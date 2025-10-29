@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌐 ESP32 Hidropônico - Painel Admin</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --success: #16a34a;
+            --warning: #f59e0b;
+            --error: #dc2626;
+            --background: #f8fafc;
+            --card-bg: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --info-bg: #e0f2fe;
+            --info-text: #0369a1;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+
+        body {
+            background: var(--background);
+            min-height: 100vh;
+            padding: 1rem;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 1.5rem;
+            border-left: 4px solid var(--primary);
+        }
+
+        .header h1 {
+            color: var(--primary);
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .system-info {
+            display: grid;
+            gap: 0.75rem;
+        }
+
+        .info-item {
+            background: var(--info-bg);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid rgba(3, 105, 161, 0.2);
+        }
+
+        .info-label {
+            font-weight: 600;
+            color: var(--info-text);
+        }
+
+        .info-value {
+            color: var(--text);
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+
+        .section {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 1.5rem;
+        }
+
+        .section h2 {
+            color: var(--text);
+            font-size: 1.25rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .actions-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+
+        .action-btn {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            text-decoration: none;
+        }
+
+        .action-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 15px rgba(37, 99, 235, 0.3);
+        }
+
+        .action-btn.restart {
+            background: var(--error);
+        }
+
+        .action-btn.restart:hover {
+            box-shadow: 0 8px 15px rgba(220, 38, 38, 0.3);
+        }
+
+        .action-btn.wifi {
+            background: var(--warning);
+        }
+
+        .action-btn.wifi:hover {
+            box-shadow: 0 8px 15px rgba(245, 158, 11, 0.3);
+        }
+
+        .connections {
+            display: grid;
+            gap: 0.75rem;
+        }
+
+        .connection-item {
+            padding: 1rem;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 2px solid var(--border);
+        }
+
+        .connection-item.connected {
+            background: rgba(22, 163, 74, 0.1);
+            border-color: var(--success);
+        }
+
+        .connection-item.disconnected {
+            background: rgba(220, 38, 38, 0.1);
+            border-color: var(--error);
+        }
+
+        .connection-label {
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+        }
+
+        .status-connected {
+            color: var(--success);
+        }
+
+        .status-disconnected {
+            color: var(--error);
+        }
+
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .footer {
+            text-align: center;
+            padding: 1rem;
+            color: var(--text-light);
+            font-size: 0.875rem;
+        }
+
+        @media (max-width: 640px) {
+            .container {
+                padding: 0.5rem;
+            }
+            
+            .actions-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* ===== SEÇÃO DE SAÚDE DA MEMÓRIA ===== */
+        .memory-health {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+        }
+
+        .memory-health h2 {
+            color: white;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .health-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .health-card {
+            background: rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            padding: 1.25rem;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .health-card:hover {
+            transform: translateY(-4px);
+            background: rgba(255, 255, 255, 0.2);
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
+        }
+
+        .health-card-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            opacity: 0.9;
+        }
+
+        .health-card-value {
+            font-size: 1.75rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+            font-family: monospace;
+        }
+
+        .health-card-unit {
+            font-size: 0.75rem;
+            opacity: 0.8;
+        }
+
+        .memory-progress {
+            margin: 1rem 0;
+        }
+
+        .progress-bar {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            height: 20px;
+            overflow: hidden;
+            margin-bottom: 0.5rem;
+        }
+
+        .progress-fill {
+            height: 100%;
+            transition: all 0.5s ease;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: white;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+        }
+
+        .progress-healthy {
+            background: linear-gradient(90deg, #4CAF50, #81C784);
+        }
+
+        .progress-warning {
+            background: linear-gradient(90deg, #FF9800, #FFB74D);
+        }
+
+        .progress-critical {
+            background: linear-gradient(90deg, #F44336, #EF5350);
+        }
+
+        .health-status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            margin: 1rem 0;
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 8px;
+            font-weight: 600;
+        }
+
+        .status-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+        }
+
+        .icon-healthy { background: #4CAF50; }
+        .icon-warning { background: #FF9800; }
+        .icon-critical { background: #F44336; }
+
+        .protection-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+
+        .protection-item {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            padding: 0.75rem;
+            text-align: center;
+        }
+
+        .protection-title {
+            font-size: 0.75rem;
+            opacity: 0.8;
+            margin-bottom: 0.25rem;
+        }
+
+        .protection-value {
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .auto-update {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            opacity: 0.8;
+            margin-top: 1rem;
+        }
+
+        .update-pulse {
+            width: 8px;
+            height: 8px;
+            background: #4CAF50;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(76, 175, 80, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header com informações do sistema -->
+        <div class="header">
+            <h1>🌐 ESP32 Hidropônico - Painel Admin</h1>
+            <div class="system-info">
+                <div class="info-item">
+                    <span class="info-label">IP do Sistema:</span>
+                    <span class="info-value" id="system-ip">Carregando...</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Device ID:</span>
+                    <span class="info-value" id="device-id">Carregando...</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Firmware:</span>
+                    <span class="info-value" id="firmware-version">Carregando...</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Ações do Sistema -->
+        <div class="section">
+            <h2>🔧 Ações do Sistema</h2>
+            <div class="actions-grid">
+                <button class="action-btn restart" onclick="restartSystem()">
+                    🔄 Reiniciar Sistema
+                </button>
+                <button class="action-btn wifi" onclick="reconfigureWiFi()">
+                    📶 Reconfigurar WiFi
+                </button>
+            </div>
+        </div>
+
+        <!-- Saúde da Memória -->
+        <div class="section memory-health">
+            <h2>🧠 Saúde da Memória</h2>
+            
+            <!-- Status WebSocket -->
+            <div class="websocket-status" style="text-align: center; margin-bottom: 1rem; padding: 0.5rem; background: rgba(255,255,255,0.1); border-radius: 8px;">
+                <span id="ws-status">🔴 WebSocket Desconectado</span>
+                <button onclick="refreshMemoryStatus()" style="margin-left: 1rem; padding: 0.25rem 0.5rem; background: rgba(255,255,255,0.2); border: none; border-radius: 4px; color: white; cursor: pointer;">🔄 Atualizar</button>
+            </div>
+            
+            <!-- Cards de Informações -->
+            <div class="health-cards">
+                <div class="health-card">
+                    <div class="health-card-title">Heap Livre</div>
+                    <div class="health-card-value" id="heap-free">--</div>
+                    <div class="health-card-unit">KB</div>
+                </div>
+                <div class="health-card">
+                    <div class="health-card-title">Heap Total</div>
+                    <div class="health-card-value" id="heap-total">--</div>
+                    <div class="health-card-unit">KB</div>
+                </div>
+                <div class="health-card">
+                    <div class="health-card-title">Fragmentação</div>
+                    <div class="health-card-value" id="fragmentation">--</div>
+                    <div class="health-card-unit">%</div>
+                </div>
+                <div class="health-card">
+                    <div class="health-card-title">Uptime</div>
+                    <div class="health-card-value" id="uptime">--</div>
+                    <div class="health-card-unit">h</div>
+                </div>
+            </div>
+
+            <!-- Barra de Progresso -->
+            <div class="memory-progress">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="memory-progress" style="width: 0%">
+                        0% usado
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status de Saúde -->
+            <div class="health-status" id="health-status">
+                <div class="status-icon icon-healthy" id="health-icon"></div>
+                <span id="health-text">Sistema Saudável</span>
+            </div>
+
+            <!-- Sistema de Proteção -->
+            <div class="protection-grid">
+                <div class="protection-item">
+                    <div class="protection-title">WebSocket</div>
+                    <div class="protection-value" id="watchdog-status">30s ✅</div>
+                </div>
+                <div class="protection-item">
+                    <div class="protection-title">Clientes WS</div>
+                    <div class="protection-value" id="connections-status">0/2 ✅</div>
+                </div>
+                <div class="protection-item">
+                    <div class="protection-title">Reset Auto</div>
+                    <div class="protection-value" id="reset-status">Auto ✅</div>
+                </div>
+                <div class="protection-item">
+                    <div class="protection-title">Próximo Reset</div>
+                    <div class="protection-value" id="next-reset">--h</div>
+                </div>
+            </div>
+
+            <!-- Última Atualização -->
+            <div class="auto-update">
+                <div class="update-pulse"></div>
+                <span id="last-update">Aguardando dados via WebSocket...</span>
+            </div>
+        </div>
+
+        <!-- Conexões Externas -->
+        <div class="section">
+            <h2>☁️ Conexões Externas</h2>
+            <div class="connections">
+                <div class="connection-item" id="supabase-connection">
+                    <span class="connection-label">Supabase:</span>
+                    <span class="connection-status" id="supabase-status">
+                        <div class="loading"></div> Verificando...
+                    </span>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            Sistema Hidropônico ESP32 - Versão 2.1.0
+        </div>
+    </div>
+
+    <script>
+        // Estado da aplicação
+        let deviceInfo = {};
+        let websocket = null;
+        let reconnectTimer = null;
+
+        // Inicialização
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDeviceInfo();
+            initWebSocket();
+            
+            // Não mais polling automático! WebSocket faz push
+            // setInterval removido → 83% menos overhead!
+        });
+
+        // ===== WEBSOCKET CONNECTION =====
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = protocol + '//' + window.location.hostname + ':81/ws';
+            
+            console.log('🔌 Conectando WebSocket:', wsUrl);
+            
+            websocket = new WebSocket(wsUrl);
+            
+            websocket.onopen = function(event) {
+                console.log('✅ WebSocket conectado');
+                document.getElementById('ws-status').innerHTML = '🟢 WebSocket Conectado';
+                
+                // Solicitar dados iniciais
+                websocket.send(JSON.stringify({
+                    action: 'get_initial_data'
+                }));
+                
+                // Limpar timer de reconexão
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+            };
+            
+            websocket.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('📨 WebSocket data:', data);
+                    
+                    if (data.type === 'memory_update') {
+                        updateMemoryDisplay(data);
+                    } else if (data.type === 'system_status') {
+                        updateSystemStatus(data);
+                    } else if (data.type === 'message') {
+                        showNotification(data.message);
+                    }
+                } catch (error) {
+                    console.error('❌ Erro ao processar WebSocket data:', error);
+                }
+            };
+            
+            websocket.onclose = function(event) {
+                console.log('🔴 WebSocket desconectado:', event.code);
+                document.getElementById('ws-status').innerHTML = '🔴 WebSocket Desconectado';
+                
+                // Tentar reconectar em 3 segundos
+                if (!reconnectTimer) {
+                    reconnectTimer = setTimeout(() => {
+                        console.log('🔄 Tentando reconectar WebSocket...');
+                        initWebSocket();
+                    }, 3000);
+                }
+            };
+            
+            websocket.onerror = function(error) {
+                console.error('❌ WebSocket erro:', error);
+                document.getElementById('ws-status').innerHTML = '⚠️ WebSocket Erro';
+            };
+        }
+
+        // Carregar informações do dispositivo (HTTP uma vez apenas)
+        function loadDeviceInfo() {
+            fetch('/api/device-info')
+                .then(response => response.json())
+                .then(data => {
+                    deviceInfo = data;
+                    document.getElementById('system-ip').textContent = data.ip_address || 'N/A';
+                    document.getElementById('device-id').textContent = data.device_id || 'N/A';
+                    document.getElementById('firmware-version').textContent = data.firmware_version || 'N/A';
+                })
+                .catch(error => {
+                    console.error('Erro ao carregar informações do dispositivo:', error);
+                    document.getElementById('system-ip').textContent = 'Erro';
+                    document.getElementById('device-id').textContent = 'Erro';
+                    document.getElementById('firmware-version').textContent = 'Erro';
+                });
+        }
+
+        // ===== FUNÇÕES MANUAIS (SEM POLLING) =====
+        function refreshMemoryStatus() {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(JSON.stringify({
+                    action: 'get_memory_status'
+                }));
+            } else {
+                showNotification('WebSocket não conectado');
+            }
+        }
+
+        function refreshSystemStatus() {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(JSON.stringify({
+                    action: 'get_system_status'
+                }));
+            } else {
+                showNotification('WebSocket não conectado');
+            }
+        }
+
+        // Atualizar display da memória (recebe dados via WebSocket)
+        function updateMemoryDisplay(data) {
+            // Converter bytes para KB
+            const heapFreeKB = Math.round(data.heap_free / 1024);
+            const heapTotalKB = Math.round(data.heap_total / 1024);
+            const heapUsagePercent = data.heap_usage_percent;
+            const fragmentationPercent = data.fragmentation_percent;
+            
+            // Atualizar cards
+            document.getElementById('heap-free').textContent = heapFreeKB;
+            document.getElementById('heap-total').textContent = heapTotalKB;
+            document.getElementById('fragmentation').textContent = fragmentationPercent;
+            document.getElementById('uptime').textContent = data.uptime_hours + 'h ' + data.uptime_minutes + 'm';
+            
+            // Atualizar barra de progresso
+            const progressBar = document.getElementById('memory-progress');
+            progressBar.style.width = heapUsagePercent + '%';
+            progressBar.textContent = heapUsagePercent + '% usado';
+            
+            // Definir classe de cor baseada no uso
+            progressBar.className = 'progress-fill';
+            if (data.health_status === 'critical') {
+                progressBar.classList.add('progress-critical');
+            } else if (data.health_status === 'warning') {
+                progressBar.classList.add('progress-warning');
+            } else {
+                progressBar.classList.add('progress-healthy');
+            }
+            
+            // Atualizar status de saúde
+            const healthIcon = document.getElementById('health-icon');
+            const healthText = document.getElementById('health-text');
+            
+            healthIcon.className = 'status-icon';
+            if (data.health_status === 'critical') {
+                healthIcon.classList.add('icon-critical');
+                healthText.textContent = 'Estado Crítico - Requer Atenção!';
+            } else if (data.health_status === 'warning') {
+                healthIcon.classList.add('icon-warning');
+                healthText.textContent = 'Estado de Alerta - Monitorando';
+            } else {
+                healthIcon.classList.add('icon-healthy');
+                healthText.textContent = 'Sistema Saudável';
+            }
+            
+            // Atualizar sistema de proteção
+            document.getElementById('watchdog-status').textContent = 
+                data.watchdog_timeout + 's ✅';
+            document.getElementById('connections-status').textContent = 
+                data.ws_clients + '/2 ✅';
+            document.getElementById('reset-status').textContent = 
+                'Auto ✅';
+            document.getElementById('next-reset').textContent = 
+                data.next_reset_hours + 'h';
+            
+            // Timestamp da última atualização
+            const now = new Date();
+            document.getElementById('last-update').textContent = 
+                'Última atualização: ' + now.toLocaleTimeString();
+            
+            // Log para debug
+            console.log('🧠 Memory Updated via WebSocket:', {
+                heap_free_kb: heapFreeKB,
+                heap_usage: heapUsagePercent + '%',
+                fragmentation: fragmentationPercent + '%',
+                health_status: data.health_status,
+                uptime: data.uptime_hours + 'h ' + data.uptime_minutes + 'm'
+            });
+        }
+
+        // Atualizar status do sistema
+        function updateSystemStatus(data) {
+            updateConnectionStatus('supabase', data.supabase_connected || false);
+        }
+
+        // Atualizar status de conexão
+        function updateConnectionStatus(service, connected) {
+            const connectionElement = document.getElementById(`${service}-connection`);
+            const statusElement = document.getElementById(`${service}-status`);
+            
+            if (connected) {
+                connectionElement.className = 'connection-item connected';
+                statusElement.innerHTML = '<span class="status-connected">✅ Conectado</span>';
+            } else {
+                connectionElement.className = 'connection-item disconnected';
+                statusElement.innerHTML = '<span class="status-disconnected">❌ Desconectado</span>';
+            }
+        }
+
+        // Mostrar notificação
+        function showNotification(message) {
+            // Criar elemento de notificação
+            const notification = document.createElement('div');
+            notification.className = 'notification';
+            notification.textContent = message;
+            notification.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                background: var(--primary);
+                color: white;
+                padding: 1rem;
+                border-radius: 8px;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                z-index: 1000;
+                transition: all 0.3s ease;
+            `;
+            
+            document.body.appendChild(notification);
+            
+            // Remover após 3 segundos
+            setTimeout(() => {
+                notification.style.opacity = '0';
+                setTimeout(() => {
+                    document.body.removeChild(notification);
+                }, 300);
+            }, 3000);
+        }
+
+        // ===== FUNÇÕES DE AÇÃO (MANTIDAS) =====
+        
+        // Reiniciar sistema
+        function restartSystem() {
+            if (confirm('Tem certeza que deseja reiniciar o sistema?')) {
+                const button = event.target;
+                button.innerHTML = '<div class="loading"></div> Reiniciando...';
+                button.disabled = true;
+                
+                fetch('/api/reset')
+                    .then(() => {
+                        showNotification('Sistema reiniciado! Página será recarregada em 10 segundos.');
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 10000);
+                    })
+                    .catch(error => {
+                        console.error('Erro ao reiniciar:', error);
+                        showNotification('Comando de reinício enviado. Sistema deve reiniciar em breve.');
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 10000);
+                    });
+            }
+        }
+
+        // Reconfigurar WiFi
+        function reconfigureWiFi() {
+            if (confirm('ATENÇÃO: Isso irá resetar as configurações WiFi e o ESP32 voltará ao modo Access Point.\n\nApós o reset, você precisará:\n1. Conectar-se à rede "ESP32_Hidropônico"\n2. Acessar http://192.168.4.1\n3. Configurar nova rede WiFi\n\nDeseja continuar?')) {
+                const button = event.target;
+                button.innerHTML = '<div class="loading"></div> Resetando WiFi...';
+                button.disabled = true;
+                
+                fetch('/api/reconfigure-wifi')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            showNotification('✅ WiFi resetado com sucesso! ESP32 reiniciando...');
+                        } else {
+                            showNotification('❌ Erro: ' + (data.message || 'Falha na reconfiguração'));
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Erro ao reconfigurar WiFi:', error);
+                        showNotification('⚠️ Comando enviado! ESP32 deve estar resetando WiFi...');
+                    })
+                    .finally(() => {
+                        // Reabilitar botão após 10 segundos
+                        setTimeout(() => {
+                            button.innerHTML = '📶 Reconfigurar WiFi';
+                            button.disabled = false;
+                        }, 10000);
+                    });
+            }
+        }
+
+        // Cleanup ao fechar página
+        window.addEventListener('beforeunload', function() {
+            if (websocket) {
+                websocket.close();
+            }
+        });
+    </script>
+</body>
+</html>

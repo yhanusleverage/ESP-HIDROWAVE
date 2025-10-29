@@ -1,0 +1,1853 @@
+#include "WiFiManager.h"
+
+unsigned long currentReconnectInterval = MIN_RECONNECT_INTERVAL;
+int reconnectAttempts = 0;
+
+WiFiManager::WiFiManager() : server(nullptr), isAPMode(false), isConnecting(false) {
+    // Configurar IPs do AP
+    AP_IP.fromString("192.168.4.1");
+    AP_GATEWAY.fromString("192.168.4.1");
+    AP_SUBNET.fromString("255.255.255.0");
+}
+
+WiFiManager::~WiFiManager() {
+    if (server) {
+        delete server;
+    }
+}
+
+bool WiFiManager::begin() {
+    Serial.println("🌐 Iniciando WiFiManager...");
+    
+    // Inicializar SPIFFS
+    if (!SPIFFS.begin(true)) {
+        Serial.println("❌ Erro ao inicializar SPIFFS");
+        return false;
+    }
+    
+    // Inicializar Preferences
+    preferences.begin("wifi", false);
+    
+    // Tentar conexão automática primeiro
+    if (tryAutoConnect()) {
+        Serial.println("✅ Conectado automaticamente ao WiFi");
+            return true;
+        }
+    
+    // Se não conseguiu conectar, iniciar modo AP
+    Serial.println("🔄 Iniciando modo AP para configuração...");
+    return startAPMode();
+}
+
+void WiFiManager::loop() {
+    // Verificar timeout de conexão
+    if (isConnecting && (millis() - connectionStartTime > CONNECTION_TIMEOUT)) {
+        Serial.println("⏰ Timeout na conexão WiFi");
+        isConnecting = false;
+        
+        if (onConnectionResult) {
+            onConnectionResult(false);
+        }
+        
+        if (onStatusUpdate) {
+            onStatusUpdate("Timeout na conexão");
+        }
+    }
+    
+    // Verificar status da conexão
+    if (isConnecting && WiFi.status() == WL_CONNECTED) {
+        Serial.println("✅ WiFi conectado com sucesso!");
+        Serial.print("📍 IP: ");
+        Serial.println(WiFi.localIP());
+        
+        isConnecting = false;
+        isAPMode = false;
+        
+        if (onConnectionResult) {
+            onConnectionResult(true);
+        }
+        
+        if (onStatusUpdate) {
+            onStatusUpdate("Conectado: " + WiFi.localIP().toString());
+        }
+        
+        // Parar o servidor AP se estiver rodando
+        if (server) {
+            server->end();
+            delete server;
+            server = nullptr;
+        }
+        
+        // Desabilitar modo AP
+        WiFi.softAPdisconnect(true);
+    }
+}
+
+bool WiFiManager::startAPMode() {
+    Serial.println("🔧 Configurando modo AP...");
+    
+    // Configurar modo AP
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+    
+    bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
+    
+    if (!apStarted) {
+        Serial.println("❌ Erro ao iniciar AP");
+        return false;
+    }
+    
+    isAPMode = true;
+    
+    Serial.println("✅ Modo AP iniciado");
+    Serial.print("📶 SSID: ");
+    Serial.println(AP_SSID);
+    Serial.print("📍 IP: ");
+    Serial.println(WiFi.softAPIP());
+    
+    // Configurar servidor web
+    setupWebServer();
+    
+    if (onStatusUpdate) {
+        onStatusUpdate("Modo AP ativo: " + WiFi.softAPIP().toString());
+    }
+    
+    return true;
+}
+
+bool WiFiManager::tryAutoConnect() {
+    WiFiCredentials credentials = loadCredentials();
+    
+    if (credentials.ssid.length() == 0) {
+        Serial.println("📝 Nenhuma credencial salva encontrada");
+        return false;
+    }
+    
+    Serial.println("🔄 Tentando conexão automática...");
+    Serial.print("📶 SSID: ");
+    Serial.println(credentials.ssid);
+    
+    return connectToWiFi(credentials);
+}
+
+void WiFiManager::setupWebServer() {
+    if (server) {
+        delete server;
+    }
+    
+    server = new AsyncWebServer(80);
+    
+    // Configurar CORS para todas as rotas
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    
+    // Servir arquivos estáticos
+    server->serveStatic("/", SPIFFS, "/").setDefaultFile("wifi-config.html");
+    
+    // Handler para OPTIONS (preflight CORS)
+    server->on("/api/connect-wifi", HTTP_OPTIONS, [](AsyncWebServerRequest *request) {
+        request->send(200);
+    });
+    
+    // Rotas da API
+    server->on("/api/device-info", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        handleDeviceInfo(request);
+    });
+    
+    server->on("/api/scan-networks", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        handleScanNetworks(request);
+    });
+    
+    // Handler para connect-wifi com suporte a body
+    server->on("/api/connect-wifi", HTTP_POST, 
+        [this](AsyncWebServerRequest *request) {
+            // Esta função será chamada quando o request estiver completo
+            handleConnectWiFi(request);
+        },
+        NULL, // onUpload
+        [this](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            // Esta função processa o body do POST
+            Serial.println("🔍 DEBUG: onBody callback chamado");
+            Serial.printf("🔍 DEBUG: Body length: %d, total: %d\n", len, total);
+            
+            // Converter dados para string
+            String bodyData = "";
+            for (size_t i = 0; i < len; i++) {
+                bodyData += (char)data[i];
+            }
+            
+            Serial.println("📝 DEBUG: Body data: " + bodyData);
+            
+            // Armazenar o body no request para uso posterior
+            request->_tempObject = new String(bodyData);
+        }
+    );
+    
+    // Aceitar também GET para connect-wifi (fallback)
+    server->on("/api/connect-wifi", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        handleConnectWiFi(request);
+    });
+    
+    server->on("/api/reset", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        handleReset(request);
+    });
+    
+    // Rota padrão
+    server->onNotFound([this](AsyncWebServerRequest *request) {
+        handleNotFound(request);
+    });
+    
+    server->begin();
+    Serial.println("🌐 Servidor web iniciado na porta 80");
+}
+
+void WiFiManager::handleDeviceInfo(AsyncWebServerRequest *request) {
+    DynamicJsonDocument doc(512);
+    
+    doc["device_id"] = getDeviceID();
+    doc["firmware_version"] = getFirmwareVersion();
+    doc["ap_ip"] = getAPIP();
+    doc["station_ip"] = getStationIP();
+    doc["ap_mode"] = isInAPMode();
+    doc["connected"] = isConnected();
+    doc["uptime"] = millis() / 1000;
+    
+    String response;
+    serializeJson(doc, response);
+    
+    request->send(200, "application/json", response);
+}
+
+void WiFiManager::handleScanNetworks(AsyncWebServerRequest *request) {
+    Serial.println("🔍 Escaneando redes WiFi...");
+    
+    if (onStatusUpdate) {
+        onStatusUpdate("Escaneando redes...");
+    }
+    
+    String response = scanNetworksJSON();
+    request->send(200, "application/json", response);
+}
+
+void WiFiManager::handleConnectWiFi(AsyncWebServerRequest *request) {
+    Serial.println("🔍 DEBUG: handleConnectWiFi chamada");
+    
+    WiFiCredentials credentials;
+    bool dataFound = false;
+    
+    // Verificar se temos body data armazenado no _tempObject
+    if (request->_tempObject != nullptr) {
+        String* bodyData = (String*)request->_tempObject;
+        Serial.println("📝 DEBUG: Body recuperado: " + *bodyData);
+        
+        // Tentar processar como FormData primeiro
+        if (bodyData->indexOf("Content-Disposition") != -1) {
+            Serial.println("🔍 DEBUG: Processando como FormData");
+            
+            // Extrair SSID
+            int ssidStart = bodyData->indexOf("name=\"ssid\"");
+            if (ssidStart != -1) {
+                ssidStart = bodyData->indexOf("\r\n\r\n", ssidStart) + 4;
+                int ssidEnd = bodyData->indexOf("\r\n", ssidStart);
+                if (ssidEnd != -1) {
+                    credentials.ssid = bodyData->substring(ssidStart, ssidEnd);
+                    credentials.ssid.trim();
+                }
+            }
+            
+            // Extrair Password
+            int passStart = bodyData->indexOf("name=\"password\"");
+            if (passStart != -1) {
+                passStart = bodyData->indexOf("\r\n\r\n", passStart) + 4;
+                int passEnd = bodyData->indexOf("\r\n", passStart);
+                if (passEnd != -1) {
+                    credentials.password = bodyData->substring(passStart, passEnd);
+                    credentials.password.trim();
+                }
+            }
+            
+            // Extrair Device Name
+            int deviceStart = bodyData->indexOf("name=\"device_name\"");
+            if (deviceStart != -1) {
+                deviceStart = bodyData->indexOf("\r\n\r\n", deviceStart) + 4;
+                int deviceEnd = bodyData->indexOf("\r\n", deviceStart);
+                if (deviceEnd != -1) {
+                    credentials.deviceName = bodyData->substring(deviceStart, deviceEnd);
+                    credentials.deviceName.trim();
+                }
+            }
+            
+            dataFound = true;
+        }
+        // Tentar processar como JSON
+        else if (bodyData->indexOf("{") != -1) {
+            Serial.println("🔍 DEBUG: Processando como JSON");
+            
+            DynamicJsonDocument doc(1024);
+            DeserializationError error = deserializeJson(doc, *bodyData);
+            
+            if (error == DeserializationError::Ok) {
+                credentials.ssid = doc["ssid"].as<String>();
+                credentials.password = doc["password"].as<String>();
+                credentials.deviceName = doc["device_name"].as<String>();
+                dataFound = true;
+                Serial.println("✅ DEBUG: Dados extraídos do JSON");
+    } else {
+                Serial.println("❌ DEBUG: Erro ao deserializar JSON: " + String(error.c_str()));
+            }
+        }
+        // Tentar processar como URL encoded
+        else {
+            Serial.println("🔍 DEBUG: Processando como URL encoded");
+            
+            // Decodificar URL encoded data
+            String decodedBody = *bodyData;
+            decodedBody.replace("+", " ");
+            decodedBody.replace("%40", "@");
+            decodedBody.replace("%2B", "+");
+            
+            // Extrair parâmetros
+            int ssidPos = decodedBody.indexOf("ssid=");
+            if (ssidPos != -1) {
+                ssidPos += 5;
+                int ssidEnd = decodedBody.indexOf("&", ssidPos);
+                if (ssidEnd == -1) ssidEnd = decodedBody.length();
+                credentials.ssid = decodedBody.substring(ssidPos, ssidEnd);
+            }
+            
+            int passPos = decodedBody.indexOf("password=");
+            if (passPos != -1) {
+                passPos += 9;
+                int passEnd = decodedBody.indexOf("&", passPos);
+                if (passEnd == -1) passEnd = decodedBody.length();
+                credentials.password = decodedBody.substring(passPos, passEnd);
+            }
+            
+            int devicePos = decodedBody.indexOf("device_name=");
+            if (devicePos != -1) {
+                devicePos += 12;
+                int deviceEnd = decodedBody.indexOf("&", devicePos);
+                if (deviceEnd == -1) deviceEnd = decodedBody.length();
+                credentials.deviceName = decodedBody.substring(devicePos, deviceEnd);
+            }
+            
+            dataFound = true;
+        }
+        
+        // Limpar o objeto temporário
+        delete bodyData;
+        request->_tempObject = nullptr;
+    }
+    
+    // Verificar se é POST com form data nos parâmetros
+    if (!dataFound && request->hasParam("ssid", true)) {
+        credentials.ssid = request->getParam("ssid", true)->value();
+        credentials.password = request->hasParam("password", true) ? request->getParam("password", true)->value() : "";
+        credentials.deviceName = request->hasParam("device_name", true) ? request->getParam("device_name", true)->value() : "";
+        dataFound = true;
+        Serial.println("📝 DEBUG: Dados extraídos dos parâmetros POST");
+    }
+    
+    // Verificar se é GET com parâmetros na URL
+    if (!dataFound && request->hasParam("ssid")) {
+        credentials.ssid = request->getParam("ssid")->value();
+        credentials.password = request->hasParam("password") ? request->getParam("password")->value() : "";
+        credentials.deviceName = request->hasParam("device_name") ? request->getParam("device_name")->value() : "";
+        dataFound = true;
+        Serial.println("📝 DEBUG: Dados extraídos dos parâmetros GET");
+    }
+    
+    Serial.println("🔍 DEBUG: SSID final: '" + credentials.ssid + "'");
+    Serial.println("🔍 DEBUG: Password final: '" + credentials.password + "'");
+    Serial.println("🔍 DEBUG: Device name final: '" + credentials.deviceName + "'");
+    
+    if (credentials.ssid.length() == 0) {
+        Serial.println("❌ DEBUG: SSID vazio após todas as tentativas");
+        request->send(400, "application/json", "{\"success\":false,\"message\":\"SSID é obrigatório\"}");
+        return;
+    }
+    
+    Serial.println("🔗 Tentando conectar ao WiFi...");
+    Serial.print("📶 SSID: ");
+    Serial.println(credentials.ssid);
+    Serial.print("🔑 Password length: ");
+    Serial.println(credentials.password.length());
+    
+    // Salvar credenciais
+    saveCredentials(credentials);
+    
+    // Iniciar conexão
+    isConnecting = true;
+    connectionStartTime = millis();
+    
+    if (onStatusUpdate) {
+        onStatusUpdate("Conectando a " + credentials.ssid + "...");
+    }
+    
+    // Responder imediatamente
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Conectando...\"}");
+    
+    // Conectar em background
+    Serial.println("🔍 DEBUG: Chamando WiFi.begin()");
+    WiFi.begin(credentials.ssid.c_str(), credentials.password.c_str());
+}
+
+void WiFiManager::handleReset(AsyncWebServerRequest *request) {
+    Serial.println("🔄 Reiniciando ESP32...");
+    
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Reiniciando...\"}");
+    
+    delay(1000);
+    ESP.restart();
+}
+
+void WiFiManager::handleNotFound(AsyncWebServerRequest *request) {
+    // Redirecionar para a página principal
+    request->redirect("/");
+}
+
+String WiFiManager::scanNetworksJSON() {
+    int networkCount = WiFi.scanNetworks();
+    
+    DynamicJsonDocument doc(4096);
+    JsonArray networks = doc.createNestedArray("networks");
+    
+    if (networkCount > 0) {
+        // Ordenar por força do sinal
+        for (int i = 0; i < networkCount; i++) {
+            for (int j = i + 1; j < networkCount; j++) {
+                if (WiFi.RSSI(i) < WiFi.RSSI(j)) {
+                    // Trocar posições (não há função swap direta, então fazemos manualmente)
+                    // Como não podemos trocar diretamente, vamos apenas ordenar na criação do JSON
+                }
+            }
+        }
+        
+        // Criar lista ordenada
+        for (int i = 0; i < networkCount && i < 20; i++) { // Limitar a 20 redes
+            int strongestIndex = 0;
+            int strongestRSSI = -999;
+            
+            // Encontrar a rede mais forte não processada
+            for (int j = 0; j < networkCount; j++) {
+                if (WiFi.RSSI(j) > strongestRSSI) {
+                    bool alreadyAdded = false;
+                    // Verificar se já foi adicionada
+                    for (int k = 0; k < networks.size(); k++) {
+                        if (networks[k]["ssid"] == WiFi.SSID(j)) {
+                            alreadyAdded = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!alreadyAdded) {
+                        strongestRSSI = WiFi.RSSI(j);
+                        strongestIndex = j;
+                    }
+                }
+            }
+            
+            if (strongestRSSI > -999) {
+                JsonObject network = networks.createNestedObject();
+                network["ssid"] = WiFi.SSID(strongestIndex);
+                network["rssi"] = WiFi.RSSI(strongestIndex);
+                network["encryption"] = (WiFi.encryptionType(strongestIndex) != WIFI_AUTH_OPEN);
+            }
+        }
+    }
+    
+    doc["count"] = networks.size();
+    
+    String result;
+    serializeJson(doc, result);
+    
+    Serial.print("📡 Encontradas ");
+    Serial.print(networks.size());
+    Serial.println(" redes");
+    
+    return result;
+}
+
+bool WiFiManager::connectToWiFi(const WiFiCredentials& credentials) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(credentials.ssid.c_str(), credentials.password.c_str());
+    
+    if (credentials.deviceName.length() > 0) {
+        WiFi.setHostname(credentials.deviceName.c_str());
+    }
+    
+    isConnecting = true;
+    connectionStartTime = millis();
+    
+    return true;
+}
+
+void WiFiManager::saveCredentials(const WiFiCredentials& credentials) {
+    preferences.putString("ssid", credentials.ssid);
+    preferences.putString("password", credentials.password);
+    preferences.putString("device_name", credentials.deviceName);
+    
+    Serial.println("💾 Credenciais salvas");
+}
+
+WiFiCredentials WiFiManager::loadCredentials() {
+    WiFiCredentials credentials;
+    credentials.ssid = preferences.getString("ssid", "");
+    credentials.password = preferences.getString("password", "");
+    credentials.deviceName = preferences.getString("device_name", "ESP32 Hidropônico");
+    
+    return credentials;
+}
+
+void WiFiManager::clearCredentials() {
+    preferences.clear();
+    Serial.println("🗑️ Credenciais removidas");
+}
+
+void WiFiManager::onConnection(std::function<void(bool)> callback) {
+    onConnectionResult = callback;
+}
+
+void WiFiManager::onStatus(std::function<void(String)> callback) {
+    onStatusUpdate = callback;
+}
+
+bool WiFiManager::isConnected() {
+    return WiFi.status() == WL_CONNECTED;
+}
+
+bool WiFiManager::isInAPMode() {
+    return isAPMode;
+}
+
+String WiFiManager::getDeviceID() {
+    uint64_t chipid = ESP.getEfuseMac();
+    return "ESP32_HIDRO_" + String((uint32_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX);
+}
+
+String WiFiManager::getFirmwareVersion() {
+    return "2.1.0";
+}
+
+String WiFiManager::getAPIP() {
+    return WiFi.softAPIP().toString();
+}
+
+String WiFiManager::getStationIP() {
+    if (isConnected()) {
+        return WiFi.localIP().toString();
+    }
+    return "0.0.0.0";
+}
+
+void WiFiManager::resetSettings() {
+    clearCredentials();
+    WiFi.disconnect(true);
+    delay(1000);
+    ESP.restart();
+}
+
+void WiFiManager::restart() {
+    ESP.restart();
+}
+
+bool WiFiManager::validateConfig() {
+    return currentSSID.length() > 0 && 
+           supabaseUrl.length() > 0 && 
+           supabaseUrl.startsWith("http") &&
+           supabaseAnonKey.length() > 0;
+}
+
+bool WiFiManager::tryConnect() {
+    if (currentSSID.length() == 0) {
+        Serial.println("[tryConnect] SSID está vazio. Falha na conexão.");
+        return false;
+    }
+
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == currentSSID) {
+        Serial.println("[tryConnect] Já conectado a '" + currentSSID + "'. Sucesso.");
+        if (statusCallback) {
+            statusCallback(true, getIP());
+        }
+        // Se estiver em modo AP, desativar
+        if (apModeActive) {
+            Serial.println("[tryConnect] Desativando modo AP pois já estamos conectados.");
+            exitAPMode();
+        }
+        return true;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() != currentSSID) {
+        Serial.println("[tryConnect] Conectado a '" + WiFi.SSID() + "', mas o desejado é '" + currentSSID + "'. Desconectando...");
+        WiFi.disconnect(true);
+        delay(100);
+    }
+
+    Serial.println("[tryConnect] Tentando conectar ao WiFi: '" + currentSSID + "'");
+
+    // Se estiver em modo AP, mudar para modo STA
+    if (apModeActive) {
+        Serial.println("[tryConnect] Mudando de modo AP para modo Station...");
+        WiFi.softAPdisconnect(true);
+    }
+
+    WiFi.mode(WIFI_STA);
+
+    if (hostname.length() > 0) {
+        if (WiFi.setHostname(hostname.c_str())) {
+            Serial.println("[tryConnect] Hostname '" + hostname + "' aplicado ao stack WiFi antes de conectar.");
+        } else {
+            Serial.println("[tryConnect] AVISO: Falha ao aplicar hostname '" + hostname + "' ao stack WiFi.");
+        }
+    } else {
+        Serial.println("[tryConnect] Nenhum hostname customizado definido. Usando hostname padrão do ESP32.");
+    }
+
+    WiFi.begin(currentSSID.c_str(), currentPassword.c_str());
+
+    unsigned long startAttemptTime = millis();
+    int lastStatus = -1;
+    int initialStatus = WiFi.status();
+
+    while (millis() - startAttemptTime < connectionTimeout) {
+        int currentWiFiStatus = WiFi.status();
+        if (currentWiFiStatus != lastStatus) {
+            lastStatus = currentWiFiStatus;
+            Serial.printf("[tryConnect] Status WiFi: %s (%d)\\n", wifiStatusToString(lastStatus), lastStatus);
+        }
+        if (lastStatus == WL_CONNECTED) break;
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[tryConnect] Conectado com sucesso a '" + currentSSID + "'!");
+        Serial.println("             IP: " + WiFi.localIP().toString());
+        Serial.println("             Hostname efetivo: " + String(WiFi.getHostname()));
+        
+        // Desativar modo AP após conexão bem-sucedida
+        if (apModeActive) {
+            Serial.println("[tryConnect] Desativando modo AP após conexão bem-sucedida.");
+            exitAPMode();
+        }
+        
+        if (statusCallback) {
+            statusCallback(true, getIP());
+        }
+        return true;
+    }
+
+    char logMessage[128];
+    snprintf(logMessage, sizeof(logMessage), "[tryConnect] Falha na conexão com '%s'. Status inicial: %s (%d), Status final: %s (%d)", 
+             currentSSID.c_str(), wifiStatusToString(initialStatus), initialStatus, 
+             wifiStatusToString(WiFi.status()), WiFi.status());
+    Serial.println(logMessage);
+
+    if (statusCallback) {
+        statusCallback(false, "");
+    }
+    return false;
+}
+
+void WiFiManager::startConfigAP() {
+    if (apModeActive) {
+        Serial.println("[startConfigAP] Modo AP já ativo");
+        return;
+    }
+    
+    Serial.println("[startConfigAP] Iniciando modo Access Point para configuração...");
+    
+    // Salvar modo anterior e SSID para fallback
+    String previousSSID = currentSSID;
+    String previousPassword = currentPassword;
+    WiFiMode_t previousMode = WiFi.getMode();
+    
+    // Desconectar de qualquer rede existente
+    WiFi.disconnect(true);
+    delay(100);
+    
+    // Configurar modo AP
+    if (WiFi.getMode() != WIFI_AP) {
+        Serial.println("[startConfigAP] Configurando modo AP...");
+        WiFi.mode(WIFI_AP);
+        delay(100);
+    }
+    
+    // Nome do AP baseado no chip ID para ser único
+    String apName = "ESP32-Hidro-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    
+    // Tentar iniciar o AP
+    if (WiFi.softAP(apName.c_str(), "12345678")) {
+        Serial.println("[startConfigAP] AP iniciado com sucesso:");
+        Serial.println("   SSID: " + apName);
+        Serial.println("   Senha: 12345678");
+        Serial.println("   IP: " + WiFi.softAPIP().toString());
+        
+        // Configurar servidor web
+        setupConfigServer();
+        
+        // Atualizar estado
+        apModeActive = true;
+        apStartTime = millis();
+        
+        // Configurar verificação de clientes
+        static unsigned long lastClientCheck = 0;
+        const unsigned long CLIENT_CHECK_INTERVAL = 5000; // Verificar a cada 5 segundos
+        
+        if (millis() - lastClientCheck >= CLIENT_CHECK_INTERVAL) {
+            lastClientCheck = millis();
+            
+            // Se não houver clientes conectados e temos configurações anteriores válidas
+            if (WiFi.softAPgetStationNum() == 0 && previousSSID.length() > 0) {
+                Serial.println("[startConfigAP] Nenhum cliente conectado ao AP. Tentando voltar para rede anterior: " + previousSSID);
+                
+                // Restaurar configurações anteriores
+                currentSSID = previousSSID;
+                currentPassword = previousPassword;
+                
+                // Tentar reconectar à rede anterior
+                WiFi.mode(previousMode);
+                if (tryConnect()) {
+                    Serial.println("[startConfigAP] Reconectado com sucesso à rede anterior!");
+                    exitAPMode();
+                }
+            }
+        }
+    } else {
+        Serial.println("[startConfigAP] Falha ao iniciar AP!");
+        // Tentar voltar ao modo anterior
+        WiFi.mode(previousMode);
+        if (previousSSID.length() > 0) {
+            currentSSID = previousSSID;
+            currentPassword = previousPassword;
+            tryConnect();
+        }
+    }
+}
+
+void WiFiManager::checkAPTimeout() {
+    if (!apModeActive || millis() - apStartTime < apTimeout) return;
+    
+    Serial.println("Timeout do modo AP atingido. Desativando...");
+    exitAPMode();
+    
+    // Se temos credenciais salvas, tentar reconectar
+    if (validateConfig()) {
+        tryConnect();
+    }
+}
+
+void WiFiManager::exitAPMode() {
+    if (!apModeActive) return;
+    
+    Serial.println("[exitAPMode] Desativando modo AP...");
+    
+    // Parar o servidor de configuração
+    stopConfigServer();
+    
+    // Desconectar AP e limpar configurações
+    WiFi.softAPdisconnect(true);
+    delay(100); // Pequeno delay para garantir que o AP seja desconectado
+    
+    // Resetar flag
+    apModeActive = false;
+    
+    Serial.println("[exitAPMode] Modo AP desativado com sucesso");
+    
+    // Garantir que estamos em modo Station
+    if (WiFi.getMode() != WIFI_STA) {
+        Serial.println("[exitAPMode] Configurando modo Station...");
+        WiFi.mode(WIFI_STA);
+    }
+}
+
+std::vector<NetworkInfo> WiFiManager::scanNetworks() {
+    std::vector<NetworkInfo> networks;
+    
+    Serial.println("Escaneando redes WiFi...");
+    int numNetworks = WiFi.scanNetworks();
+    
+    if (numNetworks == 0) {
+        Serial.println("Nenhuma rede encontrada");
+        return networks;
+    }
+    
+    Serial.println("Redes encontradas:");
+    for (int i = 0; i < numNetworks; i++) {
+        NetworkInfo network;
+        network.ssid = WiFi.SSID(i);
+        network.rssi = WiFi.RSSI(i);
+        network.encryption = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+        network.channel = WiFi.channel(i);
+        
+        networks.push_back(network);
+        
+        Serial.printf("%d: %s (%d dBm) %s\n", 
+            i + 1, 
+            network.ssid.c_str(), 
+            network.rssi,
+            network.getEncryptionString().c_str());
+    }
+    
+    // Ordenar por força do sinal
+    std::sort(networks.begin(), networks.end(), 
+        [](const NetworkInfo& a, const NetworkInfo& b) {
+            return a.rssi > b.rssi;
+        });
+    
+    return networks;
+}
+
+String WiFiManager::getNetworksJSON() {
+    auto networks = scanNetworks();
+    
+    StaticJsonDocument<4096> doc; // Aumentar se necessário
+    JsonArray array = doc.createNestedArray("networks");
+    
+    for (const auto& network : networks) {
+        JsonObject obj = array.createNestedObject();
+        obj["ssid"] = network.ssid;
+        obj["rssi"] = network.rssi;
+        obj["strength"] = network.getSignalStrength();
+        obj["encryption"] = network.getEncryptionString();
+        obj["icon"] = network.getSignalIcon();
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    return response;
+}
+
+String WiFiManager::getHTMLContent() {
+    String html = R"RAW_HTML(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Hidropônico - Setup</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        :root { 
+            --primary: #2196F3; 
+            --success: #4CAF50; 
+            --error: #f44336; 
+            --warning: #ff9800;
+        }
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: var(--primary); margin-top: 0; text-align: center; }
+        .card { background: #fff; padding: 20px; margin: 10px 0; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+        .status { background: #e3f2fd; padding: 15px; border-radius: 4px; margin: 15px 0; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; color: #666; }
+        input { width: 100%; padding: 8px; margin-top: 5px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        input:focus { border-color: var(--primary); outline: none; }
+        .btn { background: var(--primary); color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; }
+        .btn:hover { opacity: 0.9; }
+        .success { color: var(--success); }
+        .error { color: var(--error); }
+        .hidden { display: none; }
+        #status { text-align: center; margin: 10px 0; }
+        .network-list {
+            max-height: 200px;
+            overflow-y: auto;
+            margin: 10px 0;
+        }
+        .network-item {
+            padding: 8px;
+            border: 1px solid #ddd;
+            margin: 4px 0;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .network-item:hover {
+            background: #f5f5f5;
+        }
+        .signal-strength {
+            display: inline-block;
+            min-width: 60px;
+            text-align: right;
+        }
+        .scan-button {
+            background: var(--primary);
+            color: white;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 10px 0;
+        }
+        .scan-button:hover {
+            opacity: 0.9;
+        }
+        /* Estilo para o overlay de progresso */
+        .progress-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            color: white;
+            text-align: center;
+            padding: 20px;
+        }
+        .progress-content {
+            background: #1a1a1a;
+            padding: 30px;
+            border-radius: 10px;
+            max-width: 80%;
+            width: 400px;
+        }
+        .progress-step {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .progress-step.pending {
+            opacity: 0.5;
+        }
+        .progress-step.success {
+            background: rgba(76, 175, 80, 0.2);
+        }
+        .progress-step.error {
+            background: rgba(244, 67, 54, 0.2);
+        }
+        .progress-step .status-icon {
+            font-size: 20px;
+            margin-left: 10px;
+        }
+        .progress-message {
+            margin-top: 20px;
+            font-size: 14px;
+            color: #aaa;
+        }
+        /* Animação de spinner */
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #fff;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+        }
+        .status-indicator {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .status-connected {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .status-disconnected {
+            background-color: #f44336;
+            color: white;
+        }
+        .status-ap {
+            background-color: #2196F3;
+            color: white;
+        }
+        .scan-status {
+            text-align: center;
+            margin: 10px 0;
+            font-style: italic;
+        }
+        .refresh-button {
+            background: none;
+            border: none;
+            color: #2196F3;
+            cursor: pointer;
+            font-size: 20px;
+            padding: 5px;
+        }
+        .refresh-button:hover {
+            opacity: 0.8;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #2196F3;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            vertical-align: middle;
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌱 ESP32 Hidropônico</h1>
+        
+        <div id="statusContainer" class="status-indicator">
+            <div id="statusText">Carregando status...</div>
+            <div id="statusDetails"></div>
+        </div>
+
+        <form id="wifiForm" onsubmit="return saveConfig(event)">
+            <div class="card">
+                <h3>📡 Configuração WiFi</h3>
+                <div class="scan-controls">
+                    <button type="button" class="scan-button" onclick="startScan()">
+                        <span id="scanButtonText">🔍 Escanear Redes</span>
+                        <span id="scanSpinner" class="loading" style="display: none;"></span>
+                    </button>
+                </div>
+                <div id="scanStatus" class="scan-status"></div>
+                <input type="text" id="networkSearch" placeholder="Buscar rede..." 
+                       style="width:100%;margin:8px 0;padding:8px;border:1px solid #ddd;border-radius:4px;" 
+                       oninput="filterNetworks()">
+                <div id="networkList" class="network-list"></div>
+                <div class="form-group">
+                    <label for="ssid">Nome da Rede (SSID):</label>
+                    <input type="text" id="ssid" name="ssid" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Senha:</label>
+                    <input type="password" id="password" name="password">
+                </div>
+                <div class="form-group">
+                    <label for="hostname">Nome do Dispositivo:</label>
+                    <input type="text" id="hostname" name="hostname">
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>🔑 Configuração Supabase</h3>
+                <div class="form-group">
+                    <label for="supabase_url">URL do Projeto:</label>
+                    <input type="url" id="supabase_url" name="supabase_url" required>
+                </div>
+                <div class="form-group">
+                    <label for="supabase_anon_key">Chave Anônima:</label>
+                    <input type="text" id="supabase_anon_key" name="supabase_anon_key" required>
+                </div>
+            </div>
+
+            <button type="submit" class="btn">💾 Salvar e Conectar</button>
+        </form>
+
+        <button onclick="restartDevice()" class="btn" style="margin-top: 20px;">🔄 Reiniciar ESP32</button>
+    </div>
+
+    <div id="progressOverlay" class="progress-overlay">
+        <div class="progress-content">
+            <h2>Configurando Sistema</h2>
+            <div id="wifiStep" class="progress-step pending">
+                <span>Conexão WiFi</span>
+                <span class="status-icon">⏳</span>
+            </div>
+            <div id="supabaseStep" class="progress-step pending">
+                <span>Configuração Supabase</span>
+                <span class="status-icon">⏳</span>
+            </div>
+            <div class="progress-message" id="progressMessage">
+                Iniciando configuração...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Variáveis globais
+        let scanInterval = null;
+        let statusInterval = null;
+        let lastNetworks = [];
+
+        // Funções auxiliares
+        function showError(message) {
+            const statusContainer = document.getElementById('statusContainer');
+            statusContainer.className = 'status-indicator status-error';
+            document.getElementById('statusText').innerHTML = '❌ Erro';
+            document.getElementById('statusDetails').innerHTML = message;
+        }
+
+        function showSuccess(message) {
+            const statusContainer = document.getElementById('statusContainer');
+            statusContainer.className = 'status-indicator status-success';
+            document.getElementById('statusText').innerHTML = '✅ Sucesso';
+            document.getElementById('statusDetails').innerHTML = message;
+        }
+
+        // Função para atualizar status
+        async function refreshStatus() {
+            try {
+                const response = await fetch('/api/status');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+                
+                if (!data.success) {
+                    throw new Error(data.message || 'Erro desconhecido');
+                }
+                
+                updateStatusDisplay(data);
+            } catch (error) {
+                console.error('Erro ao atualizar status:', error);
+                showError(`Erro ao atualizar status: ${error.message}`);
+            }
+        }
+
+        // Função para escanear redes
+        async function startScan() {
+            const button = document.querySelector('.scan-button');
+            const spinner = document.getElementById('scanSpinner');
+            const buttonText = document.getElementById('scanButtonText');
+            const scanStatus = document.getElementById('scanStatus');
+            const networkList = document.getElementById('networkList');
+            
+            try {
+                button.disabled = true;
+                spinner.style.display = 'inline-block';
+                buttonText.textContent = 'Escaneando...';
+                scanStatus.textContent = 'Iniciando busca por redes...';
+                networkList.innerHTML = '<div class="network-item">Buscando redes disponíveis...</div>';
+
+                let retryCount = 0;
+                const maxRetries = 10; // 20 segundos no total
+                
+                while (retryCount < maxRetries) {
+                    const response = await fetch('/api/scan');
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    const data = await response.json();
+                    
+                    if (!data.success && data.status === 'error') {
+                        throw new Error(data.message || 'Erro ao escanear redes');
+                    }
+                    
+                    if (data.status === 'scanning') {
+                        // Ainda escaneando, aguardar e tentar novamente
+                        scanStatus.textContent = data.message || 'Buscando redes...';
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                        retryCount++;
+                        continue;
+                    }
+                    
+                    if (data.status === 'success') {
+                        // Scan completo
+                        scanStatus.textContent = data.message || `${data.networks.length} redes encontradas`;
+                        if (data.networks && data.networks.length > 0) {
+                            renderNetworkList(data.networks);
+                        } else {
+                            networkList.innerHTML = '<div class="network-item">Nenhuma rede encontrada</div>';
+                        }
+                        break;
+                    }
+                }
+                
+                if (retryCount >= maxRetries) {
+                    throw new Error('Timeout ao buscar redes. Tente novamente.');
+                }
+                
+            } catch (error) {
+                console.error('Erro ao escanear:', error);
+                scanStatus.textContent = `Erro ao buscar redes: ${error.message}`;
+                networkList.innerHTML = '<div class="network-item error">Erro ao buscar redes. Tente novamente.</div>';
+            } finally {
+                button.disabled = false;
+                spinner.style.display = 'none';
+                buttonText.textContent = '🔍 Escanear Redes';
+            }
+        }
+
+        // Função para salvar configurações
+        async function saveConfig(event) {
+            event.preventDefault();
+            
+            try {
+                const form = event.target;
+                const formData = new FormData(form);
+                
+                const response = await fetch('/api/config', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                
+                if (data.success) {
+                    showSuccess(data.message || 'Configurações salvas com sucesso!');
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 3000);
+                } else {
+                    showError(data.message || 'Erro ao salvar configurações');
+                }
+            } catch (error) {
+                console.error('Erro ao salvar:', error);
+                showError(`Erro ao salvar: ${error.message}`);
+            }
+        }
+
+        // Função para reiniciar dispositivo
+        async function restartDevice() {
+            if (!confirm('Deseja reiniciar o ESP32?')) return;
+            
+            try {
+                const response = await fetch('/api/restart', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.message || 'Erro ao reiniciar');
+                }
+                
+                showSuccess(data.message || 'Dispositivo reiniciando...');
+            } catch (error) {
+                console.error('Erro ao reiniciar:', error);
+                showError(`Erro ao reiniciar: ${error.message}`);
+            }
+        }
+
+        // Função para renderizar lista de redes
+        function renderNetworkList(networks) {
+            const networkList = document.getElementById('networkList');
+            networkList.innerHTML = '';
+            lastNetworks = networks;
+            
+            if (networks.length === 0) {
+                networkList.innerHTML = '<div class="network-item">Nenhuma rede encontrada</div>';
+                return;
+            }
+            
+            // Ordenar redes por força do sinal
+            networks.sort((a, b) => b.strength - a.strength);
+            
+            networks.forEach(network => {
+                const div = document.createElement('div');
+                div.className = 'network-item';
+                div.innerHTML = `
+                    <div class="network-info">
+                        <span class="network-name">${network.ssid}</span>
+                        <small class="network-encryption">${network.encryption}</small>
+                    </div>
+                    <div class="signal-strength">
+                        ${network.icon} ${network.strength}%
+                    </div>
+                `;
+                div.onclick = () => {
+                    document.getElementById('ssid').value = network.ssid;
+                    // Destacar rede selecionada
+                    document.querySelectorAll('.network-item').forEach(item => 
+                        item.classList.remove('selected'));
+                    div.classList.add('selected');
+                };
+                networkList.appendChild(div);
+            });
+        }
+
+        // Função para filtrar redes
+        function filterNetworks() {
+            const search = document.getElementById('networkSearch').value.toLowerCase();
+            const filtered = lastNetworks.filter(n => 
+                n.ssid.toLowerCase().includes(search)
+            );
+            renderNetworkList(filtered);
+        }
+
+        // Inicialização
+        refreshStatus();
+        statusInterval = setInterval(refreshStatus, 5000);
+    </script>
+</body>
+</html>)RAW_HTML";
+    return html;
+}
+
+String WiFiManager::getStatusJSON() {
+    StaticJsonDocument<200> doc;
+    doc["connected"] = isConnected();
+    doc["ssid"] = currentSSID;
+    doc["ip"] = isConnected() ? WiFi.localIP().toString() : "";
+    doc["hostname"] = WiFi.getHostname();
+    
+    if (isConnected()) {
+        doc["rssi"] = WiFi.RSSI();
+        NetworkInfo info;
+        info.rssi = WiFi.RSSI();
+        doc["signal_strength"] = info.getSignalStrength();
+        doc["signal_icon"] = info.getSignalIcon();
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    return response;
+}
+
+void WiFiManager::setupConfigServer() {
+    if (configServer) {
+        configServer->end();
+        delete configServer;
+    }
+    
+    configServer = new AsyncWebServer(80);
+
+    // Configurar CORS
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+    // Handler para preflight requests (OPTIONS)
+    configServer->onNotFound([](AsyncWebServerRequest *request) {
+        if (request->method() == HTTP_OPTIONS) {
+            request->send(200);
+        } else {
+            request->send(404, "application/json", "{\"success\":false,\"message\":\"Endpoint não encontrado\"}");
+        }
+    });
+
+    // Rota principal - página de configuração
+    configServer->on("/", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        request->send(200, "text/html", getHTMLContent());
+    });
+
+    // Rota de status
+    configServer->on("/api/status", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        StaticJsonDocument<512> doc;
+        
+        doc["success"] = true;
+        doc["connected"] = isConnected();
+        doc["ssid"] = currentSSID;
+        doc["ip"] = isConnected() ? WiFi.localIP().toString() : "";
+        doc["ap_mode"] = apModeActive;
+        doc["hostname"] = WiFi.getHostname();
+        
+        if (isConnected()) {
+            doc["connection_status"] = "connected";
+            doc["rssi"] = WiFi.RSSI();
+            doc["signal_strength"] = map(WiFi.RSSI(), -100, -50, 0, 100);
+        } else if (apModeActive) {
+            doc["connection_status"] = "ap_mode";
+            doc["ap_ip"] = WiFi.softAPIP().toString();
+            doc["ap_ssid"] = "ESP32-Hidro-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+        } else {
+            doc["connection_status"] = "disconnected";
+        }
+        
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // Rota de scan
+    configServer->on("/api/scan", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        StaticJsonDocument<4096> doc;
+        doc["success"] = true;
+        
+        int scanStatus = WiFi.scanComplete();
+        
+        if (scanStatus == WIFI_SCAN_RUNNING) {
+            doc["status"] = "scanning";
+            doc["message"] = "Buscando redes...";
+        } else if (scanStatus == WIFI_SCAN_FAILED) {
+            doc["success"] = false;
+            doc["status"] = "error";
+            doc["message"] = "Falha ao buscar redes. Tentando novamente...";
+            WiFi.scanNetworks(true);
+        } else if (scanStatus >= 0) {
+            doc["status"] = "success";
+            doc["message"] = String(scanStatus) + " redes encontradas";
+            
+            JsonArray networks = doc.createNestedArray("networks");
+            for (int i = 0; i < scanStatus; i++) {
+                JsonObject network = networks.createNestedObject();
+                NetworkInfo networkInfo;
+                networkInfo.ssid = WiFi.SSID(i);
+                networkInfo.rssi = WiFi.RSSI(i);
+                networkInfo.encryption = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+                networkInfo.channel = WiFi.channel(i);
+                
+                network["ssid"] = networkInfo.ssid;
+                network["rssi"] = networkInfo.rssi;
+                network["encryption"] = networkInfo.getEncryptionString();
+                network["strength"] = networkInfo.getSignalStrength();
+                network["icon"] = networkInfo.getSignalIcon();
+            }
+            
+            WiFi.scanDelete();
+            WiFi.scanNetworks(true);
+        } else {
+            doc["status"] = "scanning";
+            doc["message"] = "Iniciando busca por redes...";
+            WiFi.scanNetworks(true);
+        }
+        
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // Rota de configuração
+    configServer->on("/api/config", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        StaticJsonDocument<512> doc;
+        doc["success"] = false;
+        
+        if (!request->hasParam("ssid", true)) {
+            doc["message"] = "SSID é obrigatório";
+        } else {
+            String newSSID = request->getParam("ssid", true)->value();
+            String newPassword = request->hasParam("password", true) ? 
+                               request->getParam("password", true)->value() : "";
+            
+            if (newSSID.length() == 0) {
+                doc["message"] = "SSID inválido";
+            } else {
+                currentSSID = newSSID;
+                currentPassword = newPassword;
+                
+                if (saveConfig()) {
+                    doc["success"] = true;
+                    doc["message"] = "Configurações salvas com sucesso";
+                    scheduleRestart("Configuração atualizada", 2000);
+                } else {
+                    doc["message"] = "Erro ao salvar configurações";
+                }
+            }
+        }
+        
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // Rota de reinício
+    configServer->on("/api/restart", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        StaticJsonDocument<128> doc;
+        doc["success"] = true;
+        doc["message"] = "Reiniciando em 2 segundos...";
+        
+        serializeJson(doc, *response);
+        request->send(response);
+        
+        scheduleRestart("Reinício solicitado via web", 2000);
+    });
+
+    configServer->begin();
+    Serial.println("Servidor de configuração iniciado em http://" + WiFi.softAPIP().toString());
+}
+
+bool WiFiManager::saveConfig() {
+    StaticJsonDocument<512> doc;
+    doc["ssid"] = currentSSID;
+    doc["password"] = currentPassword;
+    doc["supabase_url"] = supabaseUrl;
+    doc["supabase_anon_key"] = supabaseAnonKey;
+    doc["hostname"] = hostname; // Salvar hostname
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+        Serial.println("Falha ao abrir arquivo de configuração para escrita");
+        return false;
+    }
+
+    size_t bytesWritten = serializeJson(doc, configFile);
+    configFile.close();
+    
+    if (bytesWritten > 0) {
+        Serial.printf("Configurações salvas com sucesso em /config.json (%d bytes)\\n", bytesWritten);
+        return true;
+    } else {
+        Serial.println("Falha ao escrever no arquivo de configuração.");
+        return false;
+    }
+}
+
+bool WiFiManager::loadConfig() {
+    if (!SPIFFS.exists("/config.json")) {
+        Serial.println("Arquivo de configuração não existe");
+        return false;
+    }
+
+    File configFile = SPIFFS.open("/config.json", "r");
+    if (!configFile) {
+        Serial.println("Falha ao abrir arquivo de configuração");
+        return false;
+    }
+
+    StaticJsonDocument<512> doc; // Ensure size matches saveConfig
+    DeserializationError error = deserializeJson(doc, configFile);
+    configFile.close();
+
+    if (error) {
+        Serial.print("Falha ao ler arquivo de configuração: ");
+        Serial.println(error.c_str());
+        return false;
+    }
+
+    currentSSID = doc["ssid"].as<String>();
+    currentPassword = doc["password"].as<String>();
+    supabaseUrl = doc["supabase_url"].as<String>();
+    supabaseAnonKey = doc["supabase_anon_key"].as<String>();
+    hostname = doc["hostname"].as<String>(); // Carregar hostname
+
+    // Aplicar hostname se carregado e WiFi estiver conectado ou se preparando para conectar
+    if (hostname.length() > 0) {
+         // WiFi.setHostname será chamado em setHostname ou quando conectar
+         Serial.println("Hostname carregado: " + hostname);
+    }
+    
+    Serial.println("Configurações carregadas do arquivo.");
+    return true;
+}
+
+void WiFiManager::handleClient() {
+    // Verifica se há um reinício agendado
+    scheduleRestart(nullptr, 0);
+}
+
+bool WiFiManager::initFS() {
+    if (!SPIFFS.begin(true)) {
+        Serial.println("Erro ao montar SPIFFS");
+        return false;
+    }
+
+    if (!SPIFFS.exists("/config.json")) {
+        Serial.println("Arquivo de configuração não encontrado - será criado quando necessário");
+        
+        // Criar estrutura básica do arquivo de configuração
+        StaticJsonDocument<512> doc;
+        doc["ssid"] = "";
+        doc["password"] = "";
+        doc["supabase_url"] = "";
+        doc["supabase_anon_key"] = "";
+        
+        File configFile = SPIFFS.open("/config.json", "w");
+        if (configFile) {
+            serializeJson(doc, configFile);
+            configFile.close();
+            Serial.println("Arquivo de configuração inicial criado");
+        }
+    }
+    return true;
+}
+
+void WiFiManager::checkConnection() {
+    unsigned long currentTime = millis();
+    
+    // Se não estiver conectado e tivermos SSID configurado
+    if (!isConnected() && currentSSID.length() > 0 && 
+        currentTime - lastReconnectAttempt > currentReconnectInterval) {
+        
+        lastReconnectAttempt = currentTime;
+        reconnectAttempts++;
+        
+        Serial.printf("[WiFi] Tentativa de reconexão #%d (intervalo: %lu ms)...\n", 
+                     reconnectAttempts, currentReconnectInterval);
+        
+        if (tryConnect()) {
+            Serial.println("[WiFi] Reconectado com sucesso!");
+            // Resetar contadores após sucesso
+            reconnectAttempts = 0;
+            currentReconnectInterval = MIN_RECONNECT_INTERVAL;
+        } else {
+            Serial.println("[WiFi] Falha na reconexão");
+            // Implementar backoff exponencial
+            if (currentReconnectInterval < MAX_RECONNECT_INTERVAL) {
+                currentReconnectInterval *= 2;
+                if (currentReconnectInterval > MAX_RECONNECT_INTERVAL) {
+                    currentReconnectInterval = MAX_RECONNECT_INTERVAL;
+                }
+            }
+            
+            // Log do próximo intervalo de tentativa
+            Serial.printf("[WiFi] Próxima tentativa em %lu segundos\n", 
+                         currentReconnectInterval / 1000);
+        }
+    }
+    
+    // Se estamos conectados, resetar os contadores
+    if (isConnected()) {
+        reconnectAttempts = 0;
+        currentReconnectInterval = MIN_RECONNECT_INTERVAL;
+    }
+}
+
+void WiFiManager::configureViaSerial() {
+    Serial.println("\n=== CONFIGURAÇÃO WiFi & Supabase (VIA SERIAL) ===");
+    Serial.println("Digite as informações. Pressione Enter após cada item.");
+    Serial.println("Você tem 30 segundos para cada entrada.");
+    
+    String newSSID = readSerialLine("SSID da rede WiFi: ");
+    if (newSSID.length() == 0) {
+        Serial.println("Configuração cancelada: SSID não fornecido após timeout.");
+        return;
+    }
+    
+    String newPassword = readSerialLine("Senha da rede WiFi (deixe em branco se não houver): ");
+    
+    String newSupabaseUrl = readSerialLine("URL do Projeto Supabase (ex: https://xyz.supabase.co): ");
+    if (newSupabaseUrl.length() == 0) {
+        Serial.println("URL Supabase não fornecida, usando a URL salva: " + supabaseUrl);
+    } else {
+        supabaseUrl = newSupabaseUrl;
+    }
+
+    String newSupabaseKey = readSerialLine("Chave Anon Supabase: ");
+    if (newSupabaseKey.length() == 0) {
+        Serial.println("Chave Anon Supabase não fornecida, usando a chave salva.");
+    } else {
+        supabaseAnonKey = newSupabaseKey;
+    }
+    
+    Serial.println("\n--- Configurações Recebidas (Serial) ---");
+    Serial.println("SSID: " + newSSID);
+    Serial.println("Senha: [PROTEGIDA]");
+    Serial.println("Supabase URL: " + supabaseUrl);
+    Serial.println("Supabase Key: [PROTEGIDA]");
+    Serial.println("------------------------------------");
+
+    currentSSID = newSSID;
+    if (newPassword.length() > 0) {
+        currentPassword = newPassword;
+    }
+
+    Serial.println("\nTentando conectar ao WiFi...");
+    if (tryConnect()) {
+        Serial.println("Conectado com sucesso!");
+        saveConfig();
+        Serial.println("Configurações salvas. O ESP32 será reiniciado para aplicar.");
+        delay(2000);
+        ESP.restart();
+    } else {
+        Serial.println("Falha na conexão. Verifique as credenciais e tente novamente.");
+    }
+}
+
+void WiFiManager::stopConfigServer() {
+    if (configServer) {
+        configServer->end();
+        delete configServer;
+        configServer = nullptr;
+    }
+    apModeActive = false;
+}
+
+void WiFiManager::setStatusCallback(void (*callback)(bool connected, String ip)) {
+    this->statusCallback = callback;
+}
+
+String WiFiManager::readSerialLine(const char* prompt, unsigned long timeout) {
+    Serial.print(prompt);
+    String input = "";
+    unsigned long startTime = millis();
+    bool somethingTyped = false;
+    
+    while (millis() - startTime < timeout) {
+        if (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\n' || c == '\r') {
+                if (somethingTyped) {
+                    Serial.println();
+                    break;
+                } else {
+                    Serial.println();
+                    startTime = millis();
+                    Serial.print(prompt);
+                    input = "";
+                    somethingTyped = false;
+                    continue;
+                }
+            } else if (isprint(c)) {
+                input += c;
+                Serial.print(c);
+                somethingTyped = true;
+            } else if (c == 127 || c == 8) {
+                if (input.length() > 0) {
+                    input.remove(input.length() - 1);
+                    Serial.print("\b \b");
+                    somethingTyped = input.length() > 0;
+                }
+            }
+        }
+        yield();
+    }
+    
+    if (!somethingTyped && millis() - startTime >= timeout) {
+        Serial.println("\nTimeout! Nenhum dado inserido.");
+        input = "";
+    }
+    
+    input.trim();
+    return input;
+}
+
+void WiFiManager::setHostname(const String& newHostname) {
+    if (newHostname.length() == 0 && hostname.length() == 0) {
+        // Sem novo hostname e sem hostname antigo, nada a fazer.
+        return;
+    }
+    if (newHostname == hostname) {
+        // Novo hostname é igual ao atual, nada a fazer.
+        return;
+    }
+
+    this->hostname = newHostname; // Atualiza o membro da classe
+
+    if (this->hostname.length() > 0) {
+        Serial.println("[WiFiManager] Hostname da classe atualizado para: '" + this->hostname + "'. Será aplicado antes da próxima conexão WiFi (via tryConnect)." );
+        // Tenta uma atualização dinâmica se já estiver conectado.
+        // Isso pode ou não ter efeito imediato dependendo do roteador/configuração DHCP.
+        if (WiFi.status() == WL_CONNECTED && (WiFi.getMode() == WIFI_STA || WiFi.getMode() == WIFI_AP_STA) ) {
+            if (WiFi.setHostname(this->hostname.c_str())) {
+                Serial.println("[WiFiManager] Tentativa de aplicar hostname '" + this->hostname + "' dinamicamente (WiFi já conectado).");
+            } else {
+                Serial.println("[WiFiManager] AVISO: Falha ao tentar aplicar hostname '" + this->hostname + "' dinamicamente.");
+            }
+        }
+    } else {
+        Serial.println("[WiFiManager] Hostname da classe limpo. O hostname padrão do ESP32 será usado na próxima conexão, a menos que um novo seja definido.");
+        // Tenta remover o hostname dinamicamente se estava conectado.
+        if (WiFi.status() == WL_CONNECTED && (WiFi.getMode() == WIFI_STA || WiFi.getMode() == WIFI_AP_STA) ) {
+            // Para limpar, passamos um ponteiro nulo ou string vazia. Testar qual funciona melhor.
+            // Usar um nome padrão do ESP32 pode ser uma opção também, ex: "esp32"
+            if (WiFi.setHostname(ESP.getChipModel())) { // Tenta reverter para um padrão
+                 Serial.println("[WiFiManager] Tentativa de reverter hostname para o padrão do chip dinamicamente.");
+            }
+        }
+    }
+}
+
+bool WiFiManager::testSupabaseConnection() {
+    if (!isConnected()) {
+        Serial.println("[Supabase Test] Falha: WiFi não conectado.");
+        return false;
+    }
+    if (supabaseUrl.length() == 0 || supabaseAnonKey.length() == 0) {
+        Serial.println("[Supabase Test] Falha: URL ou Chave Supabase não configurada.");
+        return false;
+    }
+
+    HTTPClient http;
+    bool overallSuccess = false;
+
+    String testUrl = supabaseUrl;
+    if (!testUrl.startsWith("http")) {
+        Serial.println("[Supabase Test] Falha: URL Supabase deve começar com http ou https.");
+        return false;
+    }
+    if (!testUrl.endsWith("/")) {
+        testUrl += "/";
+    }
+    testUrl += "rest/v1/";
+
+    Serial.printf("[Supabase Test] Tentando conectar a: %s\n", testUrl.c_str());
+    
+    bool beginSuccess = http.begin(testUrl);
+
+    if (beginSuccess) {
+        Serial.println("[Supabase Test] HTTP begin bem-sucedido.");
+        http.addHeader("apikey", supabaseAnonKey);
+        http.addHeader("Authorization", "Bearer " + supabaseAnonKey);
+        http.setTimeout(10000);
+
+        int httpCode = http.GET();
+        Serial.printf("[Supabase Test] HTTP GET finalizado. Código: %d\n", httpCode);
+
+        if (httpCode > 0) {
+            String errorMsg = getHttpErrorMessage(httpCode);
+            Serial.printf("[Supabase Test] Resposta: %s\n", errorMsg.c_str());
+            
+            if (httpCode == HTTP_CODE_OK) {
+                overallSuccess = true;
+            }
+        } else {
+            Serial.printf("[Supabase Test] Falha na conexão HTTPClient: %s\n", http.errorToString(httpCode).c_str());
+        }
+        http.end();
+    } else {
+        Serial.println("[Supabase Test] Falha ao iniciar conexão HTTP. Verifique a URL e a rede.");
+    }
+    
+    return overallSuccess;
+}
+
+// Helper function to convert WiFi status to string for logging
+const char* WiFiManager::wifiStatusToString(int status) {
+    switch (status) {
+        case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
+        case WL_NO_SSID_AVAIL: return "WL_NO_SSID_AVAIL";
+        case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
+        case WL_CONNECTED: return "WL_CONNECTED";
+        case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
+        case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
+        case WL_DISCONNECTED: return "WL_DISCONNECTED";
+        case WL_NO_SHIELD: return "WL_NO_SHIELD"; // For ESP8266
+        default: return "UNKNOWN_STATUS";
+    }
+}
+
+void WiFiManager::scheduleRestart(const char* reason, unsigned long delayMs) {
+    static unsigned long restartTime = 0;
+    static bool restartScheduled = false;
+    static String restartReason;
+
+    if (reason != nullptr) {  // Agendar novo reinício
+        restartScheduled = true;
+        restartTime = millis() + delayMs;
+        restartReason = reason;
+        Serial.printf("[WiFiManager] Reinício agendado em %lu ms. Motivo: %s\n", delayMs, reason);
+    } else if (restartScheduled) {  // Verificar reinício agendado
+        if (millis() >= restartTime) {
+            Serial.printf("[WiFiManager] Executando reinício agendado. Motivo: %s\n", restartReason.c_str());
+            ESP.restart();
+        }
+    }
+}
+
+// Implementação do método helper para mensagens HTTP
+String WiFiManager::getHttpErrorMessage(int httpCode) {
+    switch (httpCode) {
+        case HTTP_CODE_OK:
+            return "Sucesso";
+        case HTTP_CODE_UNAUTHORIZED:
+            return "Não autorizado - Verifique suas credenciais";
+        case HTTP_CODE_FORBIDDEN:
+            return "Acesso negado";
+        case HTTP_CODE_NOT_FOUND:
+            return "Recurso não encontrado";
+        default:
+            return "Erro " + String(httpCode);
+    }
+}

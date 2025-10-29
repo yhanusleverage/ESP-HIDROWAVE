@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌐 ESP32 Hidropônico - WiFi Setup</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+        .container {    
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            max-width: 400px;
+            width: 100%;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        .header h1 {
+            color: #2563eb;
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        .header p {
+            color: #64748b;
+            font-size: 0.9rem;
+        }
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        .form-group label {
+            display: block;
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 0.5rem;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 0.75rem;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: #2563eb;
+        }
+        .btn {
+            width: 100%;
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 1rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn:hover {
+            background: #1d4ed8;
+            transform: translateY(-2px);
+        }
+        .btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .scan-btn {
+            background: #059669;
+            margin-bottom: 1rem;
+        }
+        .scan-btn:hover {
+            background: #047857;
+        }
+        .networks-list {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            margin-top: 0.5rem;
+        }
+        .network-item {
+            padding: 0.75rem;
+            border-bottom: 1px solid #f3f4f6;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .network-item:hover {
+            background: #f9fafb;
+        }
+        .network-item:last-child {
+            border-bottom: none;
+        }
+        .signal-strength {
+            font-size: 0.8rem;
+            color: #6b7280;
+        }
+        .loading {
+            text-align: center;
+            padding: 1rem;
+            color: #6b7280;
+        }
+        .error {
+            background: #fef2f2;
+            color: #dc2626;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            border: 1px solid #fecaca;
+        }
+        .success {
+            background: #f0fdf4;
+            color: #16a34a;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            border: 1px solid #bbf7d0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌐 WiFi Setup</h1>
+            <p>Configure sua rede WiFi para o sistema hidropônico</p>
+        </div>
+        
+        <div id="message"></div>
+        
+        <form id="wifiForm">
+            <div class="form-group">
+                <button type="button" class="btn scan-btn" onclick="scanNetworks()">
+                    📡 Escanear Redes WiFi
+                </button>
+                <div id="networks" class="networks-list" style="display: none;"></div>
+            </div>
+            
+            <div class="form-group">
+                <label for="ssid">Nome da Rede (SSID):</label>
+                <input type="text" id="ssid" name="ssid" required placeholder="Digite o nome da rede">
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Senha:</label>
+                <input type="password" id="password" name="password" placeholder="Digite a senha (deixe vazio se não houver)">
+            </div>
+            
+            <div class="form-group">
+                <label for="deviceName">Nome do Dispositivo:</label>
+                <input type="text" id="deviceName" name="deviceName" value="ESP32_HIDRO" placeholder="Nome para identificar o dispositivo">
+            </div>
+            
+            <button type="submit" class="btn" id="connectBtn">
+                🔗 Conectar WiFi
+            </button>
+        </form>
+    </div>
+    
+    <script>
+        let isConnecting = false;
+        
+        function showMessage(message, type = 'error') {
+            const messageDiv = document.getElementById('message');
+            messageDiv.innerHTML = '<div class="' + type + '">' + message + '</div>';
+        }
+        
+        function scanNetworks() {
+            const btn = event.target;
+            const networksDiv = document.getElementById('networks');
+            
+            btn.disabled = true;
+            btn.textContent = '📡 Escaneando...';
+            networksDiv.style.display = 'block';
+            networksDiv.innerHTML = '<div class="loading">🔍 Procurando redes WiFi...</div>';
+            
+            fetch('/api/scan-wifi')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success && data.networks && data.networks.length > 0) {
+                        let html = '';
+                        data.networks.forEach(network => {
+                            const signalBars = getSignalBars(network.rssi);
+                            html += `
+                                <div class="network-item" onclick="selectNetwork('${network.ssid}')">
+                                    <span>${network.ssid}</span>
+                                    <span class="signal-strength">${signalBars} ${network.rssi} dBm</span>
+                                </div>
+                            `;
+                        });
+                        networksDiv.innerHTML = html;
+                    } else {
+                        networksDiv.innerHTML = '<div class="loading">Nenhuma rede encontrada</div>';
+                    }
+                })
+                .catch(error => {
+                    console.error('Erro no scan:', error);
+                    networksDiv.innerHTML = '<div class="loading">Erro ao escanear redes</div>';
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                    btn.textContent = '📡 Escanear Redes WiFi';
+                });
+        }
+        
+        function getSignalBars(rssi) {
+            if (rssi > -50) return '📶📶📶📶';
+            if (rssi > -60) return '📶📶📶';
+            if (rssi > -70) return '📶📶';
+            return '📶';
+        }
+        
+        function selectNetwork(ssid) {
+            document.getElementById('ssid').value = ssid;
+            document.getElementById('networks').style.display = 'none';
+        }
+        
+        document.getElementById('wifiForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            if (isConnecting) return;
+            
+            const ssid = document.getElementById('ssid').value.trim();
+            const password = document.getElementById('password').value;
+            const deviceName = document.getElementById('deviceName').value.trim();
+            
+            if (!ssid) {
+                showMessage('❌ Nome da rede é obrigatório');
+                return;
+            }
+            
+            isConnecting = true;
+            const btn = document.getElementById('connectBtn');
+            btn.disabled = true;
+            btn.textContent = '🔗 Conectando...';
+            
+            // Mostrar feedback de processo
+            showMessage('🔄 Salvando credenciais e testando conexão...', 'success');
+            
+            const formData = new FormData();
+            formData.append('ssid', ssid);
+            formData.append('password', password);
+            formData.append('deviceName', deviceName || 'ESP32_HIDRO');
+            
+            fetch('/api/connect-wifi', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    let message = '✅ WiFi configurado com sucesso!<br>';
+                    
+                    // Mostrar resultado do teste de conexão
+                    if (data.connection_test !== undefined) {
+                        if (data.connection_test) {
+                            message += '🌐 <strong>Teste de Conexão:</strong> ✅ ' + (data.connection_result || 'Conectado!') + '<br>';
+                        } else {
+                            message += '🌐 <strong>Teste de Conexão:</strong> ⚠️ ' + (data.connection_result || 'Falha no teste') + '<br>';
+                            message += '💡 <strong>Nota:</strong> As credenciais foram salvas. O sistema tentará conectar após o reinício.<br>';
+                        }
+                    }
+                    
+                    // Mostrar informações do reinício
+                    if (data.will_restart) {
+                        const delay = data.restart_delay || 3;
+                        message += '🔄 <strong>Reiniciando em ' + delay + ' segundos...</strong><br>';
+                    }
+                    
+                    message += '<br>📱 <strong>Próximos Passos:</strong><br>';
+                    message += '1️⃣ Conecte seu dispositivo à rede <strong>' + ssid + '</strong><br>';
+                    message += '2️⃣ Monitore o console serial para ver o IP atribuído<br>';
+                    message += '3️⃣ Acesse o IP no navegador para controlar o sistema';
+                    
+                    showMessage(message, 'success');
+                    
+                    // Countdown do reinício
+                    if (data.will_restart) {
+                        const delay = data.restart_delay || 3;
+                        startRestartCountdown(delay);
+                    }
+                } else {
+                    showMessage('❌ Erro: ' + (data.message || 'Falha na configuração'));
+                    btn.disabled = false;
+                    btn.textContent = '🔗 Conectar WiFi';
+                    isConnecting = false;
+                }
+            })
+            .catch(error => {
+                console.error('Erro:', error);
+                showMessage('❌ Erro na comunicação com o dispositivo');
+                btn.disabled = false;
+                btn.textContent = '🔗 Conectar WiFi';
+                isConnecting = false;
+            });
+        });
+        
+        function startRestartCountdown(seconds) {
+            const btn = document.getElementById('connectBtn');
+            let remaining = seconds;
+            
+            const countdown = setInterval(() => {
+                btn.textContent = `🔄 Reiniciando em ${remaining}s...`;
+                remaining--;
+                
+                if (remaining < 0) {
+                    clearInterval(countdown);
+                    btn.textContent = '✅ Sistema Reiniciado';
+                    
+                    // Mostrar mensagem final
+                    setTimeout(() => {
+                        showMessage(`
+                            🎉 <strong>Configuração Concluída!</strong><br><br>
+                            📡 O sistema hidropônico reiniciou e deve estar se conectando à rede <strong>${document.getElementById('ssid').value}</strong>.<br><br>
+                            🔍 <strong>Para acessar o sistema:</strong><br>
+                            1️⃣ Conecte seu dispositivo à mesma rede WiFi<br>
+                            2️⃣ Verifique o console serial para ver o IP<br>
+                            3️⃣ Acesse o IP no navegador<br><br>
+                            💡 Se não conseguir conectar, refaça o processo conectando-se novamente ao AP <strong>ESP32_Hidropônico</strong>.
+                        `, 'success');
+                    }, 1000);
+                }
+            }, 1000);
+        }
+    </script>
+</body>
+</html> 

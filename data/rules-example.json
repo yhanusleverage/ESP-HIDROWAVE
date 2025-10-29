@@ -1,0 +1,359 @@
+{
+  "version": "1.0.0",
+  "metadata": {
+    "created_at": "2025-09-18T23:44:00Z",
+    "author": "ESP-HIDROWAVE Decision Engine",
+    "description": "Regras de exemplo para sistema hidropônico RDWC"
+  },
+  "rules": [
+    {
+      "id": "ph_correction_low",
+      "name": "Correção pH Baixo",
+      "description": "Ativa dosador de pH+ quando pH está abaixo de 5.8 e há água suficiente no tanque",
+      "enabled": true,
+      "priority": 85,
+      "condition": {
+        "type": "composite",
+        "logic_operator": "AND",
+        "sub_conditions": [
+          {
+            "type": "sensor_compare",
+            "sensor_name": "ph",
+            "op": "<",
+            "value_min": 5.8
+          },
+          {
+            "type": "system_status",
+            "sensor_name": "water_level_ok",
+            "op": "==",
+            "value_min": 1
+          }
+        ]
+      },
+      "actions": [
+        {
+          "type": "relay_pulse",
+          "target_relay": 2,
+          "duration_ms": 3000,
+          "message": "Dosagem pH+ por 3s - pH baixo detectado"
+        },
+        {
+          "type": "log_event",
+          "message": "pH baixo corrigido automaticamente"
+        }
+      ],
+      "safety_checks": [
+        {
+          "name": "Verificação nível mínimo",
+          "condition": {
+            "type": "system_status",
+            "sensor_name": "water_level_ok",
+            "op": "==",
+            "value_min": 1
+          },
+          "error_message": "Nível de água insuficiente para dosagem",
+          "is_critical": false
+        },
+        {
+          "name": "pH não crítico",
+          "condition": {
+            "type": "sensor_compare",
+            "sensor_name": "ph",
+            "op": ">",
+            "value_min": 4.0
+          },
+          "error_message": "pH extremamente baixo - intervenção manual necessária",
+          "is_critical": true
+        }
+      ],
+      "trigger_type": "periodic",
+      "trigger_interval_ms": 30000,
+      "cooldown_ms": 300000,
+      "max_executions_per_hour": 6
+    },
+    {
+      "id": "ph_correction_high",
+      "name": "Correção pH Alto",
+      "description": "Ativa dosador de pH- quando pH está acima de 7.2",
+      "enabled": true,
+      "priority": 85,
+      "condition": {
+        "type": "composite",
+        "logic_operator": "AND",
+        "sub_conditions": [
+          {
+            "type": "sensor_compare",
+            "sensor_name": "ph",
+            "op": ">",
+            "value_min": 7.2
+          },
+          {
+            "type": "system_status",
+            "sensor_name": "water_level_ok",
+            "op": "==",
+            "value_min": 1
+          }
+        ]
+      },
+      "actions": [
+        {
+          "type": "relay_pulse",
+          "target_relay": 3,
+          "duration_ms": 2000,
+          "message": "Dosagem pH- por 2s - pH alto detectado"
+        }
+      ],
+      "safety_checks": [
+        {
+          "name": "pH não crítico alto",
+          "condition": {
+            "type": "sensor_compare",
+            "sensor_name": "ph",
+            "op": "<",
+            "value_min": 9.0
+          },
+          "error_message": "pH extremamente alto - intervenção manual necessária",
+          "is_critical": true
+        }
+      ],
+      "trigger_type": "periodic",
+      "trigger_interval_ms": 30000,
+      "cooldown_ms": 300000,
+      "max_executions_per_hour": 6
+    },
+    {
+      "id": "nutrient_dosing",
+      "name": "Dosagem de Nutrientes",
+      "description": "Adiciona nutrientes quando TDS está baixo",
+      "enabled": true,
+      "priority": 70,
+      "condition": {
+        "type": "composite",
+        "logic_operator": "AND",
+        "sub_conditions": [
+          {
+            "type": "sensor_compare",
+            "sensor_name": "tds",
+            "op": "<",
+            "value_min": 800
+          },
+          {
+            "type": "sensor_compare",
+            "sensor_name": "ph",
+            "op": "between",
+            "value_min": 5.5,
+            "value_max": 7.0
+          },
+          {
+            "type": "system_status",
+            "sensor_name": "water_level_ok",
+            "op": "==",
+            "value_min": 1
+          }
+        ]
+      },
+      "actions": [
+        {
+          "type": "relay_pulse",
+          "target_relay": 1,
+          "duration_ms": 5000,
+          "message": "Dosagem nutrientes por 5s - TDS baixo"
+        },
+        {
+          "type": "supabase_update",
+          "message": "Dosagem automática de nutrientes realizada"
+        }
+      ],
+      "safety_checks": [
+        {
+          "name": "TDS máximo",
+          "condition": {
+            "type": "sensor_compare",
+            "sensor_name": "tds",
+            "op": "<",
+            "value_min": 2000
+          },
+          "error_message": "TDS muito alto - não adicionar mais nutrientes",
+          "is_critical": false
+        }
+      ],
+      "trigger_type": "periodic",
+      "trigger_interval_ms": 60000,
+      "cooldown_ms": 600000,
+      "max_executions_per_hour": 3
+    },
+    {
+      "id": "circulation_control",
+      "name": "Controle de Circulação",
+      "description": "Liga bomba de circulação periodicamente para manter oxigenação",
+      "enabled": true,
+      "priority": 60,
+      "condition": {
+        "type": "system_status",
+        "sensor_name": "water_level_ok",
+        "op": "==",
+        "value_min": 1
+      },
+      "actions": [
+        {
+          "type": "relay_pulse",
+          "target_relay": 6,
+          "duration_ms": 600000,
+          "message": "Circulação ativa por 10 minutos"
+        }
+      ],
+      "safety_checks": [
+        {
+          "name": "Temperatura segura",
+          "condition": {
+            "type": "sensor_compare",
+            "sensor_name": "temp_water",
+            "op": "<",
+            "value_min": 35.0
+          },
+          "error_message": "Temperatura da água muito alta para circulação",
+          "is_critical": false
+        }
+      ],
+      "trigger_type": "periodic",
+      "trigger_interval_ms": 1800000,
+      "cooldown_ms": 0,
+      "max_executions_per_hour": 0
+    },
+    {
+      "id": "oxygenation_low_temp",
+      "name": "Oxigenação por Temperatura",
+      "description": "Aumenta oxigenação quando temperatura da água está alta",
+      "enabled": true,
+      "priority": 75,
+      "condition": {
+        "type": "composite",
+        "logic_operator": "AND",
+        "sub_conditions": [
+          {
+            "type": "sensor_compare",
+            "sensor_name": "temp_water",
+            "op": ">",
+            "value_min": 28.0
+          },
+          {
+            "type": "system_status",
+            "sensor_name": "water_level_ok",
+            "op": "==",
+            "value_min": 1
+          }
+        ]
+      },
+      "actions": [
+        {
+          "type": "relay_on",
+          "target_relay": 7,
+          "message": "Oxigenação intensiva - temperatura alta"
+        },
+        {
+          "type": "system_alert",
+          "message": "Temperatura da água elevada - oxigenação ativada"
+        }
+      ],
+      "safety_checks": [
+        {
+          "name": "Temperatura crítica",
+          "condition": {
+            "type": "sensor_compare",
+            "sensor_name": "temp_water",
+            "op": "<",
+            "value_min": 40.0
+          },
+          "error_message": "Temperatura crítica - sistema de emergência necessário",
+          "is_critical": true
+        }
+      ],
+      "trigger_type": "on_change",
+      "cooldown_ms": 300000,
+      "max_executions_per_hour": 0
+    },
+    {
+      "id": "emergency_shutdown",
+      "name": "Parada de Emergência",
+      "description": "Para todas as operações em situações críticas",
+      "enabled": true,
+      "priority": 100,
+      "condition": {
+        "type": "composite",
+        "logic_operator": "OR",
+        "sub_conditions": [
+          {
+            "type": "sensor_compare",
+            "sensor_name": "temp_water",
+            "op": ">",
+            "value_min": 40.0
+          },
+          {
+            "type": "sensor_compare",
+            "sensor_name": "ph",
+            "op": "outside",
+            "value_min": 3.0,
+            "value_max": 10.0
+          },
+          {
+            "type": "system_status",
+            "sensor_name": "free_heap",
+            "op": "<",
+            "value_min": 10000
+          }
+        ]
+      },
+      "actions": [
+        {
+          "type": "relay_off",
+          "target_relay": 0,
+          "message": "EMERGÊNCIA: Desligando bomba principal"
+        },
+        {
+          "type": "relay_off",
+          "target_relay": 1,
+          "message": "EMERGÊNCIA: Desligando bomba nutrientes"
+        },
+        {
+          "type": "relay_off",
+          "target_relay": 2,
+          "message": "EMERGÊNCIA: Desligando bomba pH"
+        },
+        {
+          "type": "system_alert",
+          "message": "SISTEMA EM EMERGÊNCIA - Intervenção manual necessária"
+        },
+        {
+          "type": "supabase_update",
+          "message": "Parada de emergência ativada automaticamente"
+        }
+      ],
+      "safety_checks": [],
+      "trigger_type": "on_change",
+      "cooldown_ms": 0,
+      "max_executions_per_hour": 0
+    },
+    {
+      "id": "night_lighting",
+      "name": "Iluminação Noturna",
+      "description": "Controla iluminação LED baseado no horário",
+      "enabled": false,
+      "priority": 30,
+      "condition": {
+        "type": "time_window",
+        "string_value": "18:00-06:00"
+      },
+      "actions": [
+        {
+          "type": "relay_on",
+          "target_relay": 11,
+          "message": "Iluminação LED noturna ativada"
+        }
+      ],
+      "safety_checks": [],
+      "trigger_type": "scheduled",
+      "cooldown_ms": 0,
+      "max_executions_per_hour": 0
+    }
+  ]
+}
