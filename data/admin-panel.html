@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Hidropônico - Painel Admin</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
+            min-height: 100vh;
+            padding: 1rem;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .header h1 {
+            color: #1e40af;
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+        .status-connected {
+            background: #dcfce7;
+            color: #166534;
+        }
+        .status-disconnected {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        .card h2 {
+            color: #374151;
+            margin-bottom: 1.5rem;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 0;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .metric:last-child {
+            border-bottom: none;
+        }
+        .metric-label {
+            color: #6b7280;
+            font-weight: 600;
+        }
+        .metric-value {
+            font-weight: 700;
+            font-size: 1.1rem;
+        }
+        .metric-good { color: #16a34a; }
+        .metric-warning { color: #ca8a04; }
+        .metric-danger { color: #dc2626; }
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #f3f4f6;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+        .progress-fill {
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .btn {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn:hover {
+            background: #1d4ed8;
+            transform: translateY(-2px);
+        }
+        .btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .btn-danger {
+            background: #dc2626;
+        }
+        .btn-danger:hover {
+            background: #b91c1c;
+        }
+        .btn-success {
+            background: #16a34a;
+        }
+        .btn-success:hover {
+            background: #15803d;
+        }
+        .console {
+            background: #1f2937;
+            color: #f9fafb;
+            border-radius: 16px;
+            padding: 2rem;
+            font-family: 'Courier New', monospace;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .console h3 {
+            margin-bottom: 1rem;
+            color: #60a5fa;
+        }
+        .console-line {
+            margin-bottom: 0.5rem;
+            padding: 0.25rem 0;
+        }
+        .console-timestamp {
+            color: #9ca3af;
+            font-size: 0.8rem;
+        }
+        .console-info { color: #60a5fa; }
+        .console-warning { color: #fbbf24; }
+        .console-error { color: #f87171; }
+        .console-success { color: #34d399; }
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        .hidden { display: none; }
+        
+        /* ✅ TÓPICO 4: ESTILOS PARA PANEL DE RELAYS (como MASTER-TASK) */
+        .relays-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+        .relay-btn {
+            padding: 1rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: 2px solid rgba(255,255,255,0.3);
+            min-height: 80px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0.25rem;
+        }
+        .relay-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        .relay-btn.on {
+            background: #16a34a;
+            border-color: #15803d;
+        }
+        .relay-btn.off {
+            background: rgba(255,255,255,0.15);
+            border-color: rgba(255,255,255,0.3);
+        }
+        .slaves-list {
+            margin-top: 1rem;
+        }
+        .slave-card {
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .slave-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .slave-name {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: white;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .slave-status {
+            font-size: 0.9rem;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            background: rgba(255,255,255,0.2);
+            color: white;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        .status-online {
+            background-color: #16a34a;
+        }
+        .status-offline {
+            background-color: #dc2626;
+        }
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .info-item:last-child {
+            border-bottom: none;
+        }
+        .info-item .label {
+            font-weight: 600;
+            color: #ffd700;
+        }
+        .info-item .value {
+            font-weight: 500;
+            color: white;
+        }
+        .loading {
+            text-align: center;
+            padding: 1rem;
+            color: rgba(255,255,255,0.7);
+        }
+        #message {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 1000;
+            display: none;
+            animation: slideIn 0.3s ease;
+            color: white;
+            font-weight: 600;
+        }
+        .success {
+            background: rgba(22, 163, 74, 0.9);
+        }
+        .error {
+            background: rgba(220, 38, 38, 0.9);
+        }
+        @keyframes slideIn {
+            from {
+                transform: translateX(400px);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ESP32 Hidropônico - Painel Admin</h1>
+            <div id="connection-status" class="status-indicator status-disconnected">
+                <span>●</span>
+                <span>Desconectado</span>
+            </div>
+        </div>
+        
+        <div class="dashboard">
+            <div class="card">
+                <h2>💾 Memória do Sistema</h2>
+                <div class="metric">
+                    <span class="metric-label">Heap Total</span>
+                    <span id="heap-total" class="metric-value">-- KB</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Heap Livre</span>
+                    <span id="heap-free" class="metric-value">-- KB</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Uso de Memória</span>
+                    <span id="heap-usage" class="metric-value">--%</span>
+                </div>
+                <div class="progress-bar">
+                    <div id="heap-progress" class="progress-fill" style="width: 0%; background: #16a34a;"></div>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Fragmentação</span>
+                    <span id="fragmentation" class="metric-value">--%</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>⏱️ Sistema</h2>
+                <div class="metric">
+                    <span class="metric-label">Uptime</span>
+                    <span id="uptime" class="metric-value">-- h -- min</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Status de Saúde</span>
+                    <span id="health-status" class="metric-value">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Conexões Ativas</span>
+                    <span id="active-connections" class="metric-value">-- / 3</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Próximo Reset</span>
+                    <span id="next-reset" class="metric-value">--</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🌱 Sistema Hidropônico</h2>
+                <div class="metric">
+                    <span class="metric-label">Estado Atual</span>
+                    <span id="hydro-state" class="metric-value">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Sensor 1</span>
+                    <span id="sensor1" class="metric-value">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Sensor 2</span>
+                    <span id="sensor2" class="metric-value">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Relés Ativos</span>
+                    <span id="active-relays" class="metric-value">--</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🔗 Conectividade</h2>
+                <div class="metric">
+                    <span class="metric-label">WiFi</span>
+                    <span id="wifi-status" class="metric-value">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">IP Local</span>
+                    <span id="local-ip" class="metric-value">--</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">RSSI</span>
+                    <span id="wifi-rssi" class="metric-value">-- dBm</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Supabase</span>
+                    <span id="supabase-status" class="metric-value">--</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- ✅ TÓPICO 4: PANEL DE CONTROL DE RELAYS (como MASTER-TASK) -->
+        <div class="card" style="margin-bottom: 2rem;">
+            <h2>🎮 Controles Generales</h2>
+            <div class="controls">
+                <button class="btn btn-primary" onclick="discoverSlaves()">🔍 Buscar Slaves</button>
+                <button class="btn btn-success" onclick="allRelaysOn()">🔌 All ON</button>
+                <button class="btn btn-danger" onclick="allRelaysOff()">🔄 All OFF</button>
+                <button class="btn" onclick="refreshData()">🔄 Actualizar</button>
+                <button class="btn" onclick="requestMemoryReport()">📊 Relatório de Memória</button>
+                <button class="btn" onclick="requestSystemStatus()">🔍 Status do Sistema</button>
+            </div>
+        </div>
+        
+        <!-- ✅ TÓPICO 4: RELAYS LOCALES (Master) -->
+        <div class="card" style="margin-bottom: 2rem;">
+            <h2>🔌 Relés Locales (Master)</h2>
+            <div id="localRelaysGrid" class="relays-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1rem; margin-top: 1rem;">
+                <div class="loading">Cargando relays locales...</div>
+            </div>
+        </div>
+        
+        <!-- ✅ TÓPICO 4: SLAVES CONECTADOS (como MASTER-TASK) -->
+        <div class="card" style="margin-bottom: 2rem;">
+            <h2>🤖 Slaves Conectados (<span id="slaveCount">0</span>)</h2>
+            <div id="slavesList" class="slaves-list" style="margin-top: 1rem;">
+                <div class="loading">Cargando slaves...</div>
+            </div>
+        </div>
+        
+        <div class="controls">
+            <button class="btn btn-success" onclick="requestHealthCheck()">💚 Verificar Saúde</button>
+            <button class="btn" onclick="requestConnectionInfo()">🔗 Info de Conexões</button>
+            <button class="btn btn-danger" onclick="requestForceReset()">🔄 Reset Forçado</button>
+            <button class="btn btn-danger" onclick="exitAdminMode()">❌ Sair do Admin</button>
+        </div>
+        
+        <div class="card">
+            <div class="console">
+                <h3>📊 Console de Debug</h3>
+                <div id="console-output">
+                    <div class="console-line console-info">
+                        <span class="console-timestamp">[--:--:--]</span>
+                        Conectando ao WebSocket...
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- ✅ TÓPICO 4: Mensaje flotante -->
+        <div id="message"></div>
+    </div>
+    
+    <script>
+        let ws = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                console.log('WebSocket conectado');
+                updateConnectionStatus(true);
+                addConsoleMessage('WebSocket conectado com sucesso', 'success');
+                reconnectAttempts = 0;
+                requestInitialData();
+            };
+            
+            ws.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleWebSocketMessage(data);
+                } catch (error) {
+                    console.error('Erro ao processar mensagem WebSocket:', error);
+                    addConsoleMessage('Erro ao processar mensagem: ' + error.message, 'error');
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('WebSocket desconectado');
+                updateConnectionStatus(false);
+                addConsoleMessage('WebSocket desconectado', 'warning');
+                
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    addConsoleMessage(`Tentativa de reconexão ${reconnectAttempts}/${maxReconnectAttempts}...`, 'info');
+                    setTimeout(connectWebSocket, 3000);
+                } else {
+                    addConsoleMessage('Máximo de tentativas de reconexão atingido', 'error');
+                }
+            };
+            
+            ws.onerror = function(error) {
+                console.error('Erro WebSocket:', error);
+                addConsoleMessage('Erro na conexão WebSocket', 'error');
+            };
+        }
+        
+        function updateConnectionStatus(connected) {
+            const statusEl = document.getElementById('connection-status');
+            if (connected) {
+                statusEl.className = 'status-indicator status-connected pulse';
+                statusEl.innerHTML = '<span>●</span><span>Conectado</span>';
+            } else {
+                statusEl.className = 'status-indicator status-disconnected';
+                statusEl.innerHTML = '<span>●</span><span>Desconectado</span>';
+            }
+        }
+        
+        function addConsoleMessage(message, type = 'info') {
+            const consoleOutput = document.getElementById('console-output');
+            const timestamp = new Date().toLocaleTimeString();
+            
+            const line = document.createElement('div');
+            line.className = `console-line console-${type}`;
+            line.innerHTML = `
+                <span class="console-timestamp">[${timestamp}]</span>
+                ${message}
+            `;
+            
+            consoleOutput.appendChild(line);
+            consoleOutput.scrollTop = consoleOutput.scrollHeight;
+            
+            // Limitar a 100 linhas
+            const lines = consoleOutput.children;
+            if (lines.length > 100) {
+                consoleOutput.removeChild(lines[0]);
+            }
+        }
+        
+        function handleWebSocketMessage(data) {
+            switch (data.type) {
+                case 'memory_status':
+                    updateMemoryStatus(data.data);
+                    break;
+                case 'system_status':
+                    updateSystemStatus(data.data);
+                    break;
+                case 'hydro_status':
+                    updateHydroStatus(data.data);
+                    break;
+                case 'connection_status':
+                    updateConnectionStatus(data.data);
+                    break;
+                case 'console_message':
+                    addConsoleMessage(data.message, data.level || 'info');
+                    break;
+                default:
+                    console.log('Mensagem WebSocket não reconhecida:', data);
+            }
+        }
+        
+        function updateMemoryStatus(data) {
+            document.getElementById('heap-total').textContent = `${Math.round(data.heap_total / 1024)} KB`;
+            document.getElementById('heap-free').textContent = `${Math.round(data.heap_free / 1024)} KB`;
+            document.getElementById('heap-usage').textContent = `${data.heap_usage_percent}%`;
+            document.getElementById('fragmentation').textContent = `${data.fragmentation_percent}%`;
+            
+            // Atualizar barra de progresso
+            const progressBar = document.getElementById('heap-progress');
+            progressBar.style.width = `${data.heap_usage_percent}%`;
+            
+            // Cor baseada no uso
+            if (data.heap_usage_percent < 60) {
+                progressBar.style.background = '#16a34a'; // Verde
+            } else if (data.heap_usage_percent < 80) {
+                progressBar.style.background = '#ca8a04'; // Amarelo
+            } else {
+                progressBar.style.background = '#dc2626'; // Vermelho
+            }
+            
+            // Status de saúde
+            const healthEl = document.getElementById('health-status');
+            const status = data.health_status || 'unknown';
+            healthEl.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+            healthEl.className = `metric-value metric-${getHealthColor(status)}`;
+        }
+        
+        function updateSystemStatus(data) {
+            const uptimeHours = data.uptime_hours || 0;
+            const uptimeMinutes = data.uptime_minutes || 0;
+            document.getElementById('uptime').textContent = `${uptimeHours}h ${uptimeMinutes}min`;
+            document.getElementById('active-connections').textContent = `${data.active_connections || 0} / 3`;
+            document.getElementById('next-reset').textContent = data.next_reset || '--';
+        }
+        
+        function updateHydroStatus(data) {
+            document.getElementById('hydro-state').textContent = data.state || '--';
+            document.getElementById('sensor1').textContent = data.sensor1 || '--';
+            document.getElementById('sensor2').textContent = data.sensor2 || '--';
+            document.getElementById('active-relays').textContent = data.active_relays || '--';
+        }
+        
+        function updateConnectionInfo(data) {
+            document.getElementById('wifi-status').textContent = data.wifi_connected ? 'Conectado' : 'Desconectado';
+            document.getElementById('local-ip').textContent = data.local_ip || '--';
+            document.getElementById('wifi-rssi').textContent = data.wifi_rssi ? `${data.wifi_rssi} dBm` : '--';
+            document.getElementById('supabase-status').textContent = data.supabase_status || '--';
+        }
+        
+        function getHealthColor(status) {
+            switch (status) {
+                case 'healthy': return 'good';
+                case 'warning': return 'warning';
+                case 'critical': return 'danger';
+                default: return '';
+            }
+        }
+        
+        function sendWebSocketMessage(type, data = {}) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type, data }));
+            } else {
+                addConsoleMessage('WebSocket não conectado', 'error');
+            }
+        }
+        
+        function requestInitialData() {
+            sendWebSocketMessage('get_memory_status');
+            sendWebSocketMessage('get_system_status');
+            sendWebSocketMessage('get_hydro_status');
+            sendWebSocketMessage('get_connection_status');
+        }
+        
+        function requestMemoryReport() {
+            sendWebSocketMessage('get_memory_report');
+            addConsoleMessage('Solicitado relatório de memória', 'info');
+        }
+        
+        function requestSystemStatus() {
+            sendWebSocketMessage('get_system_status');
+            addConsoleMessage('Solicitado status do sistema', 'info');
+        }
+        
+        function requestHealthCheck() {
+            sendWebSocketMessage('health_check');
+            addConsoleMessage('Solicitada verificação de saúde', 'info');
+        }
+        
+        function requestConnectionInfo() {
+            sendWebSocketMessage('get_connection_info');
+            addConsoleMessage('Solicitada informação de conexões', 'info');
+        }
+        
+        function requestForceReset() {
+            if (confirm('Tem certeza que deseja forçar o reset do sistema?')) {
+                sendWebSocketMessage('force_reset');
+                addConsoleMessage('Reset forçado solicitado', 'warning');
+            }
+        }
+        
+        function exitAdminMode() {
+            if (confirm('Tem certeza que deseja sair do modo admin?')) {
+                sendWebSocketMessage('exit_admin');
+                addConsoleMessage('Saindo do modo admin...', 'info');
+                setTimeout(() => {
+                    window.close();
+                }, 2000);
+            }
+        }
+        
+        // ✅ TÓPICO 4: FUNCIONES PARA PANEL DE CONTROL DE RELAYS (como MASTER-TASK)
+        
+        function showMessage(text, isError = false) {
+            const msg = document.getElementById('message');
+            msg.textContent = text;
+            msg.className = isError ? 'error' : 'success';
+            msg.style.display = 'block';
+            setTimeout(() => {
+                msg.style.display = 'none';
+            }, 3000);
+        }
+        
+        async function fetchLocalRelays() {
+            try {
+                const response = await fetch('/api/relays');
+                const data = await response.json();
+                
+                const grid = document.getElementById('localRelaysGrid');
+                if (!data.relays || data.relays.length === 0) {
+                    grid.innerHTML = '<div class="loading">No hay relays disponibles</div>';
+                    return;
+                }
+                
+                grid.innerHTML = data.relays.map(relay => `
+                    <button class="relay-btn ${relay.state ? 'on' : 'off'}" 
+                            onclick="toggleLocalRelay(${relay.id}, '${relay.state ? 'off' : 'on'}')">
+                        ${relay.name || `Relé ${relay.id}`}
+                        <br>
+                        <small>${relay.state ? 'ON' : 'OFF'}</small>
+                    </button>
+                `).join('');
+            } catch (error) {
+                console.error('Error fetching local relays:', error);
+                document.getElementById('localRelaysGrid').innerHTML = '<div class="error">Error al cargar relays</div>';
+            }
+        }
+        
+        async function toggleLocalRelay(relayNum, action) {
+            try {
+                const params = new URLSearchParams({
+                    relay: relayNum,
+                    action: action
+                });
+                
+                const response = await fetch('/api/relay?' + params.toString(), {
+                    method: 'POST'
+                });
+                
+                const data = await response.json();
+                if (data.status === 'ok' || data.success) {
+                    showMessage(`Relé ${relayNum} ${action === 'on' ? 'encendido' : 'apagado'}`, false);
+                    setTimeout(() => fetchLocalRelays(), 500);
+                } else {
+                    showMessage(`Error: ${data.message || 'Error al controlar relé'}`, true);
+                }
+            } catch (error) {
+                showMessage('Error al enviar comando', true);
+                console.error('Error:', error);
+            }
+        }
+        
+        async function fetchSlaves() {
+            try {
+                const response = await fetch('/api/slaves');
+                const data = await response.json();
+                
+                const slavesList = document.getElementById('slavesList');
+                const slaveCount = document.getElementById('slaveCount');
+                
+                if (!data.slaves || data.slaves.length === 0) {
+                    slavesList.innerHTML = '<div class="info-item">No hay slaves detectados</div>';
+                    slaveCount.textContent = '0';
+                    return;
+                }
+                
+                slaveCount.textContent = data.slaves.length;
+                
+                slavesList.innerHTML = data.slaves.map(slave => `
+                    <div class="slave-card">
+                        <div class="slave-header">
+                            <div class="slave-name">
+                                <span class="status-indicator ${slave.is_online ? 'status-online' : 'status-offline'}"></span>
+                                ${slave.device_name || slave.device_id}
+                            </div>
+                            <div class="slave-status">${slave.is_online ? 'Online' : 'Offline'}</div>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">Device ID:</span>
+                            <span class="value">${slave.device_id}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">Tipo:</span>
+                            <span class="value">${slave.device_type || 'RelayBox'}</span>
+                        </div>
+                        ${slave.is_online ? `
+                            <div class="info-item">
+                                <span class="label">Relés:</span>
+                                <span class="value">${slave.num_relays || 8}</span>
+                            </div>
+                            <div class="relays-grid" style="margin-top: 1rem;">
+                                ${(slave.relays || []).map((relay, idx) => `
+                                    <button class="relay-btn ${relay.state ? 'on' : 'off'}" 
+                                            onclick="toggleSlaveRelay('${slave.device_id}', ${relay.relay_number || idx}, '${relay.state ? 'off' : 'on'}')">
+                                        ${relay.name || `Relé ${relay.relay_number || idx}`}
+                                        <br>
+                                        <small>${relay.state ? 'ON' : 'OFF'}</small>
+                                    </button>
+                                `).join('')}
+                            </div>
+                        ` : '<div class="info-item"><span class="value">Slave offline - no se pueden controlar relays</span></div>'}
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error fetching slaves:', error);
+                document.getElementById('slavesList').innerHTML = '<div class="error">Error al cargar slaves</div>';
+            }
+        }
+        
+        async function toggleSlaveRelay(deviceId, relayNum, action) {
+            try {
+                const params = new URLSearchParams({
+                    relay: relayNum,
+                    action: action,
+                    device_id: deviceId
+                });
+                
+                const response = await fetch('/api/relay?' + params.toString(), {
+                    method: 'POST'
+                });
+                
+                const data = await response.json();
+                if (data.status === 'ok' || data.success) {
+                    showMessage(`Relé ${relayNum} de ${deviceId} ${action === 'on' ? 'encendido' : 'apagado'}`, false);
+                    setTimeout(() => fetchSlaves(), 500);
+                } else {
+                    showMessage(`Error: ${data.message || 'Error al controlar relé'}`, true);
+                }
+            } catch (error) {
+                showMessage('Error al enviar comando', true);
+                console.error('Error:', error);
+            }
+        }
+        
+        async function discoverSlaves() {
+            try {
+                showMessage('Buscando slaves...', false);
+                const response = await fetch('/api/discover', { method: 'POST' });
+                const data = await response.json();
+                showMessage(data.message || 'Discovery iniciado', false);
+                setTimeout(() => fetchSlaves(), 2000);
+            } catch (error) {
+                showMessage('Error al iniciar discovery', true);
+                console.error('Error:', error);
+            }
+        }
+        
+        async function allRelaysOn() {
+            if (!confirm('¿Encender TODOS los relés locales?')) return;
+            try {
+                showMessage('Encendiendo todos los relés...', false);
+                const response = await fetch('/api/all/on', { method: 'POST' });
+                const data = await response.json();
+                showMessage(data.message || 'Comando enviado', false);
+                setTimeout(() => fetchLocalRelays(), 1000);
+            } catch (error) {
+                showMessage('Error al enviar comando', true);
+                console.error('Error:', error);
+            }
+        }
+        
+        async function allRelaysOff() {
+            if (!confirm('¿Apagar TODOS los relés locales?')) return;
+            try {
+                showMessage('Apagando todos los relés...', false);
+                const response = await fetch('/api/all/off', { method: 'POST' });
+                const data = await response.json();
+                showMessage(data.message || 'Comando enviado', false);
+                setTimeout(() => fetchLocalRelays(), 1000);
+            } catch (error) {
+                showMessage('Error al enviar comando', true);
+                console.error('Error:', error);
+            }
+        }
+        
+        function refreshData() {
+            fetchLocalRelays();
+            fetchSlaves();
+            showMessage('Datos actualizados', false);
+        }
+        
+        // Inicializar conexão WebSocket
+        connectWebSocket();
+        
+        // ✅ TÓPICO 4: Cargar datos iniciales
+        fetchLocalRelays();
+        fetchSlaves();
+        
+        // Auto-refresh cada 3 segundos (como MASTER-TASK)
+        setInterval(() => {
+            fetchLocalRelays();
+            fetchSlaves();
+        }, 3000);
+        
+        // Atualizar dados a cada 5 segundos (WebSocket)
+        setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                requestInitialData();
+            }
+        }, 5000);
+    </script>
+</body>
+</html> 

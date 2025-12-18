@@ -1,0 +1,290 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ESP-HIDROWAVE Decision Engine Rules Schema",
+  "description": "Schema de validação para regras do motor de decisões hidropônico",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Versão do schema de regras",
+      "default": "1.0.0"
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "author": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "description": "Lista de regras do motor de decisões",
+      "items": {
+        "$ref": "#/definitions/DecisionRule"
+      },
+      "maxItems": 50
+    }
+  },
+  "required": ["rules"],
+  "definitions": {
+    "DecisionRule": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "ID único da regra",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "minLength": 3,
+          "maxLength": 50
+        },
+        "name": {
+          "type": "string",
+          "description": "Nome descritivo da regra",
+          "minLength": 3,
+          "maxLength": 100
+        },
+        "description": {
+          "type": "string",
+          "description": "Descrição detalhada da regra",
+          "maxLength": 500
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Se a regra está ativa",
+          "default": true
+        },
+        "priority": {
+          "type": "integer",
+          "description": "Prioridade da regra (0-100, maior = mais importante)",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 50
+        },
+        "condition": {
+          "$ref": "#/definitions/RuleCondition"
+        },
+        "actions": {
+          "type": "array",
+          "description": "Lista de ações a serem executadas",
+          "items": {
+            "$ref": "#/definitions/RuleAction"
+          },
+          "minItems": 1,
+          "maxItems": 10
+        },
+        "safety_checks": {
+          "type": "array",
+          "description": "Verificações de segurança (interlocks)",
+          "items": {
+            "$ref": "#/definitions/SafetyCheck"
+          },
+          "maxItems": 5
+        },
+        "trigger_type": {
+          "type": "string",
+          "description": "Tipo de trigger da regra",
+          "enum": ["periodic", "on_change", "scheduled"],
+          "default": "periodic"
+        },
+        "trigger_interval_ms": {
+          "type": "integer",
+          "description": "Intervalo para triggers periódicos (ms)",
+          "minimum": 1000,
+          "maximum": 86400000,
+          "default": 30000
+        },
+        "cooldown_ms": {
+          "type": "integer",
+          "description": "Tempo mínimo entre execuções (ms)",
+          "minimum": 0,
+          "maximum": 86400000,
+          "default": 0
+        },
+        "max_executions_per_hour": {
+          "type": "integer",
+          "description": "Limite máximo de execuções por hora (0 = ilimitado)",
+          "minimum": 0,
+          "maximum": 3600,
+          "default": 0
+        }
+      },
+      "required": ["id", "name", "condition", "actions"],
+      "additionalProperties": false
+    },
+    "RuleCondition": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Tipo da condição",
+          "enum": ["sensor_compare", "time_window", "relay_state", "system_status", "composite"]
+        },
+        "sensor_name": {
+          "type": "string",
+          "description": "Nome do sensor ou parâmetro",
+          "enum": [
+            "ph", "tds", "ec", "temp_water", "temp_environment", "humidity",
+            "water_level_ok", "wifi_connected", "supabase_connected", "free_heap", "uptime",
+            "relay_0", "relay_1", "relay_2", "relay_3", "relay_4", "relay_5", "relay_6", "relay_7",
+            "relay_8", "relay_9", "relay_10", "relay_11", "relay_12", "relay_13", "relay_14", "relay_15"
+          ]
+        },
+        "op": {
+          "type": "string",
+          "description": "Operador de comparação",
+          "enum": ["<", "<=", ">", ">=", "==", "!=", "between", "outside"]
+        },
+        "value_min": {
+          "type": "number",
+          "description": "Valor mínimo para comparação"
+        },
+        "value_max": {
+          "type": "number",
+          "description": "Valor máximo para comparação (usado em 'between' e 'outside')"
+        },
+        "string_value": {
+          "type": "string",
+          "description": "Valor string para comparações de texto"
+        },
+        "negate": {
+          "type": "boolean",
+          "description": "Negação da condição (!condition)",
+          "default": false
+        },
+        "sub_conditions": {
+          "type": "array",
+          "description": "Sub-condições para condições compostas",
+          "items": {
+            "$ref": "#/definitions/RuleCondition"
+          },
+          "maxItems": 10
+        },
+        "logic_operator": {
+          "type": "string",
+          "description": "Operador lógico para condições compostas",
+          "enum": ["AND", "OR"]
+        }
+      },
+      "required": ["type"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "sensor_compare" } }
+          },
+          "then": {
+            "required": ["sensor_name", "op", "value_min"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "composite" } }
+          },
+          "then": {
+            "required": ["sub_conditions", "logic_operator"]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "RuleAction": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Tipo da ação",
+          "enum": ["relay_on", "relay_off", "relay_pulse", "relay_pwm", "system_alert", "log_event", "supabase_update"]
+        },
+        "target_relay": {
+          "type": "integer",
+          "description": "ID do relé alvo (0-15)",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "duration_ms": {
+          "type": "integer",
+          "description": "Duração da ação em ms",
+          "minimum": 0,
+          "maximum": 86400000
+        },
+        "value": {
+          "type": "number",
+          "description": "Valor para PWM ou dosagem",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "message": {
+          "type": "string",
+          "description": "Mensagem para logs/alertas",
+          "maxLength": 200
+        },
+        "repeat": {
+          "type": "boolean",
+          "description": "Se deve repetir a ação",
+          "default": false
+        },
+        "repeat_interval_ms": {
+          "type": "integer",
+          "description": "Intervalo de repetição (ms)",
+          "minimum": 1000,
+          "maximum": 86400000
+        }
+      },
+      "required": ["type"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { 
+              "type": { 
+                "enum": ["relay_on", "relay_off", "relay_pulse", "relay_pwm"] 
+              } 
+            }
+          },
+          "then": {
+            "required": ["target_relay"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "relay_pulse" } }
+          },
+          "then": {
+            "required": ["duration_ms"],
+            "properties": {
+              "duration_ms": { "minimum": 100 }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "SafetyCheck": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Nome do check de segurança",
+          "minLength": 3,
+          "maxLength": 100
+        },
+        "condition": {
+          "$ref": "#/definitions/RuleCondition"
+        },
+        "error_message": {
+          "type": "string",
+          "description": "Mensagem de erro quando o check falha",
+          "minLength": 5,
+          "maxLength": 200
+        },
+        "is_critical": {
+          "type": "boolean",
+          "description": "Se true, para todo o sistema quando falha",
+          "default": false
+        }
+      },
+      "required": ["name", "condition", "error_message"],
+      "additionalProperties": false
+    }
+  }
+}
