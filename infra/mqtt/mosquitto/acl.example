@@ -1,0 +1,23 @@
+# Copiar para: /var/lib/mosquitto/acl
+# chmod 640, owner mosquitto
+# Documentação: docs/mqtt/04_MODELAGEM_TOPICOS_PAYLOADS.md
+
+# --- Usuário do bridge (servidor) ---
+user bridge_internal
+topic read hidrowave/+/heartbeat
+topic read hidrowave/+/telemetry
+topic read hidrowave/+/status
+topic read hidrowave/+/ec_operation
+topic read hidrowave/+/dose
+topic read hidrowave/+/relay/state
+topic write hidrowave/+/command
+
+# --- Um ESP (substituir XXXXXX pelo sufixo MAC) ---
+user mqtt_ESP32_HIDRO_XXXXXX
+topic read hidrowave/ESP32_HIDRO_XXXXXX/command
+topic write hidrowave/ESP32_HIDRO_XXXXXX/#
+
+# --- Dev temporário (remover em produção se usar user por device) ---
+# user hidrowave
+# topic read hidrowave/ESP32_HIDRO_269844/command
+# topic write hidrowave/ESP32_HIDRO_269844/#

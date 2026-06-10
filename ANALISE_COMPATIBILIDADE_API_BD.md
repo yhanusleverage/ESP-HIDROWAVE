@@ -82,10 +82,10 @@
 }
 ```
 
-**Compatibilidade com BD**: ⚠️ **PARCIAL**
-- Dados são salvos localmente no ESP
-- **FALTA**: Sincronização com tabela `nutrition_plans`
-- **FALTA**: Registro de dosagens na tabela `nutrient_dosages`
+**Compatibilidade com BD**: ✅ **IMPLEMENTADO (código)** — ver [`HIDROWAVE-main/docs/HANDOFF_ULTIMA_DOSAGEM_E2E.md`](../../HIDROWAVE-main/docs/HANDOFF_ULTIMA_DOSAGEM_E2E.md)
+- INSERT em `nutrient_dosages` após cada nutriente (`SupabaseClient::insertNutrientDosage`)
+- UI lê SUM(ml) via `useLastDosage`
+- **Prod:** executar SQL + flash + validar KPI
 
 ---
 
@@ -169,14 +169,15 @@
 
 ### Tabela: `nutrient_dosages`
 
-**Status**: ❌ **NÃO IMPLEMENTADO**
+**Status**: ✅ **IMPLEMENTADO (firmware + frontend)** · ⏳ **SQL prod + bancada**
 
 **Uso**: Registrar cada dosagem executada
 
-**Ação Necessária**:
-- Registrar após cada execução de dosagem
-- Incluir `ec_controller_metric_id` se aplicável
-- Campos: `nutrient_name`, `relay_number`, `ml_per_liter`, `dosage_ml`, `dosage_time_seconds`, etc.
+**Implementado**:
+- [`SupabaseClient::insertNutrientDosage`](src/SupabaseClient.cpp) — HTTPS POST
+- Hook em [`HydroControl::emitNutrientDoseEvent`](src/HydroControl.cpp)
+- SQL: [`HIDROWAVE-main/scripts/CRIAR_TABELA_NUTRIENT_DOSAGES.sql`](../../HIDROWAVE-main/scripts/CRIAR_TABELA_NUTRIENT_DOSAGES.sql)
+- UI: [`useLastDosage.ts`](../../HIDROWAVE-main/src/hooks/useLastDosage.ts)
 
 ---
 
@@ -229,9 +230,10 @@ Frontend consulta métricas para gráficos
 - [ ] Sincronizar proporções nutricionais com `nutrition_plans`
 
 ### Prioridade BAIXA
-- [ ] Registrar dosagens em `nutrient_dosages`
 - [ ] Criar endpoint GET para histórico de métricas
 - [ ] Implementar paginação para consultas grandes
+- [x] Registrar dosagens em `nutrient_dosages` (código — ver HANDOFF)
+- [ ] Validar dosagens em prod (SQL + flash + KPI)
 
 ---
 

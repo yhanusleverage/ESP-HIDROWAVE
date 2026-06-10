@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🌐 ESP32 Hidropônico - WiFi Setup</title>
+    <title>🌐 HydroWave — Configuração inicial</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
@@ -131,57 +131,91 @@
             margin-bottom: 1rem;
             border: 1px solid #bbf7d0;
         }
+        .step-label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: #2563eb;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 0.35rem;
+        }
+        .help-text {
+            color: #64748b;
+            font-size: 0.85rem;
+            display: block;
+            margin-top: 0.35rem;
+            line-height: 1.4;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🌐 WiFi Setup</h1>
-            <p>Configure sua rede WiFi para o sistema hidropônico</p>
+            <h1>🌐 Configuração Inicial</h1>
+            <p>Configure a rede WiFi e sua conta no sistema hidropônico</p>
         </div>
         
         <div id="message"></div>
         
         <form id="wifiForm">
             <div class="form-group">
+                <span class="step-label">Passo 1</span>
                 <button type="button" class="btn scan-btn" onclick="scanNetworks()">
-                    📡 Escanear Redes WiFi
+                    📡 Escanear redes WiFi
                 </button>
                 <div id="networks" class="networks-list" style="display: none;"></div>
             </div>
             
             <div class="form-group">
-                <label for="ssid">Nome da Rede (SSID):</label>
-                <input type="text" id="ssid" name="ssid" required placeholder="Digite o nome da rede">
+                <span class="step-label">Passo 2</span>
+                <label for="ssid">Nome da rede WiFi (SSID)</label>
+                <input type="text" id="ssid" name="ssid" required placeholder="Ex.: Minha_Rede_2.4G" autocomplete="off">
             </div>
             
             <div class="form-group">
-                <label for="password">Senha:</label>
-                <input type="password" id="password" name="password" placeholder="Digite a senha (deixe vazio se não houver)">
+                <span class="step-label">Passo 3</span>
+                <label for="wifiPassword">Senha da rede WiFi</label>
+                <input type="text" id="wifiPassword" name="password" placeholder="Deixe vazio se a rede for aberta" autocomplete="off">
+                <span class="help-text">Esta é a senha do seu roteador, não a senha do site.</span>
             </div>
             
             <div class="form-group">
-                <label for="userEmail">📧 E-mail:</label>
-                <input type="email" id="userEmail" name="userEmail" required placeholder="seu.email@exemplo.com">
-                <small style="color: #64748b; font-size: 0.85rem; display: block; margin-top: 0.25rem;">
-                    Será usado para identificar e rastrear seus dispositivos no sistema
-                </small>
+                <span class="step-label">Passo 4</span>
+                <label for="userEmail">E-mail da sua conta</label>
+                <input type="email" id="userEmail" name="userEmail" required placeholder="seu.email@exemplo.com" autocomplete="email">
+                <span class="help-text">Será usado para acessar o painel HydroWave e vincular este equipamento.</span>
             </div>
             
             <div class="form-group">
-                <label for="deviceName">Nome do Dispositivo:</label>
-                <input type="text" id="deviceName" name="deviceName" value="ESP32_HIDRO" placeholder="Nome para identificar o dispositivo">
+                <span class="step-label">Passo 5</span>
+                <label for="userPassword">Senha da sua conta (painel web)</label>
+                <input type="text" id="userPassword" name="userPassword" required minlength="6" placeholder="Mínimo 6 caracteres" autocomplete="new-password">
+                <span class="help-text">Use a mesma senha para entrar no site HydroWave após a configuração.</span>
+            </div>
+            
+            <div class="form-group">
+                <span class="step-label">Passo 6</span>
+                <label for="deviceName">Nome do dispositivo</label>
+                <input type="text" id="deviceName" name="deviceName" value="ESP32_HIDRO" placeholder="Ex.: Estufa principal" autocomplete="off">
+            </div>
+            
+            <div class="form-group">
+                <span class="step-label">Passo 7</span>
+                <label for="location">Localização</label>
+                <input type="text" id="location" name="location" placeholder="Ex.: Estufa A, Sala hidro" autocomplete="off">
+                <span class="help-text">Onde o equipamento está instalado (aparece no painel HydroWave).</span>
             </div>
             
             <button type="submit" class="btn" id="connectBtn">
-                🔗 Conectar WiFi
+                Salvar e conectar
             </button>
         </form>
     </div>
     
     <script>
         let isConnecting = false;
-        
+
         function showMessage(message, type = 'error') {
             const messageDiv = document.getElementById('message');
             messageDiv.innerHTML = '<div class="' + type + '">' + message + '</div>';
@@ -221,7 +255,7 @@
                 })
                 .finally(() => {
                     btn.disabled = false;
-                    btn.textContent = '📡 Escanear Redes WiFi';
+                    btn.textContent = '📡 Escanear redes WiFi';
                 });
         }
         
@@ -237,10 +271,16 @@
             document.getElementById('networks').style.display = 'none';
         }
         
-        // Função para validar email
+        function sanitizeEmail(raw) {
+            return raw.trim().toLowerCase().replace(/["'\s]/g, '');
+        }
+
         function isValidEmail(email) {
-            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-            return emailRegex.test(email);
+            const e = sanitizeEmail(email);
+            const emailRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/;
+            if (!emailRegex.test(e)) return false;
+            const badSuffixes = ['.coom', '.con', '.cmo', '.comm', '.gmial.com', '.gmail.co'];
+            return !badSuffixes.some(s => e.endsWith(s));
         }
         
         document.getElementById('wifiForm').addEventListener('submit', function(e) {
@@ -249,18 +289,24 @@
             if (isConnecting) return;
             
             const ssid = document.getElementById('ssid').value.trim();
-            const password = document.getElementById('password').value;
-            const userEmail = document.getElementById('userEmail').value.trim();
+            const password = document.getElementById('wifiPassword').value;
+            const userEmail = sanitizeEmail(document.getElementById('userEmail').value);
+            const userPassword = document.getElementById('userPassword').value;
             const deviceName = document.getElementById('deviceName').value.trim();
+            const location = document.getElementById('location').value.trim();
             
             if (!ssid) {
-                showMessage('❌ Nome da rede é obrigatório');
+                showMessage('❌ O nome da rede WiFi é obrigatório');
                 return;
             }
             
-            // Validar email
             if (!userEmail || !isValidEmail(userEmail)) {
-                showMessage('❌ Por favor, digite um e-mail válido');
+                showMessage('❌ Digite um e-mail válido');
+                return;
+            }
+            
+            if (!userPassword || userPassword.length < 6) {
+                showMessage('❌ A senha da conta deve ter no mínimo 6 caracteres');
                 return;
             }
             
@@ -270,13 +316,15 @@
             btn.textContent = '🔗 Conectando...';
             
             // Mostrar feedback de processo
-            showMessage('🔄 Salvando credenciais e testando conexão...', 'success');
+            showMessage('🔄 Salvando configurações e testando a conexão WiFi...', 'success');
             
             const formData = new FormData();
             formData.append('ssid', ssid);
             formData.append('password', password);
             formData.append('userEmail', userEmail);
+            formData.append('userPassword', userPassword);
             formData.append('deviceName', deviceName || 'ESP32_HIDRO');
+            formData.append('location', location || 'Estufa');
             
             fetch('/api/connect-wifi', {
                 method: 'POST',
@@ -285,7 +333,18 @@
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    let message = '✅ WiFi configurado com sucesso!<br>';
+                    let message = '✅ Configuração salva com sucesso!<br>';
+
+                    if (data.auth_signup === 'created') {
+                        message += '🔐 <strong>Conta:</strong> criada no HydroWave<br>';
+                    } else if (data.auth_signup === 'exists') {
+                        message += '🔐 <strong>Conta:</strong> já existia — pode entrar no painel<br>';
+                    } else if (data.auth_signup === 'failed') {
+                        message += '⚠️ <strong>Conta:</strong> ' + (data.auth_message || 'não foi possível criar agora') + '<br>';
+                        message += '💡 Tente criar a conta no site com o mesmo e-mail e senha.<br>';
+                    } else if (data.auth_signup === 'skipped_no_wifi' || data.auth_signup === 'skipped_no_network') {
+                        message += '⚠️ <strong>Conta:</strong> WiFi sem internet — registre-se no painel web depois.<br>';
+                    }
                     
                     // Mostrar resultado do teste de conexão
                     if (data.connection_test !== undefined) {
@@ -303,10 +362,10 @@
                         message += '🔄 <strong>Reiniciando em ' + delay + ' segundos...</strong><br>';
                     }
                     
-                    message += '<br>📱 <strong>Próximos Passos:</strong><br>';
-                    message += '1️⃣ Conecte seu dispositivo à rede <strong>' + ssid + '</strong><br>';
-                    message += '2️⃣ Monitore o console serial para ver o IP atribuído<br>';
-                    message += '3️⃣ Acesse o IP no navegador para controlar o sistema';
+                    message += '<br>📱 <strong>Próximos passos:</strong><br>';
+                    message += '1️⃣ Conecte o celular ou computador à rede <strong>' + ssid + '</strong><br>';
+                    message += '2️⃣ Acesse o painel HydroWave com o e-mail e a senha informados<br>';
+                    message += '3️⃣ Monitore o console serial para ver o IP do equipamento';
                     
                     showMessage(message, 'success');
                     
@@ -318,15 +377,15 @@
                 } else {
                     showMessage('❌ Erro: ' + (data.message || 'Falha na configuração'));
                     btn.disabled = false;
-                    btn.textContent = '🔗 Conectar WiFi';
+                    btn.textContent = 'Salvar e conectar';
                     isConnecting = false;
                 }
             })
             .catch(error => {
                 console.error('Erro:', error);
-                showMessage('❌ Erro na comunicação com o dispositivo');
+                showMessage('❌ Erro na comunicação com o equipamento');
                 btn.disabled = false;
-                btn.textContent = '🔗 Conectar WiFi';
+                btn.textContent = 'Salvar e conectar';
                 isConnecting = false;
             });
         });

@@ -50,12 +50,12 @@ public:
     // Callback para sucesso na configuração
     void onWiFiConfigured(std::function<void()> callback);
     
-    // ✅ NOVO: Callback para registro com email
-    void onEmailRegistered(std::function<void(String)> callback);
+    // Callback: email + nome do dispositivo (portal) + localização
+    void onEmailRegistered(std::function<void(String email, String deviceName, String location)> callback);
     
 private:
     std::function<void()> onConfiguredCallback;
-    std::function<void(String)> onEmailCallback; // ✅ NOVO: Callback email
+    std::function<void(String, String, String)> onEmailCallback;
     
     // Métodos utilitários
     String urlDecode(String str);

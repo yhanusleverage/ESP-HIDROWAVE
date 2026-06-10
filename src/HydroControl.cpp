@@ -1,5 +1,6 @@
 #include "HydroControl.h"
 #include "PreferencesManager.h"  // ✅ Para persistência em NVS
+#include <cmath>
 
 HydroControl::HydroControl()
     : lcd(0x27, 16, 2)
@@ -23,12 +24,16 @@ HydroControl::HydroControl()
     ecSetpoint = 0.0;
     autoECEnabled = false;
     lastECCheck = 0;
-    autoECIntervalSeconds = 5;  // ✅ Padrão: 5 segundos
-    ecValid = false;  // ✅ EC não é válido até que o buffer TDS esteja cheio
-    
-    // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem
-    lastDosageCompleteTime = 0;
-    tempoRecirculacao = 60;  // Padrão: 60 segundos
+    lastECCheckAtMs = 0;
+    autoECIntervalSeconds = 30;  // Padrão: 30 segundos
+    tempoRecirculacaoSeconds = 60;
+    ecAtLastSequenceStart = 0.0f;
+    ecSetpointAtLastSequence = 0.0f;
+    currentDoseSource = "auto_ec";
+    nutrientDoseCallback = nullptr;
+    nutrientDoseCallbackUserData = nullptr;
+    ecOperationSyncCallback = nullptr;
+    ecOperationSyncCallbackUserData = nullptr;
     
     // ✅ Inicializar sistema sequencial de dosagem
     currentState = IDLE;
@@ -47,11 +52,6 @@ HydroControl::HydroControl()
         dynamicProportions[i].proportion = 0.0;
         dynamicProportions[i].active = false;
     }
-    
-    // ✅ Inicializar Task de dosagem
-    dosingTaskHandle = nullptr;
-    dosingMutex = nullptr;
-    dosingTaskRunning = false;
 }
 
 /**
@@ -120,9 +120,7 @@ bool HydroControl::begin() {
     pHSensor->calibrate(2.56, 3.3, 2.05, false);
 
     // Inicializar sensor TDS
-    // ✅ Usar TDS_VREF de Config.h (3.3V - ajustado para leituras mais precisas)
-    // ✅ Usar TDS_CALIBRATION_FACTOR de Config.h
-    tdsSensor = new TDSReaderSerial(TDS_PIN, TDS_VREF, TDS_CALIBRATION_FACTOR);
+    tdsSensor = new TDSReaderSerial(TDS_PIN, 3.3, 1.0);
     tdsSensor->begin();
 
     // Inicializar sensor de nível
@@ -202,32 +200,6 @@ bool HydroControl::begin() {
     loadECControllerConfig();
     loadNutrientProportions();
     
-    // ✅ Criar mutex para sincronização da Task de dosagem
-    dosingMutex = xSemaphoreCreateMutex();
-    if (dosingMutex == nullptr) {
-        Serial.println("❌ [DOSAGEM] Falha ao criar mutex!");
-    } else {
-        Serial.println("✅ [DOSAGEM] Mutex criado para Task dedicada");
-    }
-    
-    // ✅ Criar Task dedicada para dosagem (Core 1, prioridade alta)
-    BaseType_t taskCreated = xTaskCreatePinnedToCore(
-        dosingTaskFunction,     // Função da task
-        "DosingTask",           // Nome
-        4096,                   // Stack size
-        this,                   // Parâmetro (ponteiro para HydroControl)
-        3,                      // Prioridade ALTA (maior que loop principal)
-        &dosingTaskHandle,      // Handle
-        1                       // Core 1 (mesmo que sensores)
-    );
-    
-    if (taskCreated == pdPASS) {
-        Serial.println("✅ [DOSAGEM] Task dedicada criada (Core 1, Prioridade 3)");
-        Serial.println("   💡 Timing preciso garantido - independente do loop principal");
-    } else {
-        Serial.println("❌ [DOSAGEM] Falha ao criar Task dedicada!");
-    }
-    
     // Return true if basic initialization succeeded (even with PCF errors)
     return true;
 }
@@ -243,151 +215,38 @@ void HydroControl::update() {
     checkRelayTimers();
     checkAutoEC();  // ✅ Verificar e ajustar EC automaticamente
     processSimpleSequential();  // ✅ Processar máquina de estados sequencial
-    
-    // Debug status
-    static unsigned long lastDebug = 0;
-    if (millis() - lastDebug > 5000) {  // A cada 5 segundos
-        lastDebug = millis();
-        Serial.println("\n=== Status do Sistema ===");
-        Serial.printf("Temperatura: %.1f°C\n", temperature);
-        Serial.printf("pH: %.2f\n", pH);
-        // ✅ Mostrar TDS/EC (0.0 si buffer no está listo)
-        Serial.printf("TDS: %.1f ppm\n", tds);  // ✅ Siempre mostrar (0.0 si buffer no listo)
-        Serial.printf("EC: %.1f uS/cm\n", ec);   // ✅ Siempre mostrar (0.0 si buffer no listo)
-        if (!ecValid) {
-            Serial.println("   ⏳ Buffer EC inicializando...");
-        }
-        Serial.println("Estado dos Relés:");
-        for (int i = 0; i < NUM_RELAYS; i++) {
-            Serial.printf("Relé %d: %s\n", i+1, relayStates[i] ? "ON" : "OFF");
-        }
-        Serial.println("=====================\n");
-    }
 }
 
 void HydroControl::updateSensors() {
-    static unsigned long lastErrorPrint = 0;  // Controlar prints de erro
-    bool shouldPrintError = (millis() - lastErrorPrint > 5000);  // A cada 5 segundos
-    
-    // Temperatura
     sensors.requestTemperatures();
     float tempReading = sensors.getTempCByIndex(0);
     if (tempReading != -127.0 && tempReading >= MIN_TEMP && tempReading <= MAX_TEMP) {
         temperature = tempReading;
         sensorsOk = true;
     } else {
-        if (shouldPrintError) {
-            Serial.println("⚠️ Erro na leitura da temperatura");
-        }
         sensorsOk = false;
     }
-    
-    // pH
+
     float phReading = pHSensor->readPH(PH_PIN);
     if (phReading >= MIN_PH && phReading <= MAX_PH) {
         pH = phReading;
         sensorsOk &= true;
     } else {
-        if (shouldPrintError) {
-            Serial.println("⚠️ Erro na leitura do pH");
-        }
         sensorsOk = false;
     }
-    
-    // TDS e EC
+
     tdsSensor->updateTemperature(temperature);
     tdsSensor->readTDS();
-    
-    // ✅ Verificar se o buffer TDS está pronto ANTES de usar valores
-    bool bufferReady = tdsSensor->isBufferReady();
-    
-    // ✅ Contador de leituras estáveis após buffer pronto (precisa de 2 leituras)
-    static int stableReadingsCount = 0;
-    static bool ecStabilized = false;
-    
-    // ⚠️ Si buffer no está listo, NO usar valores (evita mostrar basura)
-    if (!bufferReady) {
-        static unsigned long lastBufferWarning = 0;
-        if (millis() - lastBufferWarning > 3000) {
-            Serial.println("⏳ [EC] Buffer inicializando... aguarde");
-            lastBufferWarning = millis();
-        }
-        stableReadingsCount = 0;
-        ecStabilized = false;
-        ecValid = false;
-        // ✅ FORZAR valores a 0 mientras buffer no está listo
-        tds = 0;
-        ec = 0;
+    float tdsReading = tdsSensor->getTDSValue();
+    if (tdsReading >= MIN_TDS && tdsReading <= MAX_TDS) {
+        tds = tdsReading;
+        ec = tdsSensor->getECValue();
+        sensorsOk &= true;
     } else {
-        float tdsReading = tdsSensor->getTDSValue();
-        
-        if (tdsReading >= MIN_TDS && tdsReading <= MAX_TDS && tdsReading > 0) {
-            tds = tdsReading;
-            ec = tdsSensor->getECValue();
-            sensorsOk &= true;
-            
-            // ✅ Contar leituras estáveis após buffer pronto
-            if (!ecStabilized) {
-                stableReadingsCount++;
-                if (stableReadingsCount >= 2) {
-                    ecStabilized = true;
-                    ecValid = true;
-                    Serial.println("✅ [EC] Leitura estabilizada após 2 amostras - automação EC liberada!");
-                    Serial.printf("   📊 EC atual: %.0f µS/cm (estável)\n", ec);
-                } else {
-                    ecValid = false;  // Ainda não estável
-                    Serial.printf("⏳ [EC] Estabilizando... leitura %d/2 (EC: %.0f µS/cm)\n", stableReadingsCount, ec);
-                }
-            } else {
-                ecValid = true;  // Já estabilizado
-            }
-        } else {
-            // ✅ Melhor diagnóstico de erros
-            static unsigned long lastErrorLog = 0;
-            if (millis() - lastErrorLog > 5000) {
-                if (tdsReading == 0.0) {
-                    Serial.println("⚠️ [TDS/EC] Sensor não está lendo valores (TDS = 0)");
-                } else {
-                    Serial.printf("⚠️ [TDS/EC] Valor fora do intervalo: %.2f ppm\n", tdsReading);
-                }
-                lastErrorLog = millis();
-            }
-            sensorsOk = false;
-            stableReadingsCount = 0;  // Reset se leitura inválida
-            ecStabilized = false;
-            ecValid = false;
-        }
+        sensorsOk = false;
     }
 
-    // Nível do reservatório
-    String tankStatus = tankSensor->getStatus();
     tankLevelOk = tankSensor->checkWaterLevel();
-    
-    // Log detalhado (solo si debe imprimir o si todo está OK)
-    if (sensorsOk) {
-        if (shouldPrintError) {  // Imprimir OK también cada 5 segundos
-            Serial.println("\n✅ Leitura dos sensores OK:");
-            Serial.printf("  Temperatura: %.1f°C\n", temperature);
-            Serial.printf("  pH: %.2f\n", pH);
-            Serial.printf("  TDS: %.0f ppm\n", tds);
-            Serial.printf("  EC: %.0f µS/cm\n", ec);
-            Serial.println("  Nível: " + tankStatus);
-            lastErrorPrint = millis();  // Actualizar timestamp
-        }
-    } else {
-        if (shouldPrintError) {  // Solo imprimir errores cada 5 segundos
-            Serial.println("\n⚠️ Problemas na leitura dos sensores:");
-            Serial.printf("  Temperatura: %.1f°C %s\n", temperature, 
-                (tempReading >= MIN_TEMP && tempReading <= MAX_TEMP) ? "✓" : "✗");
-            Serial.printf("  pH: %.2f %s\n", pH,
-                (phReading >= MIN_PH && phReading <= MAX_PH) ? "✓" : "✗");
-            Serial.printf("  TDS: %.0f ppm %s\n", tds,
-                (tds >= MIN_TDS && tds <= MAX_TDS) ? "✓" : "✗");
-            Serial.printf("  EC: %.0f µS/cm\n", ec);
-            Serial.println("  Nível: " + tankStatus);
-            lastErrorPrint = millis();  // Actualizar timestamp
-        }
-    }
 }
 
 void HydroControl::updateDisplay() {
@@ -560,71 +419,22 @@ void HydroControl::checkAutoEC() {
         }
         return;
     }
-    
-    // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
-    if (lastDosageCompleteTime > 0 && tempoRecirculacao > 0) {
-        unsigned long elapsedSeconds = (millis() - lastDosageCompleteTime) / 1000;
-        if (elapsedSeconds < tempoRecirculacao) {
-            static unsigned long lastRecircLog = 0;
-            if (millis() - lastRecircLog > 10000) {  // Log a cada 10 segundos
-                Serial.printf("⏸️ [AUTO EC] Tempo morto: %lu/%lu seg (aguardando recirculação)\n", 
-                    elapsedSeconds, tempoRecirculacao);
-                lastRecircLog = millis();
-            }
-            return;  // Ainda em tempo morto - não medir EC
-        } else {
-            // Tempo morto terminou - resetar flag
-            lastDosageCompleteTime = 0;
-            Serial.println("✅ [AUTO EC] Tempo morto concluído - retomando verificação de EC");
-        }
-    }
-    
-    // ✅ MARGEM DE SEGURANÇA: Se EC setpoint < 50, não ativar automação
-    // Esto evita activar dosificación cuando el setpoint no está configurado correctamente
-    if (ecSetpoint < 50.0) {
-        static unsigned long lastLowSetpointLog = 0;
-        unsigned long now = millis();
-        if (now - lastLowSetpointLog >= 30000) {  // Log a cada 30 segundos
-            Serial.println("⚠️ [AUTO EC] EC setpoint muito baixo - automação pausada");
-            Serial.printf("   📊 EC setpoint atual: %.0f µS/cm (mínimo: 50 µS/cm)\n", ecSetpoint);
-            Serial.println("   💡 Configure um setpoint >= 50 µS/cm no frontend para ativar");
-            lastLowSetpointLog = now;
-        }
+
+    if (currentState != IDLE) {
         return;
     }
-    
+
     // Verificar intervalo de verificação
     unsigned long currentMillis = millis();
     unsigned long checkInterval = autoECIntervalSeconds > 0 ? 
-        (autoECIntervalSeconds * 1000) : EC_CHECK_INTERVAL;
+        (autoECIntervalSeconds * 1000UL) : EC_CHECK_INTERVAL;
     
     if (currentMillis - lastECCheck < checkInterval) {
         return;  // Ainda não é hora de verificar
     }
     
     lastECCheck = currentMillis;
-    
-    // ✅ VALIDAÇÃO CRÍTICA: Não tomar decisões se EC não é confiável
-    if (!ecValid) {
-        static unsigned long lastInvalidLog = 0;
-        if (currentMillis - lastInvalidLog > 5000) {  // Log a cada 5 segundos
-            Serial.println("⏸️  [AUTO EC] Pausado - EC não é confiável (buffer TDS ainda não está cheio)");
-            Serial.println("   💡 Aguardando estabilização do sensor...");
-            lastInvalidLog = currentMillis;
-        }
-        return;  // Não fazer nada até que EC seja confiável
-    }
-    
-    // ✅ VALIDAÇÃO: Não tomar decisões se EC = 0 (sensor provavelmente não está funcionando)
-    if (ec <= 0.0) {
-        static unsigned long lastZeroLog = 0;
-        if (currentMillis - lastZeroLog > 10000) {  // Log a cada 10 segundos
-            Serial.println("⚠️  [AUTO EC] EC = 0 - sensor pode estar com problema");
-            Serial.println("   💡 Verifique conexão do sensor TDS");
-            lastZeroLog = currentMillis;
-        }
-        return;  // Não fazer nada se EC = 0
-    }
+    lastECCheckAtMs = currentMillis;
     
     // Verificar se precisa de ajuste (tolerância padrão: 50 µS/cm)
     if (ecController.needsAdjustment(ecSetpoint, ec, 50.0)) {
@@ -666,14 +476,26 @@ void HydroControl::checkAutoEC() {
 }
 
 // ✅ Máquina de estados para dosagem sequencial
-// ⚠️ NOTA: Esta função agora é apenas para compatibilidade
-// O processamento real é feito pela Task dedicada (dosingTaskFunction)
 void HydroControl::processSimpleSequential() {
-    // ✅ Task dedicada processa a dosagem - esta função não faz mais nada
-    // Mantida apenas para compatibilidade com chamadas existentes
-    return;
+    if (currentState == IDLE) {
+        return;
+    }
     
     unsigned long currentTime = millis();
+    
+    if (currentState == RECIRCULATING) {
+        unsigned long elapsedSec = (currentTime - stateStartTime) / 1000UL;
+        if (elapsedSec >= tempoRecirculacaoSeconds) {
+            Serial.println("✅ [RECIRC] Tempo de recirculação concluído");
+            currentState = IDLE;
+            totalNutrients = 0;
+            currentNutrientIndex = 0;
+            currentSequenceId = "";
+            showMessage("Recirc OK");
+            notifyEcOperationChanged();
+        }
+        return;
+    }
     
     if (currentState == DOSING) {
         // ===== DOSANDO NUTRIENTE ATUAL =====
@@ -681,15 +503,6 @@ void HydroControl::processSimpleSequential() {
         
         // Verificar tempo decorrido
         unsigned long elapsedTime = currentTime - stateStartTime;
-        
-        // ✅ Progress log cada 1 segundo
-        static unsigned long lastProgressLog = 0;
-        if (currentTime - lastProgressLog >= 1000) {
-            float progress = (elapsedTime * 100.0) / current.durationMs;
-            Serial.printf("   ⏱️ [%s] %lu/%lums (%.0f%%) - Relé %d ATIVO\n", 
-                current.name.c_str(), elapsedTime, current.durationMs, progress, current.relay + 1);
-            lastProgressLog = currentTime;
-        }
         
         // Verificar se terminou a dosagem
         if (elapsedTime >= current.durationMs) {
@@ -700,66 +513,49 @@ void HydroControl::processSimpleSequential() {
             // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
             if (current.relay >= 0 && current.relay < 8) {
                 pcf2.write(current.relay, state);
+                Serial.printf("🔴 [DOSAGEM] Relé %d DESLIGADO após %.3fs\n", current.relay + 1, current.durationMs / 1000.0);
             }
-            
-            Serial.println("╔════════════════════════════════════════╗");
-            Serial.printf("║ ✅ [DOSAGEM COMPLETA] %s\n", current.name.c_str());
-            Serial.printf("║    📊 Volume: %.3f ml\n", current.dosageML);
-            Serial.printf("║    ⏱️  Duração: %.3f segundos\n", current.durationMs / 1000.0);
-            Serial.printf("║    🔌 Relé %d → DESLIGADO\n", current.relay + 1);
-            Serial.println("╚════════════════════════════════════════╝");
+
+            emitNutrientDoseEvent(current);
             
             // ===== PRÓXIMO NUTRIENTE OU INTERVALO =====
             currentNutrientIndex++;
             
             if (currentNutrientIndex >= totalNutrients) {
-                // ===== TERMINOU TODOS OS NUTRIENTES =====
-                Serial.println("\n🎉 ════════════════════════════════════════");
-                Serial.println("🎉 SEQUÊNCIA COMPLETA - TODOS OS NUTRIENTES!");
-                Serial.printf("🎉 Total dosado: %d nutrientes\n", totalNutrients);
-                Serial.printf("🎉 Iniciando tempo morto: %lu segundos\n", tempoRecirculacao);
-                Serial.println("🎉 ════════════════════════════════════════\n");
-                
-                // ✅ MARCAR FIM DA DOSAGEM para iniciar tempo morto
-                lastDosageCompleteTime = millis();
-                
-                currentState = IDLE;
-                totalNutrients = 0;
-                currentNutrientIndex = 0;
-                showMessage("Sequencia OK!");
+                Serial.println("✅ SEQUÊNCIA COMPLETA - TODOS OS NUTRIENTES DOSADOS!");
+                if (tempoRecirculacaoSeconds > 0) {
+                    currentState = RECIRCULATING;
+                    stateStartTime = currentTime;
+                    Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n",
+                        tempoRecirculacaoSeconds);
+                    showMessage("Recirculando...");
+                    notifyEcOperationChanged();
+                } else {
+                    currentState = IDLE;
+                    totalNutrients = 0;
+                    currentNutrientIndex = 0;
+                    currentSequenceId = "";
+                    showMessage("Sequencia OK!");
+                    notifyEcOperationChanged();
+                }
             } else {
                 // ===== AGUARDAR INTERVALO ANTES DO PRÓXIMO =====
                 currentState = WAITING;
                 stateStartTime = currentTime;
-                Serial.printf("\n⏳ [INTERVALO] Aguardando %ds antes do próximo nutriente (%d/%d)...\n", 
-                    intervalSeconds, currentNutrientIndex + 1, totalNutrients);
+                Serial.printf("⏳ Aguardando %ds antes do próximo nutriente...\n", intervalSeconds);
                 showMessage("Aguardando...");
+                notifyEcOperationChanged();
             }
         }
         
     } else if (currentState == WAITING) {
         // ===== AGUARDANDO INTERVALO CONFIGURADO =====
-        unsigned long elapsed = currentTime - stateStartTime;
-        unsigned long target = intervalSeconds * 1000;
-        
-        // ✅ Progress log cada 2 segundos durante espera
-        static unsigned long lastWaitLog = 0;
-        if (currentTime - lastWaitLog >= 2000 && elapsed < target) {
-            Serial.printf("   ⏳ [ESPERA] %lu/%lums restantes...\n", target - elapsed, target);
-            lastWaitLog = currentTime;
-        }
-        
-        if (elapsed >= target) {
+        if (currentTime - stateStartTime >= (intervalSeconds * 1000)) {
             // ===== INICIAR PRÓXIMO NUTRIENTE =====
             SimpleNutrient& next = nutrients[currentNutrientIndex];
             
-            Serial.println("\n╔════════════════════════════════════════╗");
-            Serial.printf("║ 🚀 [INICIANDO DOSAGEM] %s\n", next.name.c_str());
-            Serial.printf("║    📊 Volume: %.3f ml\n", next.dosageML);
-            Serial.printf("║    ⏱️  Duração: %.3f segundos\n", next.durationMs / 1000.0);
-            Serial.printf("║    🔌 Relé %d → LIGANDO\n", next.relay + 1);
-            Serial.printf("║    📍 Progresso: %d/%d nutrientes\n", currentNutrientIndex + 1, totalNutrients);
-            Serial.println("╚════════════════════════════════════════╝");
+            Serial.printf("🚀 [DOSAGEM] Iniciando: %s - %.3fml por %.3fs - Relé %d\n", 
+                next.name.c_str(), next.dosageML, next.durationMs / 1000.0, next.relay + 1);
             
             // ===== LIGAR RELÉ =====
             relayStates[next.relay] = true;
@@ -776,6 +572,7 @@ void HydroControl::processSimpleSequential() {
             
             String displayMsg = next.name + ": " + String(next.dosageML, 2) + "ml";
             showMessage(displayMsg);
+            notifyEcOperationChanged();
         }
     }
 }
@@ -792,6 +589,11 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
     Serial.printf("💧 Total u(t): %.3f ml\n", totalML);
     Serial.printf("🎯 EC Setpoint: %.0f µS/cm\n", ecSetpoint);
     Serial.printf("📊 EC Atual: %.0f µS/cm\n", ecActual);
+
+    currentSequenceId = String(millis());
+    currentDoseSource = "auto_ec";
+    ecAtLastSequenceStart = ecActual;
+    ecSetpointAtLastSequence = ecSetpoint;
     
     // ===== DISTRIBUIR u(t) PROPORCIONALMENTE BASEADO EM mlPerLiter =====
     // ✅ LÓGICA: u(t) é o esforço de controle total (ml calculados)
@@ -810,10 +612,10 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
         Serial.printf("   📊 Total ml/L: %.2f\n", totalMlPerLiter);
         Serial.printf("   🔢 Nutrientes ativos: %d\n", activeNutrientsCount);
         
-        // Distribuir u(t) proporcionalmente para cada nutriente
-        for (int i = 0; i < 16 && totalNutrients < 8; i++) {
+        // Distribuir u(t) proporcionalmente para cada nutriente (só slots ativos)
+        for (int i = 0; i < activeNutrientsCount && totalNutrients < 8; i++) {
             if (!dynamicProportions[i].active || dynamicProportions[i].mlPerLiter <= 0.0) {
-                continue;  // Pular nutrientes inativos
+                continue;
             }
             
             // ✅ CALCULAR DOSAGEM PROPORCIONAL
@@ -887,19 +689,8 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
         stateStartTime = millis();
         
         SimpleNutrient& first = nutrients[0];
-        
-        Serial.println("\n╔════════════════════════════════════════════════════╗");
-        Serial.println("║ 🚀 [INICIANDO SEQUÊNCIA DE DOSAGEM]                 ║");
-        Serial.println("╠════════════════════════════════════════════════════╣");
-        Serial.printf("║ 🎯 EC Atual: %.0f µS/cm → Setpoint: %.0f µS/cm\n", ecActual, ecSetpoint);
-        Serial.printf("║ 📊 Total a dosar: %.3f ml\n", totalML);
-        Serial.printf("║ 🧪 Nutrientes na fila: %d\n", totalNutrients);
-        Serial.println("╠════════════════════════════════════════════════════╣");
-        Serial.printf("║ ▶️  PRIMEIRO: %s\n", first.name.c_str());
-        Serial.printf("║    📊 Volume: %.3f ml\n", first.dosageML);
-        Serial.printf("║    ⏱️  Duração: %.3f segundos\n", first.durationMs / 1000.0);
-        Serial.printf("║    🔌 Relé %d → LIGANDO\n", first.relay + 1);
-        Serial.println("╚════════════════════════════════════════════════════╝\n");
+        Serial.printf("🚀 [DOSAGEM] Iniciando PRIMEIRO: %s - %.3fml por %.3fs - Relé %d\n", 
+            first.name.c_str(), first.dosageML, first.durationMs / 1000.0, first.relay + 1);
         
         // ===== LIGAR PRIMEIRO RELÉ =====
         relayStates[first.relay] = true;
@@ -914,6 +705,7 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
         showMessage(displayMsg);
         
         Serial.printf("✅ [DOSAGEM] SISTEMA SEQUENCIAL INICIADO: %d nutrientes, intervalo %ds\n", totalNutrients, intervalSeconds);
+        notifyEcOperationChanged();
     } else {
         Serial.println("❌ Nenhuma dosagem significativa para executar");
         currentState = IDLE;
@@ -929,6 +721,10 @@ void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
     }
     
     Serial.println("\n🌐 INICIANDO DOSAGEM VIA WEB...");
+    currentSequenceId = String(millis());
+    currentDoseSource = "web";
+    ecAtLastSequenceStart = ec;
+    ecSetpointAtLastSequence = ecSetpoint;
     
     totalNutrients = 0;
     intervalSeconds = intervalo;
@@ -984,6 +780,7 @@ void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
         showMessage(displayMsg);
         
         Serial.printf("✅ [DOSAGEM] SISTEMA WEB INICIADO: %d nutrientes, intervalo %ds\n", totalNutrients, intervalSeconds);
+        notifyEcOperationChanged();
     } else {
         Serial.println("❌ Nenhum nutriente válido recebido da web");
         currentState = IDLE;
@@ -1016,6 +813,7 @@ void HydroControl::cancelCurrentDosage() {
         stateStartTime = 0;
         
         Serial.println("✅ DOSAGEM CANCELADA - Sistema resetado para IDLE");
+        notifyEcOperationChanged();
     } else {
         Serial.println("ℹ️  Nenhuma dosagem ativa para cancelar");
     }
@@ -1023,9 +821,16 @@ void HydroControl::cancelCurrentDosage() {
 
 // ✅ Atualizar proporções dinâmicas da tabela nutricional (recebido do frontend)
 void HydroControl::updateNutrientProportions(JsonArray nutrients) {
-    // Limpar proporções anteriores
     activeNutrientsCount = 0;
     totalMlPerLiter = 0.0;
+
+    for (int i = 0; i < 16; i++) {
+        dynamicProportions[i].name = "";
+        dynamicProportions[i].relay = i;
+        dynamicProportions[i].mlPerLiter = 0.0;
+        dynamicProportions[i].proportion = 0.0;
+        dynamicProportions[i].active = false;
+    }
     
     // Primeiro passo: calcular totalMlPerLiter (soma de todos os mlPerLiter)
     for (JsonVariant nutrient : nutrients) {
@@ -1040,6 +845,7 @@ void HydroControl::updateNutrientProportions(JsonArray nutrients) {
     
     if (totalMlPerLiter <= 0.0) {
         Serial.println("⚠️  Total ml/L é zero - proporções não podem ser calculadas");
+        saveNutrientProportions();
         return;
     }
     
@@ -1105,6 +911,7 @@ void HydroControl::loadECControllerConfig() {
     float setpoint = 0.0;
     bool autoEnabled = false;
     int intervalSeconds = 30;
+    int32_t tempoRecircSec = 60;
     
     PreferencesManager::loadConfigFloat("ec_baseDose", baseDose);
     PreferencesManager::loadConfigFloat("ec_flowRate", flowRate);
@@ -1114,11 +921,7 @@ void HydroControl::loadECControllerConfig() {
     PreferencesManager::loadConfigFloat("ec_setpoint", setpoint);
     PreferencesManager::loadConfigInt("ec_autoEnabled", (int32_t&)autoEnabled);
     PreferencesManager::loadConfigInt("ec_interval", (int32_t&)intervalSeconds);
-    
-    // Carregar tempo de recirculação
-    int32_t recirculacaoTemp = 60;  // Default 60 segundos
-    PreferencesManager::loadConfigInt("ec_recirculacao", recirculacaoTemp);
-    tempoRecirculacao = (unsigned long)recirculacaoTemp;
+    PreferencesManager::loadConfigInt("ec_tempoRecirc", tempoRecircSec);
     
     // Mostrar valores carregados
     Serial.println("📊 Valores carregados do NVS:");
@@ -1130,7 +933,7 @@ void HydroControl::loadECControllerConfig() {
     Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", setpoint);
     Serial.printf("   • auto_enabled:     %s\n", autoEnabled ? "true" : "false");
     Serial.printf("   • intervalo_auto_ec: %d segundos\n", intervalSeconds);
-    Serial.printf("   • tempo_recirculacao: %lu segundos\n", tempoRecirculacao);
+    Serial.printf("   • tempo_recirculacao: %ld segundos\n", (long)tempoRecircSec);
     
     // Aplicar valores carregados
     if (baseDose > 0.0) ecController.setBaseDose(baseDose);
@@ -1141,6 +944,7 @@ void HydroControl::loadECControllerConfig() {
     if (setpoint > 0.0) ecSetpoint = setpoint;
     autoECEnabled = autoEnabled;
     if (intervalSeconds > 0) autoECIntervalSeconds = intervalSeconds;
+    if (tempoRecircSec > 0) tempoRecirculacaoSeconds = (unsigned long)tempoRecircSec;
     
     Serial.println("✅ EC_CONFIG carregado e aplicado com sucesso");
     Serial.println("╚════════════════════════════════════════════════════╝\n");
@@ -1172,7 +976,6 @@ void HydroControl::saveECControllerConfig() {
     Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", setpoint);
     Serial.printf("   • auto_enabled:     %s\n", autoEnabled ? "true" : "false");
     Serial.printf("   • intervalo_auto_ec: %d segundos\n", interval);
-    Serial.printf("   • tempo_recirculacao: %lu segundos\n", tempoRecirculacao);
     
     // Guardar en NVS
     bool success = true;
@@ -1184,7 +987,6 @@ void HydroControl::saveECControllerConfig() {
     success &= PreferencesManager::saveConfigFloat("ec_setpoint", setpoint);
     success &= PreferencesManager::saveConfigInt("ec_autoEnabled", autoEnabled ? 1 : 0);
     success &= PreferencesManager::saveConfigInt("ec_interval", interval);
-    success &= PreferencesManager::saveConfigInt("ec_recirculacao", (int)tempoRecirculacao);
     
     if (success) {
         Serial.println("✅ EC_CONFIG salvo no NVS com sucesso");
@@ -1267,25 +1069,124 @@ void HydroControl::loadNutrientProportions() {
 }
 
 // ✅ Implementação dos setters com persistência automática
-void HydroControl::setECSetpoint(float setpoint, bool saveToNVS) {
+void HydroControl::setECSetpoint(float setpoint) {
     ecSetpoint = setpoint;
-    if (saveToNVS) {
-        saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
-    }
+    saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
 }
 
-void HydroControl::setAutoECEnabled(bool enabled, bool saveToNVS) {
+void HydroControl::setAutoECEnabled(bool enabled) {
+    if (!enabled && autoECEnabled) {
+        cancelCurrentDosage();
+    }
     autoECEnabled = enabled;
-    if (saveToNVS) {
-        saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
+    saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
+}
+
+void HydroControl::setAutoECInterval(int intervalSeconds) {
+    autoECIntervalSeconds = intervalSeconds;
+    saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
+}
+
+void HydroControl::setTempoRecirculacaoSeconds(unsigned long seconds) {
+    tempoRecirculacaoSeconds = seconds > 0 ? seconds : 60;
+    PreferencesManager::saveConfigInt("ec_tempoRecirc", (int32_t)tempoRecirculacaoSeconds);
+}
+
+void HydroControl::setNutrientDoseCallback(NutrientDoseCallback cb, void* userData) {
+    nutrientDoseCallback = cb;
+    nutrientDoseCallbackUserData = userData;
+}
+
+void HydroControl::setEcOperationSyncCallback(EcOperationSyncCallback cb, void* userData) {
+    ecOperationSyncCallback = cb;
+    ecOperationSyncCallbackUserData = userData;
+}
+
+void HydroControl::notifyEcOperationChanged() {
+    if (ecOperationSyncCallback) {
+        ecOperationSyncCallback(ecOperationSyncCallbackUserData);
     }
 }
 
-void HydroControl::setAutoECInterval(int intervalSeconds, bool saveToNVS) {
-    autoECIntervalSeconds = intervalSeconds;
-    if (saveToNVS) {
-        saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
+void HydroControl::emitNutrientDoseEvent(const SimpleNutrient& nutrient) {
+    if (!nutrientDoseCallback) {
+        return;
     }
+    NutrientDoseEvent event = {};
+    currentSequenceId.toCharArray(event.sequenceId, sizeof(event.sequenceId));
+    nutrient.name.toCharArray(event.nutrientName, sizeof(event.nutrientName));
+    event.relayNumber = nutrient.relay;
+    event.dosageMl = nutrient.dosageML;
+    event.dosageTimeSeconds = nutrient.durationMs / 1000.0f;
+    event.ecBefore = ecAtLastSequenceStart;
+    event.ecSetpoint = ecSetpointAtLastSequence;
+    event.source = currentDoseSource ? currentDoseSource : "auto_ec";
+    nutrientDoseCallback(&event, nutrientDoseCallbackUserData);
+}
+
+int HydroControl::computeEcOperationRemainingSec() const {
+    if (currentState == IDLE) {
+        return 0;
+    }
+    unsigned long elapsedMs = millis() - stateStartTime;
+    if (currentState == WAITING) {
+        long rem = (long)intervalSeconds - (long)(elapsedMs / 1000UL);
+        return rem > 0 ? (int)rem : 0;
+    }
+    if (currentState == RECIRCULATING) {
+        long rem = (long)tempoRecirculacaoSeconds - (long)(elapsedMs / 1000UL);
+        return rem > 0 ? (int)rem : 0;
+    }
+    if (currentState == DOSING && currentNutrientIndex < totalNutrients) {
+        const SimpleNutrient& current = nutrients[currentNutrientIndex];
+        long rem = (long)(current.durationMs - elapsedMs) / 1000L;
+        return rem > 0 ? (int)rem : 0;
+    }
+    return 0;
+}
+
+const char* HydroControl::getEcOperationStateName() const {
+    if (!autoECEnabled && currentState != IDLE) {
+        return "idle";
+    }
+    switch (currentState) {
+        case DOSING:
+        case WAITING:
+            // WAITING (~3s entre nutrientes) — mesma secuencia; UI só mostra "Dosando"
+            return "dosing";
+        case RECIRCULATING:
+            return "recirculating";
+        case IDLE:
+        default: {
+            if (!autoECEnabled) {
+                return "idle";
+            }
+            if (getEcNextCheckInSec() > 0) {
+                return "ec_check_pending";
+            }
+            return "idle";
+        }
+    }
+}
+
+int HydroControl::getEcOperationRemainingSec() const {
+    return computeEcOperationRemainingSec();
+}
+
+int HydroControl::getEcNextCheckInSec() const {
+    if (!autoECEnabled || currentState != IDLE) {
+        return 0;
+    }
+    unsigned long checkInterval = autoECIntervalSeconds > 0 ?
+        (autoECIntervalSeconds * 1000UL) : EC_CHECK_INTERVAL;
+    if (lastECCheckAtMs == 0) {
+        return (int)(checkInterval / 1000UL);
+    }
+    unsigned long elapsed = millis() - lastECCheckAtMs;
+    if (elapsed >= checkInterval) {
+        return 0;
+    }
+    return (int)((checkInterval - elapsed) / 1000UL);
 }
 
 // ✅ Salvar proporções nutricionais no NVS
@@ -1319,119 +1220,4 @@ void HydroControl::saveNutrientProportions() {
     } else {
         Serial.println("❌ Erro ao salvar proporções nutricionais no NVS");
     }
-}
-
-// ✅ TASK DEDICADA PARA DOSAGEM - Timing preciso independente do loop principal
-void HydroControl::dosingTaskFunction(void* parameter) {
-    HydroControl* self = static_cast<HydroControl*>(parameter);
-    
-    // ✅ CRÍTICO: Esperar mutex ser válido antes de começar
-    while (self->dosingMutex == nullptr) {
-        vTaskDelay(pdMS_TO_TICKS(100));  // Esperar 100ms
-    }
-    
-    // ✅ Esperar um pouco mais para garantir que tudo está inicializado
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    Serial.println("🚀 [DOSING TASK] Task iniciada - mutex válido, aguardando comandos");
-    self->dosingTaskRunning = true;
-    
-    while (true) {
-        // Processar dosagem apenas se ativa E mutex válido
-        if (self->currentState != IDLE && self->dosingMutex != nullptr) {
-            self->processDosingTask();
-            vTaskDelay(pdMS_TO_TICKS(20));  // 20ms durante dosagem (50 Hz)
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(100)); // 100ms quando idle (economiza CPU/memória)
-        }
-    }
-}
-
-// ✅ Processamento da dosagem na Task dedicada
-void HydroControl::processDosingTask() {
-    // Adquirir mutex para acesso seguro
-    if (xSemaphoreTake(dosingMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
-        return;  // Não conseguiu mutex, tentar novamente
-    }
-    
-    unsigned long currentTime = millis();
-    
-    if (currentState == DOSING) {
-        // ===== DOSANDO NUTRIENTE ATUAL =====
-        SimpleNutrient& current = nutrients[currentNutrientIndex];
-        unsigned long elapsedTime = currentTime - stateStartTime;
-        
-        // ✅ Verificar se terminou a dosagem
-        if (elapsedTime >= current.durationMs) {
-            // ===== DESLIGAR RELÉ IMEDIATAMENTE =====
-            relayStates[current.relay] = false;
-            bool state = !relayStates[current.relay];  // Invertido: LOW = ligado, HIGH = desligado
-            
-            if (current.relay >= 0 && current.relay < 8) {
-                pcf2.write(current.relay, state);
-            }
-            
-            Serial.println("╔════════════════════════════════════════╗");
-            Serial.printf("║ ✅ [TASK] DOSAGEM COMPLETA: %s\n", current.name.c_str());
-            Serial.printf("║    📊 Volume: %.3f ml\n", current.dosageML);
-            Serial.printf("║    ⏱️  Real: %lu ms / Esperado: %lu ms\n", elapsedTime, current.durationMs);
-            Serial.printf("║    📈 Precisão: %.1f%%\n", (current.durationMs * 100.0) / elapsedTime);
-            Serial.printf("║    🔌 Relé %d → DESLIGADO\n", current.relay + 1);
-            Serial.println("╚════════════════════════════════════════╝");
-            
-            // ===== PRÓXIMO NUTRIENTE OU INTERVALO =====
-            currentNutrientIndex++;
-            
-            if (currentNutrientIndex >= totalNutrients) {
-                Serial.println("\n🎉 ════════════════════════════════════════");
-                Serial.println("🎉 [TASK] SEQUÊNCIA COMPLETA!");
-                Serial.printf("🎉 Total dosado: %d nutrientes\n", totalNutrients);
-                Serial.printf("🎉 Iniciando tempo morto: %lu segundos\n", tempoRecirculacao);
-                Serial.println("🎉 ════════════════════════════════════════\n");
-                
-                // ✅ MARCAR FIM DA DOSAGEM para iniciar tempo morto
-                lastDosageCompleteTime = millis();
-                
-                currentState = IDLE;
-                totalNutrients = 0;
-                currentNutrientIndex = 0;
-            } else {
-                currentState = WAITING;
-                stateStartTime = currentTime;
-                Serial.printf("\n⏳ [TASK] Intervalo: %ds antes do nutriente %d/%d\n", 
-                    intervalSeconds, currentNutrientIndex + 1, totalNutrients);
-            }
-        }
-        
-    } else if (currentState == WAITING) {
-        // ===== AGUARDANDO INTERVALO =====
-        unsigned long elapsed = currentTime - stateStartTime;
-        unsigned long target = intervalSeconds * 1000;
-        
-        if (elapsed >= target) {
-            // ===== INICIAR PRÓXIMO NUTRIENTE =====
-            SimpleNutrient& next = nutrients[currentNutrientIndex];
-            
-            Serial.println("\n╔════════════════════════════════════════╗");
-            Serial.printf("║ 🚀 [TASK] INICIANDO: %s\n", next.name.c_str());
-            Serial.printf("║    📊 Volume: %.3f ml\n", next.dosageML);
-            Serial.printf("║    ⏱️  Duração: %lu ms\n", next.durationMs);
-            Serial.printf("║    🔌 Relé %d → LIGANDO\n", next.relay + 1);
-            Serial.printf("║    📍 Progresso: %d/%d\n", currentNutrientIndex + 1, totalNutrients);
-            Serial.println("╚════════════════════════════════════════╝");
-            
-            // ===== LIGAR RELÉ =====
-            relayStates[next.relay] = true;
-            bool state = !relayStates[next.relay];
-            
-            if (next.relay >= 0 && next.relay < 8) {
-                pcf2.write(next.relay, state);
-            }
-            
-            currentState = DOSING;
-            stateStartTime = currentTime;
-        }
-    }
-    
-    xSemaphoreGive(dosingMutex);
 }

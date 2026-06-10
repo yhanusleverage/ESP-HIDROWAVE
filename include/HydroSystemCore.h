@@ -14,6 +14,8 @@
 #include "Config.h"
 #include "WebServerManager.h"  // ✅ TÓPICO 4: Para procesar comandos de queue
 #include "ESPNowController.h"  // ✅ NOVO: Para macToString
+#include "MqttClient.h"
+#include "MqttCommandDedup.h"
 
 // ===== 🎯 CACHE NVS DE ESTADOS DE MASTER RELAYS (LOCAL, NÃO ESP-NOW) =====
 /**
@@ -55,6 +57,7 @@ private:
     RelayCommandBox relayController;  // ✅ Controlador de relés (8 relés)
     SupabaseClient supabase;
     HydroSupaManager hybridSupabase;  // ✅ Manager híbrido
+    MqttClientWrapper mqttClient;
     
     // ✅ INYECCIÓN DE DEPENDENCIAS: Referencias a componentes externos
     WebServerTask* webServerTask;      // Ponteiro para WebServerTask (Core 1)
@@ -76,13 +79,20 @@ private:
     unsigned long lastSupabaseCheck;
     unsigned long lastRulesCheck;      // ✅ NOVO: Controle de verificação de regras (decision_rules)
     unsigned long lastMemoryProtection;
+    unsigned long lastMqttTelemetrySend;
+    unsigned long lastMqttHeartbeatSend;
+    unsigned long lastEcOperationSync;
+    unsigned long lastEcOperationIdleSync;
+    unsigned long commandPollIntervalMs;
+    MqttCommandDedup mqttCommandDedup;
     
     // Intervalos otimizados para resposta mais rápida
     static const unsigned long SENSOR_SEND_INTERVAL = 30000;      // 30s
     static const unsigned long STATUS_SEND_INTERVAL = 60000;      // 1 min (mantido para device_status)
-    static const unsigned long RELAY_STATES_SYNC_INTERVAL = 3000; // ✅ Otimizado: 3s (reduzido de 5s - 40% mais rápido)
+    static const unsigned long RELAY_STATES_SYNC_INTERVAL = 10000; // 10s — espelho relay_master/slaves (após comando há update imediato)
+    static const unsigned long EC_OPERATION_SYNC_INTERVAL = 12000; // 12s — remaining_sec fresco durante dosing/recirc
+    static const unsigned long EC_OPERATION_IDLE_SYNC_INTERVAL = 30000; // 30s — limpa ec_operation huérfano em Supabase
     static const unsigned long STATUS_PRINT_INTERVAL = 30000;     // 30s
-    static const unsigned long SUPABASE_CHECK_INTERVAL = 2000;    // ✅ 2s - Verificação de comandos pendentes (já otimizado)
     static const unsigned long RULES_CHECK_INTERVAL = 30000;      // ✅ 30s - Verificação de regras de automação (decision_rules)
     // Eliminar macro antes de definir constante estática
     #ifdef MEMORY_CHECK_INTERVAL
@@ -170,7 +180,11 @@ private:
     void checkSupabaseCommands();
     void checkSupabaseRules();  // ✅ NOVO: Verificar regras de automação (decision_rules)
     void checkECConfigFromSupabase();  // ✅ NOVO: Buscar EC config do Supabase via RPC activate_auto_ec
-    void processRelayCommand(const RelayCommand& cmd, bool isSlave);
+    void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "https");
+    
+    static void mqttCommandReceived(const char* payload, size_t length, void* userData);
+    void handleMqttCommandPayload(const char* payload, size_t length);
+    unsigned long resolveCommandPollIntervalMs() const;
     
     // ✅ FORK: Processamento separado por tipo de comando
     void processManualCommand(const RelayCommand& cmd, bool isSlave);      // Comando manual (botão)
@@ -188,6 +202,12 @@ private:
     void sendSensorDataToSupabase();
     void sendDeviceStatusToSupabase();
     void syncAllRelayStatesToSupabase();  // ✅ NOVO: Sincronização unificada de todos os relay states
+    void syncEcOperationStateToSupabase();
+    void handleNutrientDoseEvent(const NutrientDoseEvent* event);
+    static void onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData);
+    static void onEcOperationSyncStatic(void* userData);
+    void publishMqttTelemetry();
+    void publishMqttHeartbeat();
     void performMemoryProtection();
     
     // ✅ TÓPICO 4: Procesar comandos de queue (Core 0)

@@ -88,6 +88,8 @@ private:
     String apiKey;
     bool isConnected;
     unsigned long lastCommandCheck;
+    unsigned long commandPollIntervalMs;
+    bool commandPollQuiet;
     
     // ✅ NOVO: Mutex para thread-safety (proteção contra race conditions)
     SemaphoreHandle_t requestMutex;        // Protege makeRequest() - evita concorrência
@@ -122,6 +124,9 @@ public:
     // ✅ NOVO: Funções RPC atômicas para buscar comandos
     bool checkForMasterCommands(RelayCommand* commands, int maxCommands, int& commandCount);
     bool checkForSlaveCommands(RelayCommand* commands, int maxCommands, int& commandCount);
+
+    void setCommandPollIntervalMs(unsigned long ms) { commandPollIntervalMs = ms; }
+    void setCommandPollQuiet(bool quiet) { commandPollQuiet = quiet; }
     
     // ✅ NOVO: Marcar comandos com suporte para Master/Slave
     bool markCommandSent(int commandId, bool isSlave = false);
@@ -150,6 +155,17 @@ public:
     
     // ✅ NOVO: Buscar EC Config do Supabase via RPC activate_auto_ec
     bool getECConfigFromSupabase(ECConfig& config);
+
+    /** Registra dosagem executada (tabela nutrient_dosages). */
+    bool insertNutrientDosage(const String& deviceId, const String& sequenceId,
+                              const String& nutrientName, int relayNumber,
+                              float dosageMl, float dosageTimeSeconds,
+                              float ecBefore, float ecSetpoint,
+                              const String& source = "auto_ec");
+
+    /** Publica estado operacional Auto EC em relay_master. */
+    bool updateEcOperationState(const String& deviceId, const String& state,
+                                int operationRemainingSec, int nextCheckInSec);
     
     // Utilitários
     bool testConnection();

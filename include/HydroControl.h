@@ -22,7 +22,8 @@
 enum SequentialState {
     IDLE,           // Parado - nenhuma dosagem ativa
     DOSING,         // Dosando nutriente atual
-    WAITING         // Aguardando intervalo entre nutrientes
+    WAITING,        // Pausa curta entre nutrientes (~3s) — publicado como "dosing" na UI
+    RECIRCULATING   // Aguardando tempo_recirculacao após secuencia completa
 };
 
 struct SimpleNutrient {
@@ -31,6 +32,21 @@ struct SimpleNutrient {
     float dosageML;     // Quantidade em ml
     int durationMs;     // Duração em milissegundos
 };
+
+/** Evento emitido ao completar dosagem de um nutriente (para Supabase nutrient_dosages). */
+struct NutrientDoseEvent {
+    char sequenceId[24];
+    char nutrientName[32];
+    int relayNumber;
+    float dosageMl;
+    float dosageTimeSeconds;
+    float ecBefore;
+    float ecSetpoint;
+    const char* source;
+};
+
+typedef void (*NutrientDoseCallback)(const NutrientDoseEvent* event, void* userData);
+typedef void (*EcOperationSyncCallback)(void* userData);
 
 class HydroControl {
 public:
@@ -75,6 +91,15 @@ public:
     bool isAutoECEnabled() const { return autoECEnabled; }
     void setAutoECInterval(int intervalSeconds, bool saveToNVS = true);  // ✅ saveToNVS: false para evitar guardar múltiples veces
     int getAutoECInterval() const { return autoECIntervalSeconds; }
+    void setTempoRecirculacaoSeconds(unsigned long seconds);
+    unsigned long getTempoRecirculacaoSeconds() const { return tempoRecirculacaoSeconds; }
+    void setNutrientDoseCallback(NutrientDoseCallback cb, void* userData);
+    void setEcOperationSyncCallback(EcOperationSyncCallback cb, void* userData);
+
+    /** Estado operacional Auto EC para UI (relay_master.ec_operation_*). */
+    const char* getEcOperationStateName() const;
+    int getEcOperationRemainingSec() const;
+    int getEcNextCheckInSec() const;
     
     // ✅ TEMPO MORTO (recirculação)
     void setTempoRecirculacao(unsigned long segundos) { tempoRecirculacao = segundos; }
@@ -140,6 +165,16 @@ private:
     unsigned long lastECCheck;
     static const unsigned long EC_CHECK_INTERVAL = 30000; // 30 segundos
     int autoECIntervalSeconds;
+    unsigned long tempoRecirculacaoSeconds;
+    unsigned long lastECCheckAtMs;
+    float ecAtLastSequenceStart;
+    float ecSetpointAtLastSequence;
+    String currentSequenceId;
+    const char* currentDoseSource;
+    NutrientDoseCallback nutrientDoseCallback;
+    void* nutrientDoseCallbackUserData;
+    EcOperationSyncCallback ecOperationSyncCallback;
+    void* ecOperationSyncCallbackUserData;
     
     // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
     unsigned long lastDosageCompleteTime;  // Timestamp da última dosagem completa
@@ -178,6 +213,9 @@ private:
     void checkRelayTimers();
     void checkAutoEC();  // ✅ Verificar e ajustar EC automaticamente
     void processSimpleSequential();  // ✅ Máquina de estados para dosagem sequencial
+    void emitNutrientDoseEvent(const SimpleNutrient& nutrient);
+    void notifyEcOperationChanged();
+    int computeEcOperationRemainingSec() const;
     
     // ✅ Persistência em NVS (privadas - carregamento automático)
     void loadECControllerConfig();  // Carregar configuração do Controller ao iniciar

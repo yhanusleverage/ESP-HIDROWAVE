@@ -15,10 +15,55 @@
 // Ver función generateDeviceID() en main.cpp
 #define FIRMWARE_VERSION "2.1.0"
 
+// Painel HTTP local na porta 80 (index.html + APIs). 0 = produção (Supabase + portal AP WiFi).
+#ifndef ENABLE_LOCAL_ADMIN_HTTP
+#define ENABLE_LOCAL_ADMIN_HTTP 0
+#endif
+
+// ===== MQTT (MVP telemetria) — secrets.ini: mqtt_enabled=0|1 =====
+#ifndef ENABLE_MQTT
+#define ENABLE_MQTT 0
+#endif
+
+#if ENABLE_MQTT
+#ifndef MQTT_HOST
+#define MQTT_HOST ""
+#endif
+#ifndef MQTT_PORT
+#define MQTT_PORT 1883
+#endif
+#ifndef MQTT_USER
+#define MQTT_USER ""
+#endif
+#ifndef MQTT_PASS
+#define MQTT_PASS ""
+#endif
+#ifndef MQTT_TELEMETRY_INTERVAL_MS
+#define MQTT_TELEMETRY_INTERVAL_MS 30000UL
+#endif
+#ifndef MQTT_HEARTBEAT_INTERVAL_MS
+#define MQTT_HEARTBEAT_INTERVAL_MS 60000UL
+#endif
+// 0 = bivalente: MQTT telemetry (hydro + environment) + HTTPS paralelo
+// 1 = só MQTT; HTTPS hydro/environment só se MQTT desconectado (fallback procedural)
+#ifndef MQTT_HYDRO_ONLY
+#define MQTT_HYDRO_ONLY 0
+#endif
+// 1 = saúde: MQTT heartbeat se broker OK; HTTPS device_status só se MQTT cair (igual hydro)
+// 0 = bivalente: MQTT + HTTPS updateDeviceStatus em paralelo
+#ifndef MQTT_HEALTH_ONLY
+#define MQTT_HEALTH_ONLY 0
+#endif
+#endif
+
 // ===== CONFIGURAÇÕES DA API =====
-// Banco de Dados (Supabase) - APENAS SUPABASE
-#define SUPABASE_URL "https://mbrwdpqndasborhosewl.supabase.co"
-#define SUPABASE_ANON_KEY "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1icndkcHFuZGFzYm9yaG9zZXdsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDgxNDI3MzEsImV4cCI6MjA2MzcxODczMX0.ouRWHqrXv0Umk8SfbyGJoc-TA2vPaGDoC_OS-auj1-A"
+// Credenciais Supabase: definidas em secrets.ini (ver secrets.ini.example)
+#ifndef SUPABASE_URL
+#error "SUPABASE_URL não definido. Copie secrets.ini.example para secrets.ini e preencha as credenciais."
+#endif
+#ifndef SUPABASE_ANON_KEY
+#error "SUPABASE_ANON_KEY não definido. Copie secrets.ini.example para secrets.ini e preencha as credenciais."
+#endif
 
 // Tabelas do banco de dados
 #define SUPABASE_ENVIRONMENT_TABLE "environment_data"
@@ -29,7 +74,15 @@
 // Configurações de API
 #define API_RETRY_ATTEMPTS 3UL
 #define SUPABASE_TIMEOUT_MS 7000       // ✅ Otimizado: 7s (reduzido de 10s para resposta mais rápida)
-#define COMMAND_POLL_INTERVAL_MS 1000  // ✅ 1s - Verificar comandos (otimizado para resposta rápida)
+#ifndef COMMAND_POLL_INTERVAL_MS
+#define COMMAND_POLL_INTERVAL_MS 10000  // fallback HTTPS quando MQTT offline (fase 3)
+#endif
+#ifndef COMMAND_POLL_INTERVAL_MQTT_OK_MS
+#define COMMAND_POLL_INTERVAL_MQTT_OK_MS 60000UL  // backup lento se MQTT online
+#endif
+#ifndef COMMAND_POLL_INTERVAL_MQTT_DOWN_MS
+#define COMMAND_POLL_INTERVAL_MQTT_DOWN_MS 10000UL
+#endif
 
 // Headers HTTP para Supabase
 #define SUPABASE_CONTENT_TYPE "application/json"
@@ -121,20 +174,11 @@
 
 // ===== CONFIGURAÇÕES DOS SENSORES =====
 // TDS
-// ⚡ IMPORTANTE: VREF = Tensão MÁXIMA da SAÍDA ANALÓGICA (pino AO) do sensor
-// NÃO é a tensão de alimentação (VCC = 5V entre + e -)
-// É a tensão que aparece no pino AO do módulo (que vai para GPIO 34)
-// Como determinar:
-//   1. Medir tensão no pino AO do módulo com multímetro (recomendado)
-//   2. Ou verificar datasheet do sensor (ex: TDS Meter V1.0 = 2.3V máximo)
-//   3. Se há divisor de tensão: VREF = tensão após divisor
-#define TDS_VREF 5  // ⚡ Tensão MÁXIMA da saída analógica (pino AO) - MEDIR COM MULTÍMETRO!
-// ⚠️ AJUSTE TEMPORÁRIO: Se medindo 40 EC mas deveria ser 120 EC, use KValue = 3.0
-// Para calibração correta, use solução padrão 1413 µS/cm e método calibrateWithSolution1413()
-#define TDS_CALIBRATION_FACTOR 0.800  // ⚠️ AJUSTAR PARA 3.0 se erro for 1/3 (40 EC → 120 EC)
+#define TDS_VREF 5.0
+#define TDS_CALIBRATION_FACTOR 1.0
 
 // pH
-#define PH_VREF 5
+#define PH_VREF 3.3
 #define PH_CALIBRATION_FACTOR 1.0
 #define PH_CAL_7 2.56   // Voltagem para pH 7 (~2.5V)
 #define PH_CAL_4 3.3    // Voltagem para pH 4 (~3.3V)
@@ -145,7 +189,7 @@
 // ===== CONFIGURAÇÕES DE RELÉS =====
 #define MAX_RELAYS 8   // Sistema Master ESP-NOW com 8 relés
 
-// Mapeamento de relés para pinos PCF8574 (permite pular pinos defeituosos)fator
+// Mapeamento de relés para pinos PCF8574 (permite pular pinos defeituosos)
 // Formato: {pcf_chip, pin_number, enabled}
 // pcf_chip: 0 = PCF1 (0x20), 1 = PCF2 (0x24)
 // pin_number: 0-7 para cada PCF
@@ -195,5 +239,6 @@ static const RelayPinMap RELAY_PIN_MAPPING[MAX_RELAYS] = {
  * @note O contador é incrementado automaticamente a cada reinício do ESP32
  */
 int getRebootCount();
+void resetRebootCount();
 
 #endif // CONFIG_H 

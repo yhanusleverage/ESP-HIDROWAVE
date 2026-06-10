@@ -1,0 +1,17 @@
+# Copiar para: /etc/mosquitto/conf.d/hidrowave.conf
+# Documentação: docs/mqtt/README.md
+
+listener 1883 0.0.0.0
+allow_anonymous false
+
+password_file /var/lib/mosquitto/passwd
+acl_file /var/lib/mosquitto/acl
+
+# Logs (opcional)
+# log_dest file /var/log/mosquitto/mosquitto.log
+
+# Futuro MQTTS:
+# listener 8883 0.0.0.0
+# cafile /etc/mosquitto/certs/ca.crt
+# certfile /etc/mosquitto/certs/server.crt
+# keyfile /etc/mosquitto/certs/server.key

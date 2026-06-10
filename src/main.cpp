@@ -176,6 +176,19 @@ bool saveRebootCount(int count) {
  * @return Novo valor do contador após incremento
  */
 int incrementAndSaveRebootCount() {
+    Preferences prefs;
+    if (prefs.begin("hydro_system", false)) {
+        if (prefs.getBool("skip_reboot_inc", false)) {
+            prefs.putBool("skip_reboot_inc", false);
+            prefs.putInt("reboot_count", 0);
+            prefs.end();
+            globalRebootCount = 0;
+            Serial.println("🔄 Primeiro boot apos portal: reboot_count mantido em 0");
+            return 0;
+        }
+        prefs.end();
+    }
+
     int currentCount = readRebootCount();
     int newCount = currentCount + 1;
     saveRebootCount(newCount);
@@ -190,6 +203,19 @@ int incrementAndSaveRebootCount() {
  */
 int getRebootCount() {
     return globalRebootCount;
+}
+
+void resetRebootCount() {
+    globalRebootCount = 0;
+    Preferences prefs;
+    if (prefs.begin("hydro_system", false)) {
+        prefs.putInt("reboot_count", 0);
+        prefs.putBool("skip_reboot_inc", true);
+        prefs.end();
+        Serial.println("🔄 reboot_count zerado (portal) — proximo boot nao incrementa");
+    } else {
+        saveRebootCount(0);
+    }
 }
 
 // Função de proteção global de memória SIMPLIFICADA
@@ -2634,44 +2660,38 @@ void setup() {
     Serial.println();
     Serial.print("> ");
     
+#if ENABLE_LOCAL_ADMIN_HTTP
     // 🌐 FASE 3: Inicializar WebServerTask en Core 1 (AsyncWebServer + REST API)
     Serial.println();
     Serial.println("╔════════════════════════════════════════════════════╗");
     Serial.println("║   🌐 FASE 3: Inicializando WebServerTask (Core 1) ║");
     Serial.println("╚════════════════════════════════════════════════════╝");
-    
-    // ✅ NOVO: Verificar memória antes de criar WebServerTask
+
     freeHeap = ESP.getFreeHeap();
     if (freeHeap < 50000) {
         Serial.printf("⚠️ Heap baixo (%u bytes) antes de criar WebServerTask\n", freeHeap);
     }
-    
+
     webServerTask = new WebServerTask();
-    esp_task_wdt_reset();  // ✅ Resetar watchdog antes de inicializar WebServer
-    
+    esp_task_wdt_reset();
+
     if (webServerTask->begin()) {
         Serial.println("✅ WebServerTask inicializado en Core 1");
         Serial.println("   ✓ AsyncWebServer: Puerto 80");
         Serial.println("   ✓ REST API: /api/status, /api/command");
         Serial.println("   ✓ Archivos estáticos: SPIFFS");
-        
-        // ✅ Inyectar WebServerTask en el StateManager
+
         stateManager.setWebServerTask(webServerTask);
         Serial.println("   ✓ WebServerTask inyectado en StateManager");
         Serial.println("   ✓ Core: 1 (dedicado)");
-        
-        // ✅ REMOVIDO: Object Pool Manager já foi inicializado ANTES de stateManager.begin()
-        // (linha ~2310) para garantir que Supabase tenha acesso quando HydroSystemCore::begin() for chamado
-        
-        // ✅ CORREÇÃO CRÍTICA: Se HydroSystemCore já existe, recriar com webServerTask válido
-        // Isso garante que os endpoints sejam registrados corretamente
-        if (stateManager.getCurrentState() == HYDRO_ACTIVE_MODE || 
+
+        if (stateManager.getCurrentState() == HYDRO_ACTIVE_MODE ||
             stateManager.getCurrentState() == ADMIN_PANEL_MODE) {
             Serial.println("\n🔄 Recriando HydroSystemCore com WebServerTask válido...");
             if (stateManager.getCurrentState() == HYDRO_ACTIVE_MODE) {
-                stateManager.switchToHydroActive();  // Recria com webServerTask válido
+                stateManager.switchToHydroActive();
             } else if (stateManager.getCurrentState() == ADMIN_PANEL_MODE) {
-                stateManager.switchToAdminPanel();  // Recria com webServerTask válido
+                stateManager.switchToAdminPanel();
             }
             Serial.println("✅ HydroSystemCore recriado com WebServerTask válido");
         }
@@ -2680,6 +2700,11 @@ void setup() {
         Serial.println("⚠️ Continuando sin Web Server...");
     }
     Serial.println();
+#else
+    Serial.println();
+    Serial.println("ℹ️ FASE 3 omitida: admin HTTP :80 desativado (ENABLE_LOCAL_ADMIN_HTTP=0)");
+    Serial.println();
+#endif
     
 #endif
 

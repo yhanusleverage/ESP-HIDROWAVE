@@ -3,7 +3,8 @@
 #include <SPIFFS.h>
 #include "HybridStateManager.h"
 #include <ArduinoJson.h>
-#include "Config.h"  // ✅ Para FIRMWARE_VERSION
+#include "Config.h"
+#include "SupabaseAuth.h"
 
 
 // ===== CONSTRUTOR E DESTRUTOR =====
@@ -144,6 +145,8 @@ bool WiFiConfigServer::begin() {
         String password = "";
         String deviceName = "";
         String userEmail = "";
+        String userPassword = "";
+        String location = "";
         
         // ===== EXTRAIR PARÂMETROS DO POST =====
         if (request->hasParam("ssid", true)) {
@@ -158,11 +161,19 @@ bool WiFiConfigServer::begin() {
         if (request->hasParam("userEmail", true)) {
             userEmail = request->getParam("userEmail", true)->value();
         }
+        if (request->hasParam("userPassword", true)) {
+            userPassword = request->getParam("userPassword", true)->value();
+        }
+        if (request->hasParam("location", true)) {
+            location = request->getParam("location", true)->value();
+        }
         
         printDebug("📝 SSID recebido: '" + ssid + "'");
-        printDebug("📝 Password recebido: " + String(password.length() > 0 ? "[" + String(password.length()) + " chars]" : "[VAZIO]"));
+        printDebug("📝 Senha WiFi: " + String(password.length() > 0 ? "[" + String(password.length()) + " chars]" : "[VAZIO]"));
         printDebug("📝 Device Name recebido: '" + deviceName + "'");
+        printDebug("📍 Localização recebida: '" + location + "'");
         printDebug("📧 Email recebido: '" + userEmail + "'");
+        printDebug("🔐 Senha conta: " + String(userPassword.length() > 0 ? "[" + String(userPassword.length()) + " chars]" : "[VAZIO]"));
         
         // ===== VALIDAÇÃO BÁSICA =====
         if (ssid.length() == 0) {
@@ -170,6 +181,23 @@ bool WiFiConfigServer::begin() {
             StaticJsonDocument<200> doc;
             doc["success"] = false;
             doc["message"] = "SSID é obrigatório";
+            
+            String response;
+            serializeJson(doc, response);
+            request->send(400, "application/json", response);
+            return;
+        }
+
+        userEmail.trim();
+        userEmail.toLowerCase();
+        userEmail.replace("\"", "");
+        userEmail.replace("'", "");
+        userEmail.replace(" ", "");
+        if (userEmail.length() > 0 && userPassword.length() < 6) {
+            printDebug("❌ ERRO: Senha da conta invalida");
+            StaticJsonDocument<256> doc;
+            doc["success"] = false;
+            doc["message"] = "Senha da conta deve ter no mínimo 6 caracteres";
             
             String response;
             serializeJson(doc, response);
@@ -196,15 +224,18 @@ bool WiFiConfigServer::begin() {
         size_t ssidSize = prefs.putString("ssid", ssid);
         size_t passSize = prefs.putString("password", password);
         String finalDeviceName = deviceName.length() > 0 ? deviceName : deviceID;
+        String finalLocation = location.length() > 0 ? location : String("Estufa");
         size_t nameSize = prefs.putString("device_name", finalDeviceName);
+        size_t locSize = prefs.putString("location", finalLocation);
         
-        // ✅ NOVO: Salvar email se fornecido
         if (userEmail.length() > 0) {
             size_t emailSize = prefs.putString("user_email", userEmail);
             printDebug("💾 Email salvo: " + String(emailSize) + " bytes");
         }
+        printDebug("💾 Localização salva: " + String(locSize) + " bytes (" + finalLocation + ")");
         
         prefs.end();
+        resetRebootCount();
         
         printDebug("💾 SSID salvo: " + String(ssidSize) + " bytes");
         printDebug("💾 Password salvo: " + String(passSize) + " bytes");
@@ -246,15 +277,49 @@ bool WiFiConfigServer::begin() {
             connectionResult = "Teste falhou - mas credenciais foram salvas";
             printDebug("⚠️ " + connectionResult);
         }
+
+        String authDetail;
+        String authStatus = "skipped";
+        if (userEmail.length() > 0 && userPassword.length() >= 6) {
+            if (connected) {
+                SupabaseSignupResult authResult = signupSupabaseUser(userEmail, userPassword, authDetail);
+                switch (authResult) {
+                    case SupabaseSignupResult::Created:
+                        authStatus = "created";
+                        printDebug("✅ Conta Supabase criada");
+                        break;
+                    case SupabaseSignupResult::AlreadyExists:
+                        authStatus = "exists";
+                        printDebug("ℹ️ Conta Supabase ja existia — perfil sera criado no registo do dispositivo");
+                        break;
+                    case SupabaseSignupResult::SkippedNoNetwork:
+                        authStatus = "skipped_no_network";
+                        printDebug("⚠️ Signup adiado: sem rede");
+                        break;
+                    case SupabaseSignupResult::SkippedNoCreds:
+                        authStatus = "skipped";
+                        break;
+                    case SupabaseSignupResult::Failed:
+                    default:
+                        authStatus = "failed";
+                        printDebug("⚠️ Signup falhou: " + authDetail);
+                        break;
+                }
+            } else {
+                authStatus = "skipped_no_wifi";
+                authDetail = "WiFi nao conectou — crie a conta manualmente no painel";
+                printDebug("⚠️ Signup nao executado: WiFi offline");
+            }
+        }
         
         // ✅ NOVO: Chamar callback de email se fornecido e callback configurado
         if (userEmail.length() > 0 && onEmailCallback) {
-            printDebug("📧 Chamando callback de registro de email...");
-            onEmailCallback(userEmail);
+            printDebug("📧 Registro: " + userEmail + " | nome: " + finalDeviceName + " | local: " + finalLocation);
+            onEmailCallback(userEmail, finalDeviceName, finalLocation);
         }
         
         // ===== RESPOSTA DE SUCESSO =====
-        StaticJsonDocument<300> doc;
+        StaticJsonDocument<512> doc;
         doc["success"] = true;
         doc["message"] = "WiFi configurado com sucesso";
         doc["connection_test"] = connected;
@@ -263,6 +328,12 @@ bool WiFiConfigServer::begin() {
         doc["restart_delay"] = 3;
         if (userEmail.length() > 0) {
             doc["user_email"] = userEmail;
+        }
+        if (authStatus.length() > 0) {
+            doc["auth_signup"] = authStatus;
+            if (authDetail.length() > 0) {
+                doc["auth_message"] = authDetail;
+            }
         }
         
         String response;
@@ -348,11 +419,11 @@ bool WiFiConfigServer::begin() {
             preferences.putString("device_name", deviceName);
             preferences.putString("location", location);
             preferences.end();
+            resetRebootCount();
         }
         
-        // Chamar callback de email se configurado
         if (onEmailCallback) {
-            onEmailCallback(userEmail);
+            onEmailCallback(userEmail, deviceName, location);
         }
         
         // Resposta de sucesso
@@ -456,7 +527,7 @@ void WiFiConfigServer::onWiFiConfigured(std::function<void()> callback) {
 }
 
 // ✅ NOVO: Implementar callback para email
-void WiFiConfigServer::onEmailRegistered(std::function<void(String)> callback) {
+void WiFiConfigServer::onEmailRegistered(std::function<void(String, String, String)> callback) {
     onEmailCallback = callback;
 }
 

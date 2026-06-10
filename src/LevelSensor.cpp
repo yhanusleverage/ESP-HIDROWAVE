@@ -28,8 +28,6 @@ String LevelSensor::getStatus() {
     bool npnDetecta = sensorNPNDetectando();
     bool pnpDetecta = sensorPNPDetectando();
 
-    String oldStatus = _lastStatus;
-    
     if (!npnDetecta) {
         _lastStatus = "CHEIO";
     } else if (!pnpDetecta && npnDetecta) {
@@ -39,14 +37,7 @@ String LevelSensor::getStatus() {
     } else {
         _lastStatus = "ERRO";  // Estado inconsistente
     }
-    
-    // Reportar mudanças de estado
-    if (oldStatus != _lastStatus) {
-        Serial.printf("💧 Nível da água: %s -> %s\n", 
-            oldStatus.isEmpty() ? "?" : oldStatus.c_str(), 
-            _lastStatus.c_str());
-    }
-    
+
     return _lastStatus;
 }
 

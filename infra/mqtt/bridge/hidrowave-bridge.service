@@ -1,0 +1,17 @@
+[Unit]
+Description=HIDROWAVE MQTT to Supabase Bridge
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hidrowave
+Group=hidrowave
+WorkingDirectory=/opt/hidrowave-bridge
+EnvironmentFile=/opt/hidrowave-bridge/.env
+ExecStart=/usr/bin/node /opt/hidrowave-bridge/index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target                                                                                                      

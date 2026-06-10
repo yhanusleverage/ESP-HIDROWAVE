@@ -1,9 +1,19 @@
 #include "DeviceRegistration.h"
+#include "Config.h"
+
+static String freshMacAddress() {
+    String mac = getFullMAC();
+    if (mac.length() < 11 || mac == "00:00:00:00:00:00") {
+        mac = WiFi.macAddress();
+        mac.toUpperCase();
+    }
+    return mac;
+}
 
 DeviceRegistration::DeviceRegistration() : 
     isRegistered(false),
     deviceId(getDeviceID()),
-    macAddress(WiFi.macAddress()) {
+    macAddress(freshMacAddress()) {
 }
 
 void DeviceRegistration::setSupabaseConfig(const String& url, const String& key) {
@@ -12,10 +22,21 @@ void DeviceRegistration::setSupabaseConfig(const String& url, const String& key)
 }
 
 bool DeviceRegistration::registerDeviceWithEmail(const String& email, const String& deviceName, const String& location) {
+    deviceId = getDeviceID();
+    macAddress = freshMacAddress();
     Serial.println("📧 Registrando dispositivo com email: " + email);
+    Serial.println("📶 MAC atual: " + macAddress);
+    Serial.println("🆔 Device ID: " + deviceId);
+    
+    String normalizedEmail = email;
+    normalizedEmail.trim();
+    normalizedEmail.toLowerCase();
+    normalizedEmail.replace("\"", "");
+    normalizedEmail.replace("'", "");
+    normalizedEmail.replace(" ", "");
     
     // Validar email
-    if (!validateEmail(email)) {
+    if (!validateEmail(normalizedEmail)) {
         lastError = "Email inválido";
         Serial.println("❌ " + lastError);
         return false;
@@ -34,7 +55,7 @@ bool DeviceRegistration::registerDeviceWithEmail(const String& email, const Stri
     }
     
     // Construir payload
-    String payload = buildRegistrationPayload(email, deviceName, location);
+    String payload = buildRegistrationPayload(normalizedEmail, deviceName, location);
     Serial.println("📤 Payload: " + payload);
     
     // Fazer requisição
@@ -48,11 +69,40 @@ bool DeviceRegistration::registerDeviceWithEmail(const String& email, const Stri
         
         if (!error && doc["success"].as<bool>()) {
             isRegistered = true;
-            userEmail = email;
+            userEmail = normalizedEmail;
+
+            // Só zera NVS no portal (WiFiConfigServer) ou troca de dono — não em todo boot
+            if (doc.containsKey("owner_changed") && doc["owner_changed"].as<bool>()) {
+                resetRebootCount();
+                Serial.println("🔄 Dono alterado — reboot_count NVS zerado");
+            }
+
             Serial.println("🎉 Dispositivo registrado com sucesso!");
-            Serial.println("👤 Email: " + email);
+            Serial.println("👤 Email pedido: " + normalizedEmail);
+            if (doc.containsKey("stored_user_email")) {
+                Serial.println("👤 Email na BD: " + doc["stored_user_email"].as<String>());
+            }
+            if (doc.containsKey("owner_changed") && doc["owner_changed"].as<bool>()) {
+                String prev = doc.containsKey("previous_owner_email")
+                    ? doc["previous_owner_email"].as<String>() : "";
+                Serial.println("🔄 Dono do equipamento alterado (antes: " + prev + ")");
+            }
+            if (doc.containsKey("email_applied") && !doc["email_applied"].as<bool>()) {
+                Serial.println("⚠️ Email nao gravado — verifique o RPC no Supabase");
+            }
             Serial.println("🆔 Device ID: " + deviceId);
-            Serial.println("📱 Total dispositivos: " + String(doc["device_count"].as<int>()));
+            Serial.println("📍 Localização enviada: " + location);
+            Serial.println("📱 Total dispositivos deste email: " + String(doc["device_count"].as<int>()));
+            if (doc.containsKey("user_profile_ensured")) {
+                Serial.println(String("👤 Perfil public.users: ") +
+                    (doc["user_profile_ensured"].as<bool>() ? "OK" : "FALHOU"));
+            }
+            if (doc.containsKey("total_devices")) {
+                Serial.println("👤 users.total_devices: " + String(doc["total_devices"].as<int>()));
+            }
+            if (doc.containsKey("reboot_count_reset") && doc["reboot_count_reset"].as<bool>()) {
+                Serial.println("🔄 reboot_count na BD zerado (novo ciclo no portal)");
+            }
             return true;
         } else {
             lastError = doc["message"].as<String>();

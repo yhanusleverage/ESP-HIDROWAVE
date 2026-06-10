@@ -7,6 +7,12 @@
 #include "Config.h"
 #include "DeviceID.h"
 #include "ObjectPoolManager.h"  // ✅ Object Pool Pattern
+#if ENABLE_MQTT
+#include "MqttClient.h"
+#endif
+#include "TelemetrySerial.h"
+#include "MqttCommandParser.h"
+#include "CommandSerial.h"
 #include <esp_task_wdt.h>
 #include <esp_err.h>
 #include <nvs_flash.h>
@@ -34,7 +40,11 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     lastStatusPrint(0),
     lastSupabaseCheck(0),
     lastRulesCheck(0),  // ✅ NOVO: Inicializar controle de verificação de regras
-    lastMemoryProtection(0) {
+    lastMemoryProtection(0),
+    lastMqttTelemetrySend(0),
+    lastMqttHeartbeatSend(0),
+    lastEcOperationSync(0),
+    lastEcOperationIdleSync(0) {
     
     // Log de dependências injetadas
     if (webServerTask) {
@@ -70,6 +80,9 @@ bool HydroSystemCore::begin() {
         return false;
     }
     Serial.println("✅ HydroControl inicializado");
+
+    hydroControl.setNutrientDoseCallback(&HydroSystemCore::onNutrientDoseStatic, this);
+    hydroControl.setEcOperationSyncCallback(&HydroSystemCore::onEcOperationSyncStatic, this);
     
     // ===== CONECTAR SUPABASE =====
     Serial.println("☁️ Conectando ao Supabase...");
@@ -186,6 +199,38 @@ bool HydroSystemCore::begin() {
     
     systemReady = true;
     
+#if ENABLE_MQTT
+    {
+        const char* hydroMode =
+#if MQTT_HYDRO_ONLY
+            "mqtt+https_fallback";
+#else
+            "bivalente";
+#endif
+        const char* healthMode =
+#if MQTT_HEALTH_ONLY
+            "mqtt+https_fallback";
+#else
+            "bivalente";
+#endif
+        Serial.printf("📡 MQTT telemetria=%lus heartbeat=%lus | hydro=%s health=%s\n",
+                      (unsigned long)(MQTT_TELEMETRY_INTERVAL_MS / 1000UL),
+                      (unsigned long)(MQTT_HEARTBEAT_INTERVAL_MS / 1000UL),
+                      hydroMode, healthMode);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        mqttClient.setCommandHandler(&HydroSystemCore::mqttCommandReceived, this);
+        if (mqttClient.begin(getDeviceID())) {
+            Serial.println("✅ MQTT client inicializado (telemetria + heartbeat + LWT + command)");
+            supabase.setCommandPollQuiet(true);
+            publishMqttHeartbeat();
+            lastMqttHeartbeatSend = millis();
+        } else {
+            Serial.println("⚠️ MQTT client não conectou — continuando com HTTPS");
+        }
+    }
+#endif
+    
     Serial.println("✅ HydroSystemCore ativo!");
     Serial.println("💾 Heap livre: " + String(ESP.getFreeHeap()) + " bytes");
     Serial.println("🌐 IP: " + WiFi.localIP().toString());
@@ -201,20 +246,36 @@ void HydroSystemCore::loop() {
     
     unsigned long now = millis();
     
-    // ✅ CRÍTICO: Processar dosagem PRIMEIRO (antes de qualquer operação bloqueante)
-    // Isso garante timing preciso dos relés mesmo com HTTP/mutex delays
-    hydroControl.loop();
-    
     // ===== PROTEÇÃO DE MEMÓRIA (10s) =====
     if (now - lastMemoryProtection >= MEMORY_CHECK_INTERVAL) {
         performMemoryProtection();
         lastMemoryProtection = now;
     }
     
-    // ===== SENSORES → SUPABASE (30s) =====
-    if (now - lastSensorSend >= SENSOR_SEND_INTERVAL) {
-        sendSensorDataToSupabase();
-        lastSensorSend = now;
+#if ENABLE_MQTT
+    mqttClient.loop();
+    if (now - lastMqttTelemetrySend >= MQTT_TELEMETRY_INTERVAL_MS) {
+        publishMqttTelemetry();
+        lastMqttTelemetrySend = now;
+    }
+    if (now - lastMqttHeartbeatSend >= MQTT_HEARTBEAT_INTERVAL_MS) {
+        publishMqttHeartbeat();
+        lastMqttHeartbeatSend = now;
+    }
+#endif
+    
+    // ===== SENSORES → SUPABASE (30s) — bivalente ou fallback se MQTT_HYDRO_ONLY =====
+    {
+        bool sendHydroHttps = true;
+#if ENABLE_MQTT && MQTT_HYDRO_ONLY
+        sendHydroHttps = !mqttClient.isConnected();
+#elif !ENABLE_MQTT
+        sendHydroHttps = true;
+#endif
+        if (sendHydroHttps && now - lastSensorSend >= SENSOR_SEND_INTERVAL) {
+            sendSensorDataToSupabase();
+            lastSensorSend = now;
+        }
     }
     
     // ===== STATUS DEVICE → SUPABASE (60s) =====
@@ -229,6 +290,29 @@ void HydroSystemCore::loop() {
         syncAllRelayStatesToSupabase();
         lastRelayStatesSync = now;
     }
+
+    // ===== EC operation heartbeat — activo 12s / idle 30s (limpa estado huérfano MQTT) =====
+    {
+        if (!hydroControl.isAutoECEnabled() && hydroControl.isDosageActive()) {
+            hydroControl.cancelCurrentDosage();
+            syncEcOperationStateToSupabase();
+            lastEcOperationIdleSync = now;
+        }
+
+        const char* opState = hydroControl.getEcOperationStateName();
+        const bool cycleActive = hydroControl.isDosageActive() ||
+            strcmp(opState, "recirculating") == 0 ||
+            strcmp(opState, "ec_check_pending") == 0;
+
+        if (cycleActive && now - lastEcOperationSync >= EC_OPERATION_SYNC_INTERVAL) {
+            syncEcOperationStateToSupabase();
+            lastEcOperationSync = now;
+        } else if (!cycleActive && strcmp(opState, "idle") == 0 &&
+                   now - lastEcOperationIdleSync >= EC_OPERATION_IDLE_SYNC_INTERVAL) {
+            syncEcOperationStateToSupabase();
+            lastEcOperationIdleSync = now;
+        }
+    }
     
     // ===== DEBUG PERIÓDICO (30s) =====
     if (now - lastStatusPrint >= STATUS_PRINT_INTERVAL) {
@@ -236,9 +320,10 @@ void HydroSystemCore::loop() {
         lastStatusPrint = now;
     }
     
-    // ===== ✅ VERIFICAR COMANDOS PENDENTES (5s) =====
-    // Busca comandos pendentes do Supabase (relay_commands com status='pending')
-    if (now - lastSupabaseCheck >= SUPABASE_CHECK_INTERVAL) {
+    // ===== Poll relay_commands (HTTPS backup — 60s se MQTT OK, 10s se MQTT down) =====
+    commandPollIntervalMs = resolveCommandPollIntervalMs();
+    supabase.setCommandPollIntervalMs(commandPollIntervalMs);
+    if (now - lastSupabaseCheck >= commandPollIntervalMs) {
         checkSupabaseCommands();
         lastSupabaseCheck = now;
     }
@@ -250,10 +335,9 @@ void HydroSystemCore::loop() {
         lastRulesCheck = now;
     }
     
-    // ===== ✅ NOVO: BUSCAR EC CONFIG DO SUPABASE (cada 10 segundos) =====
+    // ===== ✅ NOVO: BUSCAR EC CONFIG DO SUPABASE (a cada intervalo_auto_ec) =====
     // ✅ IMPORTANTE: Buscar SEMPRE que Supabase estiver conectado, mesmo se auto_enabled = false
     // Isso permite que o ESP32 seja ativado remotamente pelo frontend
-    // ⚠️ NOTA: Este es el polling HTTP (cada 10s), NO es intervalo_auto_ec (que es local, cada 5s por defecto)
     static unsigned long lastECConfigCheck = 0;
     static unsigned long lastDebugPrint = 0;
     
@@ -280,16 +364,13 @@ void HydroSystemCore::loop() {
     }
     
     // ✅ BUSCAR SEMPRE (não depende de auto_enabled) - permite ativação remota
-    // ✅ OPCIÓN 1 IMPLEMENTADA: Polling HTTP Optimizado (10s)
-    // Funciona con IP privado (REST API saliente) - Sin cambios en BD necesarios
     if (supabaseConnected) {
-        // ✅ OPTIMIZADO: Polling cada 10 segundos (balance entre latencia y carga)
-        int intervalSeconds = 10;  // ✅ Aumentado de 5s a 10s para reducir carga HTTP
-        unsigned long checkInterval = intervalSeconds * 1000;
+        int intervalSeconds = hydroControl.getAutoECInterval();
+        unsigned long checkInterval = intervalSeconds > 0 ? (intervalSeconds * 1000) : 30000; //IMPORTANTE Default: 30 segundos
         
         if (now - lastECConfigCheck >= checkInterval) {
-            Serial.println("⏰ [EC CONFIG] Polling HTTP - Verificando cambios en ec_config_view...");
-            Serial.printf("   💡 Intervalo: %d segundos (permite ativação remota)\n", intervalSeconds);
+            Serial.println("⏰ [EC CONFIG] Intervalo atingido - chamando checkECConfigFromSupabase()");
+            Serial.println("   💡 Buscando mesmo se auto_enabled=false (permite ativação remota)");
             checkECConfigFromSupabase();
             lastECConfigCheck = now;
         }
@@ -444,8 +525,8 @@ void HydroSystemCore::loop() {
         lastCacheUpdate = now;
     }
     
-    // ✅ NOTA: hydroControl.loop() agora é chamado NO INÍCIO do loop
-    // para garantir timing preciso dos relés (antes de operações HTTP bloqueantes)
+    // ===== LOOP DOS SENSORES/RELÉS =====
+    hydroControl.loop();
 }
 
 void HydroSystemCore::end() {
@@ -480,10 +561,14 @@ void HydroSystemCore::printSystemStatus() {
 }
 
 void HydroSystemCore::printSensorReadings() {
-    Serial.println("🌡️ Temperatura: " + String(hydroControl.getTemperature()) + "°C");
-    Serial.println("🧪 pH: " + String(hydroControl.getpH()));
-    Serial.println("⚡ TDS: " + String(hydroControl.getTDS()) + " ppm");
-    Serial.println("💧 Nível da água: " + String(hydroControl.isWaterLevelOk() ? "OK" : "BAIXO"));
+    MqttTelemetryReading reading;
+    reading.temperature = hydroControl.getTemperature();
+    reading.ph = hydroControl.getpH();
+    reading.tds = hydroControl.getTDS();
+    reading.waterLevelOk = hydroControl.isWaterLevelOk();
+    reading.airTemperature = hydroControl.getTemperature();
+    reading.humidity = 65.0f;
+    printTelemetrySerialLine(reading);
 }
 
 void HydroSystemCore::testSupabaseConnection() {
@@ -525,7 +610,7 @@ void HydroSystemCore::checkSupabaseCommands() {
     if (supabase.checkForMasterCommands(commands, MAX_BATCH_COMMANDS, commandCount)) {
         if (commandCount > 0) {
             isSlave = false;
-            Serial.printf("📥 [MASTER] Recebidos %d comando(s) do Supabase\n", commandCount);
+            Serial.printf("📥 [HTTPS] %d comando(s)\n", commandCount);
             // ✅ Processar todos os comandos do batch
             for (int i = 0; i < commandCount; i++) {
                 processRelayCommand(commands[i], isSlave);
@@ -542,7 +627,7 @@ void HydroSystemCore::checkSupabaseCommands() {
     if (supabase.checkForSlaveCommands(commands, MAX_BATCH_COMMANDS, commandCount)) {
         if (commandCount > 0) {
             isSlave = true;
-            Serial.printf("📥 [SLAVE] Recebidos %d comando(s) do Supabase\n", commandCount);
+            Serial.printf("📥 [HTTPS slave] %d comando(s)\n", commandCount);
             // ✅ Processar todos os comandos do batch
             for (int i = 0; i < commandCount; i++) {
                 processRelayCommand(commands[i], isSlave);
@@ -589,21 +674,64 @@ void HydroSystemCore::checkECConfigFromSupabase() {
     Serial.println("║   🔍 BUSCANDO EC CONFIG DO SUPABASE                ║");
     Serial.println("╚════════════════════════════════════════════════════╝");
     
+    static struct {
+        double base_dose = -1;
+        double flow_rate = -1;
+        double volume = -1;
+        double total_ml = -1;
+        double kp = -1;
+        double ec_setpoint = -1;
+        bool auto_enabled = false;
+        int intervalo_auto_ec = -1;
+        unsigned long tempo_recirculacao = 0;
+        String nutrientsJson;
+        bool initialized = false;
+    } lastAppliedEcConfig;
+
+    auto ecConfigUnchanged = [&](const ECConfig& config) -> bool {
+        if (!lastAppliedEcConfig.initialized) {
+            return false;
+        }
+        return lastAppliedEcConfig.base_dose == config.base_dose &&
+               lastAppliedEcConfig.flow_rate == config.flow_rate &&
+               lastAppliedEcConfig.volume == config.volume &&
+               lastAppliedEcConfig.total_ml == config.total_ml &&
+               lastAppliedEcConfig.kp == config.kp &&
+               lastAppliedEcConfig.ec_setpoint == config.ec_setpoint &&
+               lastAppliedEcConfig.auto_enabled == config.auto_enabled &&
+               lastAppliedEcConfig.intervalo_auto_ec == config.intervalo_auto_ec &&
+               lastAppliedEcConfig.tempo_recirculacao == config.tempo_recirculacao &&
+               lastAppliedEcConfig.nutrientsJson == config.nutrientsJson;
+    };
+
+    auto rememberEcConfig = [&](const ECConfig& config) {
+        lastAppliedEcConfig.base_dose = config.base_dose;
+        lastAppliedEcConfig.flow_rate = config.flow_rate;
+        lastAppliedEcConfig.volume = config.volume;
+        lastAppliedEcConfig.total_ml = config.total_ml;
+        lastAppliedEcConfig.kp = config.kp;
+        lastAppliedEcConfig.ec_setpoint = config.ec_setpoint;
+        lastAppliedEcConfig.auto_enabled = config.auto_enabled;
+        lastAppliedEcConfig.intervalo_auto_ec = config.intervalo_auto_ec;
+        lastAppliedEcConfig.tempo_recirculacao = config.tempo_recirculacao;
+        lastAppliedEcConfig.nutrientsJson = config.nutrientsJson;
+        lastAppliedEcConfig.initialized = true;
+    };
+    
     ECConfig config;
     if (supabase.getECConfigFromSupabase(config)) {
         if (config.isValid) {
+            if (!ecConfigUnchanged(config)) {
             // ✅ Atualizar parâmetros do controller
-            // ⚠️ OPTIMIZADO: No guardar automáticamente (saveToNVS = false)
-            // Se guardará UNA vez al final para evitar 4 guardados redundantes
             hydroControl.getECController().setBaseDose(config.base_dose);
             hydroControl.getECController().setFlowRate(config.flow_rate);
             hydroControl.getECController().setVolume(config.volume);
             hydroControl.getECController().setTotalMl(config.total_ml);
             hydroControl.getECController().setKp(config.kp);
-            hydroControl.setECSetpoint(config.ec_setpoint, false);  // false = no guardar aún
-            hydroControl.setAutoECEnabled(config.auto_enabled, false);  // false = no guardar aún
-            hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);  // false = no guardar aún
-            hydroControl.setTempoRecirculacao(config.tempo_recirculacao);  // ✅ TEMPO MORTO (no tiene setter con saveToNVS)
+            hydroControl.setECSetpoint(config.ec_setpoint);
+            hydroControl.setAutoECEnabled(config.auto_enabled);
+            hydroControl.setAutoECInterval(config.intervalo_auto_ec);
+            hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
             
             // ✅ PASSAR NUTRIENTES PARA HYDROCONTROL (alimento para automação)
             if (config.nutrientsJson.length() > 0 && config.nutrientsJson != "[]") {
@@ -655,16 +783,22 @@ void HydroSystemCore::checkECConfigFromSupabase() {
                 Serial.println("⚠️ [EC CONFIG] Nenhum nutriente recebido (nutrientsJson vazio)");
             }
             
-            // ✅ CRÍTICO: Salvar em NVS - El ESP32 siempre usa valores de NVS
-            // Flujo: Supabase (ec_config_view) → HydroControl → NVS → ESP32 usa de NVS
-            Serial.println("💾 [EC CONFIG] Guardando configuración en NVS...");
             hydroControl.saveECControllerConfig();
+            rememberEcConfig(config);
+            Serial.println("✅ [EC CONFIG] Configuração atualizada e salva em NVS");
+            } else {
+                Serial.println("ℹ️ [EC CONFIG] Config inalterada — NVS não reescrito");
+            }
             
-            Serial.println("✅ [EC CONFIG] Configuración actualizada desde Supabase y guardada en NVS");
-            Serial.println("   📌 ESP32 usará estos valores de NVS (no directamente de Supabase)");
             Serial.println("╚════════════════════════════════════════════════════╝\n");
         } else {
-            Serial.println("⚠️ [EC CONFIG] Config recebida mas inválida");
+            Serial.println("ℹ️ [EC CONFIG] Poll OK — Auto EC desativado no Supabase (RPC vazio)");
+            hydroControl.setAutoECEnabled(false);
+            hydroControl.cancelCurrentDosage();
+            syncEcOperationStateToSupabase();
+            lastAppliedEcConfig.auto_enabled = false;
+            lastAppliedEcConfig.initialized = true;
+            Serial.println("   ↳ Auto EC local desativado + ciclo cancelado + idle publicado");
             Serial.println("╚════════════════════════════════════════════════════╝\n");
         }
     } else {
@@ -674,39 +808,28 @@ void HydroSystemCore::checkECConfigFromSupabase() {
     }
 }
 
-void HydroSystemCore::processRelayCommand(const RelayCommand& cmd, bool isSlave) {
-    Serial.println("\n🎛️ ========================================");
-    Serial.println("🎛️ PROCESSANDO COMANDO DE RELÉ");
-    Serial.println("🎛️ ========================================");
-    Serial.printf("🆔 ID: %d\n", cmd.id);
-    Serial.printf("📡 Tipo: %s\n", isSlave ? "SLAVE" : "MASTER");
-    Serial.printf("🔌 Relé: %d\n", cmd.relayNumber);
-    Serial.printf("⚡ Ação: %s\n", cmd.action.c_str());
-    Serial.printf("🎯 Tipo: %s\n", cmd.command_type.length() > 0 ? cmd.command_type.c_str() : "manual");
-    Serial.printf("📊 Priority: %d\n", cmd.priority);
-    if (cmd.durationSeconds > 0) {
-        Serial.printf("⏱️ Duração: %d segundos\n", cmd.durationSeconds);
-    }
-    Serial.printf("📡 Target: %s\n", cmd.target_device_id.isEmpty() ? "LOCAL" : cmd.target_device_id.c_str());
-    if (cmd.command_type == "rule" && cmd.rule_id.length() > 0) {
-        Serial.printf("📋 Regra: %s (%s)\n", cmd.rule_name.c_str(), cmd.rule_id.c_str());
-    }
-    Serial.println("========================================\n");
-    
-    // ✅ PASSO 1: Marcar como "sent" ANTES de executar
-    if (supabaseConnected) {
+void HydroSystemCore::processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via) {
+    printRelayCommandSerialLine(cmd, isSlave, via);
+
+    const bool fromMqtt = (via != nullptr && strcmp(via, "mqtt") == 0);
+
+    // HTTPS poll: marcar sent antes (RPC já fez lock). MQTT: executar primeiro, ack depois.
+    if (!fromMqtt && supabaseConnected) {
         supabase.markCommandSent(cmd.id, isSlave);
     }
-    
-    // ✅ FORK: Processar diferente por tipo de comando
+
     String commandType = cmd.command_type.length() > 0 ? cmd.command_type : "manual";
-    
+
     if (commandType == "rule") {
         processRuleCommand(cmd, isSlave);
     } else if (commandType == "peristaltic") {
         processPeristalticCommand(cmd, isSlave);
     } else {
         processManualCommand(cmd, isSlave);
+    }
+
+    if (fromMqtt && supabaseConnected) {
+        supabase.markCommandSent(cmd.id, isSlave);
     }
 }
 
@@ -882,9 +1005,41 @@ void HydroSystemCore::executeLocalRelayCommand(const RelayCommand& cmd) {
     }
 }
 
+void HydroSystemCore::publishMqttTelemetry() {
+#if ENABLE_MQTT
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    MqttTelemetryReading reading;
+    reading.temperature = hydroControl.getTemperature();
+    reading.ph = hydroControl.getpH();
+    reading.tds = hydroControl.getTDS();
+    reading.waterLevelOk = hydroControl.isWaterLevelOk();
+    reading.airTemperature = hydroControl.getTemperature();
+    reading.humidity = 65.0f; // Simulado — alinhado com sendSensorDataToSupabase()
+    printTelemetrySerialLine(reading);
+    mqttClient.publishTelemetry(reading);
+#endif
+}
+
+void HydroSystemCore::publishMqttHeartbeat() {
+#if ENABLE_MQTT
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    MqttHeartbeatReading hb;
+    hb.wifiRssi = WiFi.RSSI();
+    hb.freeHeap = ESP.getFreeHeap();
+    hb.uptimeSeconds = millis() / 1000UL;
+    hb.rebootCount = getRebootCount();
+    hb.firmwareVersion = FIRMWARE_VERSION;
+    hb.ipAddress = WiFi.localIP().toString();
+    mqttClient.publishHeartbeat(hb);
+#endif
+}
+
 void HydroSystemCore::sendSensorDataToSupabase() {
-    // ✅ DEBUG: Verificar condições
-    Serial.println("🔍 [SENSORES] Tentando enviar dados...");
+    Serial.println("🔍 [SENSORES] Tentando enviar dados (HTTPS)...");
     Serial.printf("   supabaseConnected: %s\n", supabaseConnected ? "SIM" : "NÃO");
     Serial.printf("   hasEnoughMemory: %s\n", hasEnoughMemoryForHTTPS() ? "SIM" : "NÃO");
     Serial.printf("   supabase.isReady(): %s\n", supabase.isReady() ? "SIM" : "NÃO");
@@ -918,10 +1073,10 @@ void HydroSystemCore::sendSensorDataToSupabase() {
     hydroData.waterLevelOk = hydroControl.isWaterLevelOk();
     hydroData.timestamp = millis();
     
-    // ✅ DEBUG: Mostrar valores antes de enviar (TDS/EC será 0.0 si buffer no está listo)
-    Serial.printf("📊 [SENSORES] Valores: Temp=%.2f°C, pH=%.2f, TDS=%.2f ppm (EC: %.2f uS/cm)\n", 
-        hydroData.temperature, hydroData.ph, hydroData.tds, hydroControl.getEC());
-    
+    // ✅ DEBUG: Mostrar valores antes de enviar
+    Serial.printf("📊 [SENSORES] Valores: Temp=%.2f°C, pH=%.2f, TDS=%.2f ppm\n", 
+        hydroData.temperature, hydroData.ph, hydroData.tds);
+
     // Enviar dados
     bool envSuccess = supabase.sendEnvironmentData(envData);
     bool hydroSuccess = supabase.sendHydroData(hydroData);
@@ -963,10 +1118,17 @@ void HydroSystemCore::sendDeviceStatusToSupabase() {
         status.relayStates[i] = relayStates[i];
     }
     
-    // ✅ Atualizar device_status (mantido para compatibilidade)
+#if ENABLE_MQTT && MQTT_HEALTH_ONLY
+    if (!mqttClient.isConnected()) {
+        if (supabase.updateDeviceStatus(status)) {
+            Serial.println("📤 Status do dispositivo (HTTPS fallback — MQTT offline)");
+        }
+    }
+#else
     if (supabase.updateDeviceStatus(status)) {
         Serial.println("📤 Status do dispositivo atualizado no Supabase");
     }
+#endif
     
     // ✅ NOVO: Atualizar relay_master (arrays segregados)
     // Preparar arrays de timers e remaining_times
@@ -983,7 +1145,89 @@ void HydroSystemCore::sendDeviceStatusToSupabase() {
     // ✅ Depois POST para Supabase (fonte de verdade remota)
     if (supabase.updateRelayMaster(getDeviceID(), relayStates, nullptr, nullptr, nullptr)) {
         Serial.println("✅ Estados dos relés master atualizados em relay_master");
+        if (!mqttClient.isConnected()) {
+            syncEcOperationStateToSupabase();
+        }
     }
+}
+
+void HydroSystemCore::onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData) {
+    if (userData && event) {
+        static_cast<HydroSystemCore*>(userData)->handleNutrientDoseEvent(event);
+    }
+}
+
+void HydroSystemCore::onEcOperationSyncStatic(void* userData) {
+    if (userData) {
+        static_cast<HydroSystemCore*>(userData)->syncEcOperationStateToSupabase();
+    }
+}
+
+void HydroSystemCore::handleNutrientDoseEvent(const NutrientDoseEvent* event) {
+    if (!event) {
+        return;
+    }
+
+    bool doseExported = false;
+    if (mqttClient.isConnected()) {
+        MqttDoseReading dose = {};
+        dose.sequenceId = event->sequenceId;
+        dose.nutrientName = event->nutrientName;
+        dose.relayNumber = event->relayNumber;
+        dose.dosageMl = event->dosageMl;
+        dose.dosageTimeSeconds = event->dosageTimeSeconds;
+        dose.ecBefore = event->ecBefore;
+        dose.ecSetpoint = event->ecSetpoint;
+        dose.source = event->source ? event->source : "auto_ec";
+        doseExported = mqttClient.publishDose(dose);
+    }
+
+    if (!doseExported) {
+        if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
+            return;
+        }
+        Serial.println("💾 [DOSAGEM] INSERT nutrient_dosages (HTTPS fallback)");
+        supabase.insertNutrientDosage(
+            getDeviceID(),
+            String(event->sequenceId),
+            String(event->nutrientName),
+            event->relayNumber,
+            event->dosageMl,
+            event->dosageTimeSeconds,
+            event->ecBefore,
+            event->ecSetpoint,
+            String(event->source)
+        );
+    }
+
+    syncEcOperationStateToSupabase();
+}
+
+void HydroSystemCore::syncEcOperationStateToSupabase() {
+    const char* stateName = hydroControl.getEcOperationStateName();
+    const int remainingSec = hydroControl.getEcOperationRemainingSec();
+    const int nextCheckSec = hydroControl.getEcNextCheckInSec();
+
+    if (mqttClient.isConnected()) {
+        MqttEcOperationReading reading = {};
+        reading.state = stateName;
+        reading.operationRemainingSec = remainingSec;
+        reading.nextCheckInSec = nextCheckSec;
+        if (mqttClient.publishEcOperation(reading)) {
+            return;
+        }
+        Serial.println("⚠️ [EC OP] MQTT publish falhou — fallback HTTPS");
+    }
+
+    if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
+        return;
+    }
+    supabase.updateEcOperationState(
+        getDeviceID(),
+        String(stateName),
+        remainingSec,
+        nextCheckSec
+    );
 }
 
 // ===== ✅ NOVO: SINCRONIZAÇÃO UNIFICADA DE TODOS OS RELAY STATES =====
@@ -1006,6 +1250,9 @@ void HydroSystemCore::syncAllRelayStatesToSupabase() {
     // ✅ POST para Supabase (relay_master)
     if (supabase.updateRelayMaster(getDeviceID(), masterRelayStates, nullptr, nullptr, nullptr)) {
         Serial.println("✅ [SYNC] Master relays atualizados em relay_master");
+        if (!mqttClient.isConnected()) {
+            syncEcOperationStateToSupabase();
+        }
     } else {
         Serial.println("❌ [SYNC] Erro ao atualizar master relays");
     }
@@ -1339,7 +1586,11 @@ void HydroSystemCore::tryRegisterEndpoints() {
     
     Serial.println("✅ Sistema configurado com sucesso!");
     Serial.println("   ✓ Supabase: device_status (escrita cada 60s)");
-    Serial.println("   ✓ Supabase: hydro_measurements + environment_data (escrita cada 30s)");
+#if ENABLE_MQTT && MQTT_HYDRO_ONLY
+    Serial.println("   ✓ Sensores: MQTT (hydro + ambiente) + HTTPS fallback se broker cair");
+#else
+    Serial.println("   ✓ Sensores: bivalente MQTT 30s + HTTPS hydro/environment 30s");
+#endif
     Serial.println("   ✓ Supabase: relay_states (escrita quando muda estado)");
     Serial.println("   ✓ Supabase: relay_commands (leitura cada 30s)");
     Serial.println("   ✓ Endpoints HTTP desabilitados - usando apenas Supabase");
@@ -1654,6 +1905,38 @@ void HydroSystemCore::updateRelaySlaveState(const String& slaveDeviceId,
     } else {
         Serial.println("❌ [SLAVE] Falha ao atualizar relay_slaves");
     }
+}
+
+unsigned long HydroSystemCore::resolveCommandPollIntervalMs() const {
+#if ENABLE_MQTT
+    if (mqttClient.isConnected()) {
+        return COMMAND_POLL_INTERVAL_MQTT_OK_MS;
+    }
+    return COMMAND_POLL_INTERVAL_MQTT_DOWN_MS;
+#else
+    return COMMAND_POLL_INTERVAL_MQTT_DOWN_MS;
+#endif
+}
+
+void HydroSystemCore::mqttCommandReceived(const char* payload, size_t length, void* userData) {
+    if (!userData) {
+        return;
+    }
+    static_cast<HydroSystemCore*>(userData)->handleMqttCommandPayload(payload, length);
+}
+
+void HydroSystemCore::handleMqttCommandPayload(const char* payload, size_t length) {
+    RelayCommand cmd;
+    bool isSlave = false;
+    if (!parseMqttRelayCommand(payload, length, cmd, isSlave)) {
+        return;
+    }
+    if (mqttCommandDedup.alreadyProcessed(cmd.id)) {
+        Serial.printf("[MQTT CMD] dup id=%d ignorado\n", cmd.id);
+        return;
+    }
+    mqttCommandDedup.markProcessed(cmd.id);
+    processRelayCommand(cmd, isSlave, "mqtt");
 }
 
 // ===== FIM DA IMPLEMENTAÇÃO ===== 

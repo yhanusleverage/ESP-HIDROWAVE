@@ -14,6 +14,8 @@ SupabaseClient::SupabaseClient() :
     secureClient(nullptr),
     isConnected(false),
     lastCommandCheck(0),
+    commandPollIntervalMs(COMMAND_POLL_INTERVAL_MS),
+    commandPollQuiet(true),
     requestMutex(nullptr),        // ✅ NOVO: Mutex inicializado como nullptr
     commandCheckMutex(nullptr) {   // ✅ NOVO: Mutex inicializado como nullptr
 }
@@ -396,14 +398,22 @@ bool SupabaseClient::sendEnvironmentData(const EnvironmentReading& reading) {
     // ✅ VALIDAÇÃO ANTES DE ENVIAR: Verificar valores válidos
     // Verificar NaN e infinito
     if (std::isnan(reading.temperature) || std::isinf(reading.temperature) ||
-        reading.temperature < MIN_TEMP || reading.temperature > MAX_TEMP ||
-        reading.temperature > 1000.0) {  // Valor máximo razoável
-        Serial.printf("❌ Temperatura inválida para Supabase: %.2f (ignorando envio)\n", reading.temperature);
+        reading.temperature > 1000.0) {
+        Serial.printf("❌ [ENV] Temperatura inválida (NaN/Inf): %.2f (ignorando envio)\n", reading.temperature);
         return false;
     }
-    if (std::isnan(reading.humidity) || std::isinf(reading.humidity) ||
-        reading.humidity < MIN_HUMIDITY || reading.humidity > MAX_HUMIDITY) {
-        Serial.printf("❌ Umidade inválida para Supabase: %.2f (ignorando envio)\n", reading.humidity);
+    if (reading.temperature < MIN_TEMP || reading.temperature > MAX_TEMP) {
+        Serial.printf("❌ [ENV] Temperatura fora do intervalo: %.2f (restrição [%.1f, %.1f] — environment_data_temperature_check)\n",
+            reading.temperature, MIN_TEMP, MAX_TEMP);
+        return false;
+    }
+    if (std::isnan(reading.humidity) || std::isinf(reading.humidity)) {
+        Serial.printf("❌ [ENV] Umidade inválida (NaN/Inf): %.2f (ignorando envio)\n", reading.humidity);
+        return false;
+    }
+    if (reading.humidity < MIN_HUMIDITY || reading.humidity > MAX_HUMIDITY) {
+        Serial.printf("❌ [ENV] Umidade fora do intervalo: %.2f (restrição [%.1f, %.1f] — environment_data_humidity_check)\n",
+            reading.humidity, MIN_HUMIDITY, MAX_HUMIDITY);
         return false;
     }
     
@@ -618,7 +628,8 @@ String SupabaseClient::buildDeviceStatusPayload(const DeviceStatusData& status) 
     doc["firmware_version"] = status.firmwareVersion;
     doc["ip_address"] = status.ipAddress;
     doc["updated_at"] = "now()";
-    doc["reboot_count"] = status.rebootCount;  // ✅ TÓPICO 4: Incluir contador de reinícios
+    // Sempre enviar — NVS é fonte; dashboard sincroniza (inclui 0 após portal)
+    doc["reboot_count"] = status.rebootCount;
     
     // ✅ CORRIGIDO: NÃO enviar relay_states aqui
     // relay_states foi removido de device_status (migrado para relay_master e relay_slaves)
@@ -651,7 +662,7 @@ bool SupabaseClient::checkForCommands(RelayCommand* commands, int maxCommands, i
     
     // Verificar apenas a cada COMMAND_POLL_INTERVAL_MS
     unsigned long now = millis();
-    if (now - lastCommandCheck < COMMAND_POLL_INTERVAL_MS) {
+    if (now - lastCommandCheck < commandPollIntervalMs) {
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);  // ✅ Liberar mutex
         }
@@ -1014,7 +1025,7 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
     
     // Verificar apenas a cada COMMAND_POLL_INTERVAL_MS
     unsigned long now = millis();
-    if (now - lastCommandCheck < COMMAND_POLL_INTERVAL_MS) {
+    if (now - lastCommandCheck < commandPollIntervalMs) {
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);
         }
@@ -1035,8 +1046,10 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
     String payload;
     serializeJson(payloadDoc, payload);
     
-    Serial.printf("🔍 [RPC MASTER] Verificando comandos: %s\n", (baseUrl + "/rest/v1/" + endpoint).c_str());
-    Serial.printf("📦 [RPC MASTER] Payload: %s\n", payload.c_str());
+    if (!commandPollQuiet) {
+        Serial.printf("🔍 [RPC MASTER] Verificando comandos: %s\n", (baseUrl + "/rest/v1/" + endpoint).c_str());
+        Serial.printf("📦 [RPC MASTER] Payload: %s\n", payload.c_str());
+    }
     
     // ✅ Usar Object Pool se disponível
     ObjectPoolManager* poolMgr = ObjectPoolManager::getInstance();
@@ -1242,7 +1255,7 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
         Serial.printf("🔍 [RPC MASTER] Device ID: %s\n", getDeviceID().c_str());
         
         httpClient->end();
-        networkWatchdog.endOperation(false);
+        networkWatchdog.endOperation(false, httpCode);
         // ✅ Delay para liberação de memória SSL (saúde operacional)
         vTaskDelay(pdMS_TO_TICKS(200));
         if (usingPool && poolMgr) {
@@ -1349,7 +1362,10 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
     
     // ✅ Se array vazio, não é erro - apenas não há comandos pendentes
     if (commandCount == 0) {
-        Serial.println("ℹ️ [RPC MASTER] Nenhum comando pendente (array vazio [])");
+        if (!commandPollQuiet) {
+            Serial.println("ℹ️ [RPC MASTER] Nenhum comando pendente (array vazio [])");
+        }
+        networkWatchdog.endOperation(true);
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);
         }
@@ -1441,6 +1457,8 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
     if (commandCount > 0) {
         Serial.printf("📥 [RPC MASTER] Recebidos %d comandos (status: processing)\n", commandCount);
     }
+
+    networkWatchdog.endOperation(true);
     
     if (commandCheckMutex != nullptr) {
         xSemaphoreGive(commandCheckMutex);
@@ -1466,7 +1484,7 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
     
     // Verificar apenas a cada COMMAND_POLL_INTERVAL_MS
     unsigned long now = millis();
-    if (now - lastCommandCheck < COMMAND_POLL_INTERVAL_MS) {
+    if (now - lastCommandCheck < commandPollIntervalMs) {
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);
         }
@@ -1700,7 +1718,7 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
         Serial.printf("🔍 [RPC SLAVE] Device ID: %s\n", getDeviceID().c_str());
         
         httpClient->end();
-        networkWatchdog.endOperation(false);
+        networkWatchdog.endOperation(false, httpCode);
         // ✅ Delay para liberação de memória SSL (saúde operacional)
         vTaskDelay(pdMS_TO_TICKS(200));
         if (usingPool && poolMgr) {
@@ -2054,7 +2072,8 @@ bool SupabaseClient::testConnection() {
     }
     
     HTTPClient testHttp;
-    String testUrl = baseUrl + "/rest/v1/";
+    // GET /rest/v1/ devolve 401 mesmo com anon válida; testar tabela real
+    String testUrl = baseUrl + "/rest/v1/" + String(SUPABASE_STATUS_TABLE) + "?select=device_id&limit=1";
     Serial.printf("🌐 Testando URL: %s\n", testUrl.c_str());
     
     testHttp.begin(*sslClient, testUrl);
@@ -2063,6 +2082,7 @@ bool SupabaseClient::testConnection() {
     testHttp.setUserAgent("ESP32-Hydro/2.1.0");
     
     testHttp.addHeader("apikey", apiKey);
+    testHttp.addHeader("Authorization", buildAuthHeader());
     testHttp.addHeader("Accept", "application/json");
     
     int httpCode = testHttp.GET();
@@ -2138,10 +2158,23 @@ bool SupabaseClient::autoRegisterDevice(const String& deviceName, const String& 
     // ✅ Se tem email, usar função register_device_with_email (melhor método)
     if (userEmail.length() > 0) {
         Serial.println("📧 Email encontrado em Preferences, usando register_device_with_email...");
-        // Usar DeviceRegistration para registrar com email
         extern bool registerDeviceWithEmail(const String& userEmail, const String& deviceName, const String& location);
-        String finalDeviceName = deviceName.isEmpty() ? "ESP32 Hidropônico" : deviceName;
-        String finalLocation = location.isEmpty() ? "Sistema Principal" : location;
+
+        String savedDeviceName = "";
+        String savedLocation = "";
+        if (preferences.begin("hydro_system", true)) {
+            savedDeviceName = preferences.getString("device_name", "");
+            savedLocation = preferences.getString("location", "");
+            preferences.end();
+        }
+        String finalDeviceName = savedDeviceName.length() > 0
+            ? savedDeviceName
+            : (deviceName.isEmpty() ? String("ESP32 Hidropônico") : deviceName);
+        String finalLocation = savedLocation.length() > 0
+            ? savedLocation
+            : (location.isEmpty() ? String("Estufa") : location);
+        Serial.println("🏷️ Nome usado no registro: " + finalDeviceName);
+        Serial.println("📍 Localização usada no registro: " + finalLocation);
         
         if (registerDeviceWithEmail(userEmail, finalDeviceName, finalLocation)) {
             Serial.println("✅ Dispositivo registrado com email via register_device_with_email");
@@ -3356,7 +3389,7 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
         httpClient->end();
         // ✅ Delay para liberação de memória SSL (saúde operacional)
         vTaskDelay(pdMS_TO_TICKS(200));
-        networkWatchdog.endOperation(false);
+        networkWatchdog.endOperation(false, httpCode);
         setError("HTTP Code: " + String(httpCode));
         if (usingPool && poolMgr) {
             poolMgr->releaseHTTPClient(httpClient);
@@ -3438,13 +3471,13 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     
     if (configArray.size() == 0) {
         Serial.println("ℹ️ [RPC EC_CONFIG] Nenhuma config encontrada (array vazio [])");
-        Serial.println("   💡 Execute 'Salvar Parâmetros' no frontend primeiro");
-        networkWatchdog.endOperation(false);
-        setError("Nenhuma config encontrada");
+        Serial.println("   💡 Auto EC desativado no Supabase ou execute 'Salvar Parâmetros' primeiro");
+        config.isValid = false;
+        networkWatchdog.endOperation(true);
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);
         }
-        return false;
+        return true;
     }
     
     // ✅ Extrair config do primeiro elemento
@@ -3457,7 +3490,7 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     config.kp = configObj["kp"] | 1.0;
     config.ec_setpoint = configObj["ec_setpoint"] | 0.0;
     config.auto_enabled = configObj["auto_enabled"] | false;
-    config.intervalo_auto_ec = configObj["intervalo_auto_ec"] | 5;  // ✅ Por defecto: 5 segundos
+    config.intervalo_auto_ec = configObj["intervalo_auto_ec"] | 300;
     config.tempo_recirculacao = configObj["tempo_recirculacao"] | 60;
     
     // ✅ Nutrients array (não salvo em NVS, mas usado para cálculo local)
@@ -3527,4 +3560,77 @@ void SupabaseClient::cleanupMutexes() {
         commandCheckMutex = nullptr;
         Serial.println("✅ [SUPABASE] commandCheckMutex eliminado");
     }
+}
+
+bool SupabaseClient::insertNutrientDosage(const String& deviceId, const String& sequenceId,
+                                          const String& nutrientName, int relayNumber,
+                                          float dosageMl, float dosageTimeSeconds,
+                                          float ecBefore, float ecSetpoint,
+                                          const String& source) {
+    if (!isReady()) {
+        setError("Supabase não está pronto para insertNutrientDosage");
+        return false;
+    }
+
+    DynamicJsonDocument doc(512);
+    doc["device_id"] = deviceId;
+    doc["sequence_id"] = sequenceId;
+    doc["nutrient_name"] = nutrientName;
+    doc["relay_number"] = relayNumber;
+    doc["dosage_ml"] = round(dosageMl * 1000.0) / 1000.0;
+    doc["dosage_time_seconds"] = round(dosageTimeSeconds * 100.0) / 100.0;
+    doc["ec_before"] = round(ecBefore * 100.0) / 100.0;
+    doc["ec_setpoint"] = round(ecSetpoint * 100.0) / 100.0;
+    doc["source"] = source.length() > 0 ? source : "auto_ec";
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Serial.printf("💾 [DOSAGEM] INSERT nutrient_dosages: %s %.2f ml relé %d\n",
+        nutrientName.c_str(), dosageMl, relayNumber + 1);
+
+    return insert("nutrient_dosages", payload);
+}
+
+bool SupabaseClient::updateEcOperationState(const String& deviceId, const String& state,
+                                            int operationRemainingSec, int nextCheckInSec) {
+    if (!isReady()) {
+        return false;
+    }
+
+    if (requestMutex != nullptr) {
+        if (xSemaphoreTake(requestMutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            return false;
+        }
+    }
+
+    DynamicJsonDocument doc(256);
+    doc["ec_operation_state"] = state;
+    doc["ec_operation_remaining_sec"] = operationRemainingSec > 0 ? operationRemainingSec : 0;
+    doc["ec_next_check_in_sec"] = nextCheckInSec > 0 ? nextCheckInSec : 0;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String patchUrl = baseUrl + "/rest/v1/relay_master?device_id=eq." + deviceId;
+    bool ok = false;
+
+    if (secureClient != nullptr && http.begin(*secureClient, patchUrl)) {
+        http.addHeader("apikey", apiKey);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Prefer", "return=minimal");
+        http.setTimeout(8000);
+        int code = http.PATCH(payload);
+        ok = (code >= 200 && code < 300);
+        if (!ok) {
+            Serial.printf("⚠️ [EC OP] PATCH relay_master ec_operation falhou HTTP %d\n", code);
+        }
+        http.end();
+    }
+
+    if (requestMutex != nullptr) {
+        xSemaphoreGive(requestMutex);
+    }
+    return ok;
 } 

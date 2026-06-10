@@ -156,7 +156,7 @@ public:
      * @brief Finaliza el monitoreo de la operación
      * @param success true si la operación fue exitosa
      */
-    void endOperation(bool success = true) {
+    void endOperation(bool success = true, int httpCode = 0) {
         if (!operationActive) {
             return;
         }
@@ -182,6 +182,14 @@ public:
             consecutiveFailures = 0;
             lastSuccessfulOperation = now;
         } else {
+            // 404/401/400 = schema/auth — não é falha de rede; evita reboot em loop
+            const bool schemaOrClientError = (httpCode == 404 || httpCode == 401 || httpCode == 400);
+            if (schemaOrClientError) {
+                Serial.printf("⚠️ [NETWORK_WDT] HTTP %d (config/schema) — não conta para reboot\n", httpCode);
+                esp_task_wdt_reset();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                return;
+            }
             // Operação falhou - incrementar contador
             consecutiveFailures++;
             Serial.printf("⚠️ [NETWORK_WDT] Fallo #%d consecutivo\n", consecutiveFailures);

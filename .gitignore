@@ -10,6 +10,9 @@ Thumbs.db
 .pioenvs/
 .piolibdeps/
 
+# Credenciais Supabase (não commitar)
+secrets.ini
+
 # Ignorar arquivos de backup
 *.bak
 *.tmp

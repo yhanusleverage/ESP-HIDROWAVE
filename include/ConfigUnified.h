@@ -118,9 +118,13 @@
 
 // ===== CONFIGURAÇÕES SUPABASE (OPCIONAL) =====
 #ifdef ENABLE_SUPABASE
-    #define SUPABASE_URL "https://mbrwdpqndasborhosewl.supabase.co"
-    #define SUPABASE_ANON_KEY "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1icndkcHFuZGFzYm9yaG9zZXdsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDgxNDI3MzEsImV4cCI6MjA2MzcxODczMX0.ouRWHqrXv0Umk8SfbyGJoc-TA2vPaGDoC_OS-auj1-A"
-    
+    #ifndef SUPABASE_URL
+    #error "SUPABASE_URL não definido. Copie secrets.ini.example para secrets.ini."
+    #endif
+    #ifndef SUPABASE_ANON_KEY
+    #error "SUPABASE_ANON_KEY não definido. Copie secrets.ini.example para secrets.ini."
+    #endif
+
     // Tabelas do banco de dados
     #define SUPABASE_ENVIRONMENT_TABLE "environment_data"
     #define SUPABASE_HYDRO_TABLE "hydro_measurements"

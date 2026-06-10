@@ -241,11 +241,12 @@ void HydroStateManager::switchToWiFiConfig() {
     });
     
     // ✅ NOVO: Configurar callback para registro com email
-    wifiServer->onEmailRegistered([this](String userEmail) {
+    wifiServer->onEmailRegistered([this](String userEmail, String deviceName, String location) {
         Serial.println("📧 Email recebido para registro: " + userEmail);
+        Serial.println("🏷️ Nome do dispositivo (portal): " + deviceName);
+        Serial.println("📍 Localização (portal): " + location);
         
-        // Registrar dispositivo no Supabase com email
-        if (registerDeviceWithEmail(userEmail, "ESP32 Hidropônico", "Estufa")) {
+        if (registerDeviceWithEmail(userEmail, deviceName, location)) {
             Serial.println("🎉 Dispositivo registrado com sucesso no Supabase!");
         } else {
             Serial.println("❌ Erro ao registrar dispositivo no Supabase");
@@ -278,12 +279,6 @@ void HydroStateManager::switchToHydroActive() {
     // ✅ CORREÇÃO: Usar injeção de dependências em vez de extern (anti-patrón)
     // Criar e inicializar sistema hidropônico com injeção de dependências
     #ifdef MASTER_MODE
-        Serial.printf("🔍 [switchToHydroActive] masterManager: %s\n", masterManager ? "✅ Disponível" : "❌ nullptr");
-        if (!masterManager) {
-            Serial.println("⚠️ [switchToHydroActive] AVISO: masterManager é nullptr!");
-            Serial.println("   Chame setMasterManager() antes de begin()");
-            Serial.println("   Isso pode causar problemas com /api/slaves");
-        }
         hydroCore = new HydroSystemCore(webServerTask, espNowController, masterManager);
     #else
         hydroCore = new HydroSystemCore(webServerTask, espNowController, nullptr);
