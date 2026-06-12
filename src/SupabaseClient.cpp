@@ -3151,7 +3151,8 @@ bool SupabaseClient::initMutexes() {
     return true;
 }
 
-// ✅ NOVO: Buscar EC Config do Supabase via RPC activate_auto_ec
+// ✅ Buscar EC Config read-only (GET ec_config_view) — NÃO usar activate_auto_ec no poll
+// activate_auto_ec força auto_enabled=true; reservado ao botão "Ativar Auto EC" no frontend
 bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     // Inicializar config como inválida
     config.isValid = false;
@@ -3171,19 +3172,11 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
         }
     }
     
-    // ✅ RPC activate_auto_ec
-    String endpoint = "rpc/activate_auto_ec";
+    String deviceId = getDeviceID();
+    String endpoint = "ec_config_view?device_id=eq." + deviceId + "&select=*";
     
-    // ✅ Construir payload JSON para POST
-    DynamicJsonDocument payloadDoc(256);
-    payloadDoc["p_device_id"] = getDeviceID();
-    
-    String payload;
-    serializeJson(payloadDoc, payload);
-    
-    Serial.printf("🔍 [RPC EC_CONFIG] Verificando config: %s\n", (baseUrl + "/rest/v1/" + endpoint).c_str());
-    Serial.printf("📦 [RPC EC_CONFIG] Payload: %s\n", payload.c_str());
-    Serial.printf("🔍 [RPC EC_CONFIG] Device ID: %s\n", getDeviceID().c_str());
+    Serial.printf("🔍 [EC_CONFIG] GET ec_config_view: %s\n", (baseUrl + "/rest/v1/" + endpoint).c_str());
+    Serial.printf("🔍 [EC_CONFIG] Device ID: %s\n", deviceId.c_str());
     
     // ✅ Usar Object Pool se disponível
     ObjectPoolManager* poolMgr = ObjectPoolManager::getInstance();
@@ -3331,12 +3324,9 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     httpClient->addHeader("Authorization", buildAuthHeader());
     httpClient->addHeader("apikey", apiKey);
     httpClient->addHeader("Accept", "application/json");
-    httpClient->addHeader("Content-Type", "application/json");
-    httpClient->addHeader("Prefer", "return=representation");
-    
-    // ✅ Fazer POST request
-    Serial.println("📡 [RPC EC_CONFIG] Enviando requisição POST...");
-    int httpCode = httpClient->POST(payload);
+    // ✅ GET read-only — respeita auto_enabled=false salvo pelo frontend
+    Serial.println("📡 [EC_CONFIG] Enviando requisição GET...");
+    int httpCode = httpClient->GET();
     
     // ✅ Verificar watchdog después de operación HTTP bloqueante
     if (!networkWatchdog.feed()) {
@@ -3470,8 +3460,8 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     Serial.printf("📊 [RPC EC_CONFIG] Array recebido: %d elemento(s)\n", configArray.size());
     
     if (configArray.size() == 0) {
-        Serial.println("ℹ️ [RPC EC_CONFIG] Nenhuma config encontrada (array vazio [])");
-        Serial.println("   💡 Auto EC desativado no Supabase ou execute 'Salvar Parâmetros' primeiro");
+        Serial.println("ℹ️ [EC_CONFIG] Nenhuma config encontrada (array vazio [])");
+        Serial.println("   💡 Execute 'Salvar Parâmetros' no frontend primeiro");
         config.isValid = false;
         networkWatchdog.endOperation(true);
         if (commandCheckMutex != nullptr) {
@@ -3489,6 +3479,7 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     config.total_ml = configObj["total_ml"] | 0.0;
     config.kp = configObj["kp"] | 1.0;
     config.ec_setpoint = configObj["ec_setpoint"] | 0.0;
+    config.tolerance = configObj["tolerance"] | 50.0;
     config.auto_enabled = configObj["auto_enabled"] | false;
     config.intervalo_auto_ec = configObj["intervalo_auto_ec"] | 300;
     config.tempo_recirculacao = configObj["tempo_recirculacao"] | 60;
@@ -3512,6 +3503,7 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     Serial.printf("   • total_ml:         %.2f ml/L\n", config.total_ml);
     Serial.printf("   • kp:               %.2f\n", config.kp);
     Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", config.ec_setpoint);
+    Serial.printf("   • tolerance:        %.0f µS/cm\n", config.tolerance);
     Serial.printf("   • auto_enabled:     %s\n", config.auto_enabled ? "true" : "false");
     Serial.printf("   • intervalo_auto_ec: %d segundos\n", config.intervalo_auto_ec);
     Serial.printf("   • tempo_recirculacao: %lu segundos\n", config.tempo_recirculacao);
@@ -3633,4 +3625,97 @@ bool SupabaseClient::updateEcOperationState(const String& deviceId, const String
         xSemaphoreGive(requestMutex);
     }
     return ok;
-} 
+}
+
+bool SupabaseClient::updatePhOperationState(const String& deviceId, const String& state,
+                                            int operationRemainingSec, int nextCheckInSec) {
+    if (!isReady()) return false;
+
+    if (requestMutex != nullptr) {
+        if (xSemaphoreTake(requestMutex, pdMS_TO_TICKS(3000)) != pdTRUE) return false;
+    }
+
+    DynamicJsonDocument doc(256);
+    doc["ph_operation_state"] = state;
+    doc["ph_operation_remaining_sec"] = operationRemainingSec > 0 ? operationRemainingSec : 0;
+    doc["ph_next_check_in_sec"] = nextCheckInSec > 0 ? nextCheckInSec : 0;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String patchUrl = baseUrl + "/rest/v1/relay_master?device_id=eq." + deviceId;
+    bool ok = false;
+
+    if (secureClient != nullptr && http.begin(*secureClient, patchUrl)) {
+        http.addHeader("apikey", apiKey);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Prefer", "return=minimal");
+        http.setTimeout(8000);
+        int code = http.PATCH(payload);
+        ok = (code >= 200 && code < 300);
+        if (!ok) {
+            Serial.printf("⚠️ [PH OP] PATCH relay_master ph_operation falhou HTTP %d\n", code);
+        }
+        http.end();
+    }
+
+    if (requestMutex != nullptr) {
+        xSemaphoreGive(requestMutex);
+    }
+    return ok;
+}
+
+bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
+    config.isValid = false;
+    if (!isConnected || !isReady()) return false;
+
+    DynamicJsonDocument payloadDoc(256);
+    payloadDoc["p_device_id"] = getDeviceID();
+    String payload;
+    serializeJson(payloadDoc, payload);
+
+    String fullUrl = baseUrl + "/rest/v1/rpc/activate_auto_ph";
+    bool ok = false;
+    String response;
+
+    if (secureClient != nullptr && http.begin(*secureClient, fullUrl)) {
+        http.addHeader("apikey", apiKey);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Accept", "application/json");
+        http.setTimeout(12000);
+        int code = http.POST(payload);
+        if (code == 200) {
+            response = http.getString();
+            ok = true;
+        } else {
+            Serial.printf("❌ [RPC PH_CONFIG] HTTP %d\n", code);
+        }
+        http.end();
+    }
+
+    if (!ok || response.length() == 0) return false;
+
+    DynamicJsonDocument doc(1024);
+    if (deserializeJson(doc, response)) return false;
+
+    JsonArray arr = doc.as<JsonArray>();
+    if (arr.size() == 0) return true;
+
+    JsonObject o = arr[0];
+    config.ph_setpoint = o["ph_setpoint"] | 6.0;
+    config.ph_tolerance = o["ph_tolerance"] | 0.2;
+    config.flow_rate_ph_up = o["flow_rate_ph_up"] | 1.0;
+    config.flow_rate_ph_down = o["flow_rate_ph_down"] | 1.0;
+    config.volume = o["volume"] | 100.0;
+    config.ml_per_ph_unit = o["ml_per_ph_unit"] | 2.0;
+    config.relay_ph_up = o["relay_ph_up"] | 1;
+    config.relay_ph_down = o["relay_ph_down"] | 0;
+    config.auto_enabled = o["auto_enabled"] | false;
+    config.intervalo_auto_ph = o["intervalo_auto_ph"] | 300;
+    config.tempo_recirculacao = o["tempo_recirculacao"] | 60;
+    config.isValid = true;
+    return true;
+}
+ 

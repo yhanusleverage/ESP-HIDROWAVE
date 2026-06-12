@@ -72,11 +72,27 @@ struct ECConfig {
     double total_ml;
     double kp;
     double ec_setpoint;
+    double tolerance;
     bool auto_enabled;
     int intervalo_auto_ec;
     unsigned long tempo_recirculacao;  // Em segundos
     String nutrientsJson;  // JSON string de nutrientes (não salvo em NVS, usado para cálculo local)
     
+    bool isValid;
+};
+
+struct PHConfig {
+    double ph_setpoint;
+    double ph_tolerance;
+    double flow_rate_ph_up;
+    double flow_rate_ph_down;
+    double volume;
+    double ml_per_ph_unit;
+    int relay_ph_up;
+    int relay_ph_down;
+    bool auto_enabled;
+    int intervalo_auto_ph;
+    unsigned long tempo_recirculacao;
     bool isValid;
 };
 
@@ -155,6 +171,7 @@ public:
     
     // ✅ NOVO: Buscar EC Config do Supabase via RPC activate_auto_ec
     bool getECConfigFromSupabase(ECConfig& config);
+    bool getPHConfigFromSupabase(PHConfig& config);
 
     /** Registra dosagem executada (tabela nutrient_dosages). */
     bool insertNutrientDosage(const String& deviceId, const String& sequenceId,
@@ -165,6 +182,9 @@ public:
 
     /** Publica estado operacional Auto EC em relay_master. */
     bool updateEcOperationState(const String& deviceId, const String& state,
+                                int operationRemainingSec, int nextCheckInSec);
+
+    bool updatePhOperationState(const String& deviceId, const String& state,
                                 int operationRemainingSec, int nextCheckInSec);
     
     // Utilitários

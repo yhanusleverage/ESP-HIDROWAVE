@@ -56,7 +56,34 @@ float ECController::calculateDosageTime(float dosageML) {
 }
 
 bool ECController::needsAdjustment(float ecSetpoint, float ecActual, float tolerance) {
-    float error = abs(ecSetpoint - ecActual);
-    return error > tolerance;
+    float deficit = ecSetpoint - ecActual;
+    return deficit > tolerance;
+}
+
+// ===== PH Controller =====
+
+PHController::PHController() {}
+
+float PHController::calculateDosageMl(float phSetpoint, float phActual, float mlPerPhUnit, float kp) {
+    float error = phSetpoint - phActual;
+    float ml = fabs(error) * mlPerPhUnit * kp;
+    return ml > 0.05f ? ml : 0.0f;
+}
+
+float PHController::calculateDosageTime(float dosageML, float flowRateMlPerSec) {
+    if (flowRateMlPerSec > 0.0f) {
+        return dosageML / flowRateMlPerSec;
+    }
+    return 0.0f;
+}
+
+bool PHController::needsAdjustment(float phSetpoint, float phActual, float tolerance) {
+    return fabs(phSetpoint - phActual) > tolerance;
+}
+
+int PHController::getDirection(float phSetpoint, float phActual, float tolerance) {
+    float error = phSetpoint - phActual;
+    if (fabs(error) <= tolerance) return 0;
+    return error > 0 ? 1 : -1;
 }
 

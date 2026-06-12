@@ -43,5 +43,17 @@ private:
     float calculateK();
 };
 
+/** Controlador proporcional bidirecional para pH (pH+ / pH-). */
+class PHController {
+public:
+    PHController();
+
+    float calculateDosageMl(float phSetpoint, float phActual, float mlPerPhUnit, float kp = 1.0f);
+    float calculateDosageTime(float dosageML, float flowRateMlPerSec);
+    bool needsAdjustment(float phSetpoint, float phActual, float tolerance = 0.2f);
+    /** 1 = subir pH (pH+), -1 = baixar (pH-), 0 = dentro da tolerância */
+    int getDirection(float phSetpoint, float phActual, float tolerance = 0.2f);
+};
+
 #endif
 

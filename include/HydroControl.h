@@ -47,6 +47,7 @@ struct NutrientDoseEvent {
 
 typedef void (*NutrientDoseCallback)(const NutrientDoseEvent* event, void* userData);
 typedef void (*EcOperationSyncCallback)(void* userData);
+typedef void (*PhOperationSyncCallback)(void* userData);
 
 class HydroControl {
 public:
@@ -87,6 +88,8 @@ public:
     const ECController& getECController() const { return ecController; }
     void setECSetpoint(float setpoint, bool saveToNVS = true);  // ✅ saveToNVS: false para evitar guardar múltiples veces
     float getECSetpoint() const { return ecSetpoint; }
+    void setECTolerance(float tolerance, bool saveToNVS = true);
+    float getECTolerance() const { return ecTolerance; }
     void setAutoECEnabled(bool enabled, bool saveToNVS = true);  // ✅ saveToNVS: false para evitar guardar múltiples veces
     bool isAutoECEnabled() const { return autoECEnabled; }
     void setAutoECInterval(int intervalSeconds, bool saveToNVS = true);  // ✅ saveToNVS: false para evitar guardar múltiples veces
@@ -100,6 +103,23 @@ public:
     const char* getEcOperationStateName() const;
     int getEcOperationRemainingSec() const;
     int getEcNextCheckInSec() const;
+
+    // ✅ Auto pH
+    PHController& getPHController() { return phController; }
+    void setPHSetpoint(float setpoint, bool saveToNVS = true);
+    float getPHSetpoint() const { return phSetpoint; }
+    void setPHTolerance(float tolerance) { phTolerance = tolerance; }
+    float getPHTolerance() const { return phTolerance; }
+    void setAutoPHEnabled(bool enabled, bool saveToNVS = true);
+    bool isAutoPHEnabled() const { return autoPHEnabled; }
+    void setAutoPHInterval(int intervalSeconds, bool saveToNVS = true);
+    int getAutoPHInterval() const { return autoPHIntervalSeconds; }
+    void setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown, float mlPerUnit);
+    void setPhRecirculacaoSeconds(unsigned long seconds) { phRecircSeconds = seconds > 0 ? seconds : 60; }
+    void setPhOperationSyncCallback(PhOperationSyncCallback cb, void* userData);
+    const char* getPhOperationStateName() const;
+    int getPhOperationRemainingSec() const;
+    int getPhNextCheckInSec() const;
     
     // ✅ TEMPO MORTO (recirculação)
     void setTempoRecirculacao(unsigned long segundos) { tempoRecirculacao = segundos; }
@@ -161,6 +181,7 @@ private:
     // ✅ Controller KP e controle automático de EC
     ECController ecController;
     float ecSetpoint;
+    float ecTolerance;
     bool autoECEnabled;
     unsigned long lastECCheck;
     static const unsigned long EC_CHECK_INTERVAL = 30000; // 30 segundos
@@ -175,6 +196,27 @@ private:
     void* nutrientDoseCallbackUserData;
     EcOperationSyncCallback ecOperationSyncCallback;
     void* ecOperationSyncCallbackUserData;
+
+    // ✅ Auto pH
+    PHController phController;
+    float phSetpoint;
+    float phTolerance;
+    bool autoPHEnabled;
+    unsigned long lastPHCheck;
+    unsigned long lastPHCheckAtMs;
+    int autoPHIntervalSeconds;
+    int relayPhUp;
+    int relayPhDown;
+    float flowRatePhUp;
+    float flowRatePhDown;
+    float mlPerPhUnit;
+    unsigned long phRecircSeconds;
+    enum PhAutoState { PH_IDLE, PH_DOSING, PH_RECIRCULATING };
+    PhAutoState phAutoState;
+    unsigned long phStateStartMs;
+    int phActiveRelay;
+    PhOperationSyncCallback phOperationSyncCallback;
+    void* phOperationSyncCallbackUserData;
     
     // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
     unsigned long lastDosageCompleteTime;  // Timestamp da última dosagem completa
@@ -212,9 +254,13 @@ private:
     void updateDisplay();
     void checkRelayTimers();
     void checkAutoEC();  // ✅ Verificar e ajustar EC automaticamente
+    void checkAutoPH();  // ✅ Verificar e ajustar pH automaticamente
+    void processPhAutoState();
     void processSimpleSequential();  // ✅ Máquina de estados para dosagem sequencial
     void emitNutrientDoseEvent(const SimpleNutrient& nutrient);
     void notifyEcOperationChanged();
+    void notifyPhOperationChanged();
+    void startPhAutoDosage(int relay, float durationSec);
     int computeEcOperationRemainingSec() const;
     
     // ✅ Persistência em NVS (privadas - carregamento automático)

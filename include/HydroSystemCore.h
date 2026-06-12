@@ -180,6 +180,7 @@ private:
     void checkSupabaseCommands();
     void checkSupabaseRules();  // ✅ NOVO: Verificar regras de automação (decision_rules)
     void checkECConfigFromSupabase();  // ✅ NOVO: Buscar EC config do Supabase via RPC activate_auto_ec
+    void checkPHConfigFromSupabase();  // ✅ Buscar pH config via RPC activate_auto_ph
     void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "https");
     
     static void mqttCommandReceived(const char* payload, size_t length, void* userData);
@@ -203,9 +204,11 @@ private:
     void sendDeviceStatusToSupabase();
     void syncAllRelayStatesToSupabase();  // ✅ NOVO: Sincronização unificada de todos os relay states
     void syncEcOperationStateToSupabase();
+    void syncPhOperationStateToSupabase();
     void handleNutrientDoseEvent(const NutrientDoseEvent* event);
     static void onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData);
     static void onEcOperationSyncStatic(void* userData);
+    static void onPhOperationSyncStatic(void* userData);
     void publishMqttTelemetry();
     void publishMqttHeartbeat();
     void performMemoryProtection();

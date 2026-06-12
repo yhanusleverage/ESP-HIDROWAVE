@@ -22,6 +22,7 @@ HydroControl::HydroControl()
     
     // ✅ Inicializar controle automático de EC
     ecSetpoint = 0.0;
+    ecTolerance = 50.0f;
     autoECEnabled = false;
     lastECCheck = 0;
     lastECCheckAtMs = 0;
@@ -34,6 +35,24 @@ HydroControl::HydroControl()
     nutrientDoseCallbackUserData = nullptr;
     ecOperationSyncCallback = nullptr;
     ecOperationSyncCallbackUserData = nullptr;
+
+    phSetpoint = 6.0f;
+    phTolerance = 0.2f;
+    autoPHEnabled = false;
+    lastPHCheck = 0;
+    lastPHCheckAtMs = 0;
+    autoPHIntervalSeconds = 300;
+    relayPhUp = 1;
+    relayPhDown = 0;
+    flowRatePhUp = 1.0f;
+    flowRatePhDown = 1.0f;
+    mlPerPhUnit = 2.0f;
+    phRecircSeconds = 60;
+    phAutoState = PH_IDLE;
+    phStateStartMs = 0;
+    phActiveRelay = -1;
+    phOperationSyncCallback = nullptr;
+    phOperationSyncCallbackUserData = nullptr;
     
     // ✅ Inicializar sistema sequencial de dosagem
     currentState = IDLE;
@@ -213,7 +232,9 @@ void HydroControl::update() {
     updateSensors();
     updateDisplay();
     checkRelayTimers();
+    processPhAutoState();
     checkAutoEC();  // ✅ Verificar e ajustar EC automaticamente
+    checkAutoPH();  // ✅ Verificar e ajustar pH automaticamente
     processSimpleSequential();  // ✅ Processar máquina de estados sequencial
 }
 
@@ -436,8 +457,8 @@ void HydroControl::checkAutoEC() {
     lastECCheck = currentMillis;
     lastECCheckAtMs = currentMillis;
     
-    // Verificar se precisa de ajuste (tolerância padrão: 50 µS/cm)
-    if (ecController.needsAdjustment(ecSetpoint, ec, 50.0)) {
+    // Verificar se precisa de ajuste (tolerância configurável — default 50 µS/cm)
+    if (ecController.needsAdjustment(ecSetpoint, ec, ecTolerance)) {
         // Calcular dosagem necessária
         float dosageML = ecController.calculateDosage(ecSetpoint, ec);
         
@@ -470,7 +491,7 @@ void HydroControl::checkAutoEC() {
         if (currentMillis - lastNoAdjustLog > 60000) {  // Log a cada 1 minuto
             lastNoAdjustLog = currentMillis;
             float error = abs(ecSetpoint - ec);
-            Serial.printf("✅ Auto EC: Sem ajuste necessário (Erro: %.0f µS/cm, Tolerância: 50 µS/cm)\n", error);
+            Serial.printf("✅ Auto EC: Sem ajuste necessário (Erro: %.0f µS/cm, Tolerância: %.0f µS/cm)\n", error, ecTolerance);
         }
     }
 }
@@ -628,20 +649,36 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
             if (durationMs < 100) durationMs = 100; // Mínimo 100ms
             
             if (nutDosage > 0.001) {
-                nutrients[totalNutrients].name = dynamicProportions[i].name;
-                nutrients[totalNutrients].relay = dynamicProportions[i].relay;
-                nutrients[totalNutrients].dosageML = nutDosage;
-                nutrients[totalNutrients].durationMs = durationMs;
-                
-                Serial.printf("📝 %s: %.3fml (%.1f%%) [%.2f ml/L] → %dms → Relé %d\n", 
-                    dynamicProportions[i].name.c_str(), 
-                    nutDosage, 
-                    proportion * 100,
-                    dynamicProportions[i].mlPerLiter,
-                    durationMs, 
-                    dynamicProportions[i].relay + 1);
-                
-                totalNutrients++;
+                // Unificar mesmo relé na mesma secuencia (evita dosagem duplicada)
+                int existingIdx = -1;
+                for (int j = 0; j < totalNutrients; j++) {
+                    if (nutrients[j].relay == dynamicProportions[i].relay) {
+                        existingIdx = j;
+                        break;
+                    }
+                }
+
+                if (existingIdx >= 0) {
+                    nutrients[existingIdx].dosageML += nutDosage;
+                    nutrients[existingIdx].durationMs += durationMs;
+                    Serial.printf("⚠️  %s: +%.3fml unificado no relé %d (slot duplicado ignorado)\n",
+                        dynamicProportions[i].name.c_str(), nutDosage, dynamicProportions[i].relay + 1);
+                } else {
+                    nutrients[totalNutrients].name = dynamicProportions[i].name;
+                    nutrients[totalNutrients].relay = dynamicProportions[i].relay;
+                    nutrients[totalNutrients].dosageML = nutDosage;
+                    nutrients[totalNutrients].durationMs = durationMs;
+
+                    Serial.printf("📝 %s: %.3fml (%.1f%%) [%.2f ml/L] → %dms → Relé %d\n",
+                        dynamicProportions[i].name.c_str(),
+                        nutDosage,
+                        proportion * 100,
+                        dynamicProportions[i].mlPerLiter,
+                        durationMs,
+                        dynamicProportions[i].relay + 1);
+
+                    totalNutrients++;
+                }
             }
         }
     } else {
@@ -909,6 +946,7 @@ void HydroControl::loadECControllerConfig() {
     float totalMl = 0.0;
     float kp = 1.0;
     float setpoint = 0.0;
+    float tolerance = 50.0f;
     bool autoEnabled = false;
     int intervalSeconds = 30;
     int32_t tempoRecircSec = 60;
@@ -919,6 +957,7 @@ void HydroControl::loadECControllerConfig() {
     PreferencesManager::loadConfigFloat("ec_totalMl", totalMl);
     PreferencesManager::loadConfigFloat("ec_kp", kp);
     PreferencesManager::loadConfigFloat("ec_setpoint", setpoint);
+    PreferencesManager::loadConfigFloat("ec_tolerance", tolerance);
     PreferencesManager::loadConfigInt("ec_autoEnabled", (int32_t&)autoEnabled);
     PreferencesManager::loadConfigInt("ec_interval", (int32_t&)intervalSeconds);
     PreferencesManager::loadConfigInt("ec_tempoRecirc", tempoRecircSec);
@@ -931,6 +970,7 @@ void HydroControl::loadECControllerConfig() {
     Serial.printf("   • total_ml:         %.2f ml/L\n", totalMl);
     Serial.printf("   • kp:               %.2f\n", kp);
     Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", setpoint);
+    Serial.printf("   • tolerance:        %.0f µS/cm\n", tolerance);
     Serial.printf("   • auto_enabled:     %s\n", autoEnabled ? "true" : "false");
     Serial.printf("   • intervalo_auto_ec: %d segundos\n", intervalSeconds);
     Serial.printf("   • tempo_recirculacao: %ld segundos\n", (long)tempoRecircSec);
@@ -942,6 +982,7 @@ void HydroControl::loadECControllerConfig() {
     if (totalMl > 0.0) ecController.setTotalMl(totalMl);
     if (kp > 0.0) ecController.setKp(kp);
     if (setpoint > 0.0) ecSetpoint = setpoint;
+    if (tolerance > 0.0) ecTolerance = tolerance;
     autoECEnabled = autoEnabled;
     if (intervalSeconds > 0) autoECIntervalSeconds = intervalSeconds;
     if (tempoRecircSec > 0) tempoRecirculacaoSeconds = (unsigned long)tempoRecircSec;
@@ -974,6 +1015,7 @@ void HydroControl::saveECControllerConfig() {
     Serial.printf("   • total_ml:         %.2f ml/L\n", totalMl);
     Serial.printf("   • kp:               %.2f\n", kp);
     Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", setpoint);
+    Serial.printf("   • tolerance:        %.0f µS/cm\n", ecTolerance);
     Serial.printf("   • auto_enabled:     %s\n", autoEnabled ? "true" : "false");
     Serial.printf("   • intervalo_auto_ec: %d segundos\n", interval);
     
@@ -985,6 +1027,7 @@ void HydroControl::saveECControllerConfig() {
     success &= PreferencesManager::saveConfigFloat("ec_totalMl", totalMl);
     success &= PreferencesManager::saveConfigFloat("ec_kp", kp);
     success &= PreferencesManager::saveConfigFloat("ec_setpoint", setpoint);
+    success &= PreferencesManager::saveConfigFloat("ec_tolerance", ecTolerance);
     success &= PreferencesManager::saveConfigInt("ec_autoEnabled", autoEnabled ? 1 : 0);
     success &= PreferencesManager::saveConfigInt("ec_interval", interval);
     
@@ -1069,22 +1112,38 @@ void HydroControl::loadNutrientProportions() {
 }
 
 // ✅ Implementação dos setters com persistência automática
-void HydroControl::setECSetpoint(float setpoint) {
+void HydroControl::setECSetpoint(float setpoint, bool saveToNVS) {
     ecSetpoint = setpoint;
-    saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
+    if (saveToNVS) {
+        saveECControllerConfig();
+    }
 }
 
-void HydroControl::setAutoECEnabled(bool enabled) {
+void HydroControl::setECTolerance(float tolerance, bool saveToNVS) {
+    ecTolerance = tolerance > 0 ? tolerance : 50.0f;
+    if (saveToNVS) {
+        PreferencesManager::saveConfigFloat("ec_tolerance", ecTolerance);
+    }
+}
+
+void HydroControl::setAutoECEnabled(bool enabled, bool saveToNVS) {
     if (!enabled && autoECEnabled) {
         cancelCurrentDosage();
     }
     autoECEnabled = enabled;
-    saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
+    if (saveToNVS) {
+        saveECControllerConfig();
+    }
 }
 
-void HydroControl::setAutoECInterval(int intervalSeconds) {
+void HydroControl::setAutoECInterval(int intervalSeconds, bool saveToNVS) {
+    if (intervalSeconds > 0 && intervalSeconds != autoECIntervalSeconds) {
+        lastECCheckAtMs = millis();
+    }
     autoECIntervalSeconds = intervalSeconds;
-    saveECControllerConfig();  // ✅ Salvar automaticamente no NVS
+    if (saveToNVS) {
+        saveECControllerConfig();
+    }
 }
 
 void HydroControl::setTempoRecirculacaoSeconds(unsigned long seconds) {
@@ -1220,4 +1279,160 @@ void HydroControl::saveNutrientProportions() {
     } else {
         Serial.println("❌ Erro ao salvar proporções nutricionais no NVS");
     }
+}
+
+// ===== Auto pH =====
+
+void HydroControl::setPHSetpoint(float setpoint, bool saveToNVS) {
+    phSetpoint = setpoint;
+    if (saveToNVS) {
+        PreferencesManager::saveConfigFloat("ph_setpoint", setpoint);
+    }
+}
+
+void HydroControl::setAutoPHEnabled(bool enabled, bool saveToNVS) {
+    autoPHEnabled = enabled;
+    if (!enabled && phAutoState != PH_IDLE) {
+        phAutoState = PH_IDLE;
+        phActiveRelay = -1;
+        notifyPhOperationChanged();
+    }
+    if (saveToNVS) {
+        PreferencesManager::saveConfigInt("ph_autoEnabled", enabled ? 1 : 0);
+    }
+}
+
+void HydroControl::setAutoPHInterval(int intervalSeconds, bool saveToNVS) {
+    autoPHIntervalSeconds = intervalSeconds > 0 ? intervalSeconds : 300;
+    if (saveToNVS) {
+        PreferencesManager::saveConfigInt("ph_interval", autoPHIntervalSeconds);
+    }
+}
+
+void HydroControl::setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown, float mlPerUnit) {
+    relayPhUp = relayUp;
+    relayPhDown = relayDown;
+    flowRatePhUp = flowUp > 0 ? flowUp : 1.0f;
+    flowRatePhDown = flowDown > 0 ? flowDown : 1.0f;
+    mlPerPhUnit = mlPerUnit > 0 ? mlPerUnit : 2.0f;
+}
+
+void HydroControl::setPhOperationSyncCallback(PhOperationSyncCallback cb, void* userData) {
+    phOperationSyncCallback = cb;
+    phOperationSyncCallbackUserData = userData;
+}
+
+void HydroControl::notifyPhOperationChanged() {
+    if (phOperationSyncCallback) {
+        phOperationSyncCallback(phOperationSyncCallbackUserData);
+    }
+}
+
+void HydroControl::startPhAutoDosage(int relay, float durationSec) {
+    if (relay < 0 || relay >= 8 || durationSec < 0.5f) return;
+    if (currentState != IDLE) {
+        Serial.println("⚠️ [AUTO PH] EC sequencial ativo — adiando dosagem pH");
+        return;
+    }
+    int sec = max(1, (int)round(durationSec));
+    toggleRelay(relay, sec);
+    phAutoState = PH_DOSING;
+    phActiveRelay = relay;
+    phStateStartMs = millis();
+    Serial.printf("🧪 [AUTO PH] Dosagem relé %d por %d s\n", relay + 1, sec);
+    notifyPhOperationChanged();
+}
+
+void HydroControl::processPhAutoState() {
+    if (phAutoState == PH_IDLE) return;
+    unsigned long now = millis();
+    if (phAutoState == PH_DOSING) {
+        int durationMs = (phActiveRelay >= 0 && phActiveRelay < NUM_RELAYS)
+            ? timerSeconds[phActiveRelay] * 1000
+            : 0;
+        unsigned long elapsed = now - phStateStartMs;
+        if (elapsed >= (unsigned long)max(durationMs, 1000)) {
+            phAutoState = PH_RECIRCULATING;
+            phStateStartMs = now;
+            Serial.printf("⏳ [AUTO PH] Recirculando %lu s\n", phRecircSeconds);
+            notifyPhOperationChanged();
+        }
+    } else if (phAutoState == PH_RECIRCULATING) {
+        if ((now - phStateStartMs) >= phRecircSeconds * 1000UL) {
+            phAutoState = PH_IDLE;
+            phActiveRelay = -1;
+            lastPHCheck = now;
+            lastPHCheckAtMs = now;
+            Serial.println("✅ [AUTO PH] Recirculação concluída");
+            notifyPhOperationChanged();
+        }
+    }
+}
+
+void HydroControl::checkAutoPH() {
+    if (!autoPHEnabled) return;
+    if (phAutoState != PH_IDLE) return;
+    if (currentState != IDLE) return;
+
+    unsigned long now = millis();
+    unsigned long checkInterval = autoPHIntervalSeconds > 0
+        ? (autoPHIntervalSeconds * 1000UL) : 300000UL;
+    if (now - lastPHCheck < checkInterval) return;
+
+    lastPHCheck = now;
+    lastPHCheckAtMs = now;
+
+    if (!phController.needsAdjustment(phSetpoint, pH, phTolerance)) {
+        return;
+    }
+
+    int direction = phController.getDirection(phSetpoint, pH, phTolerance);
+    if (direction == 0) return;
+
+    float ml = phController.calculateDosageMl(phSetpoint, pH, mlPerPhUnit);
+    if (ml < 0.1f) return;
+
+    int relay = direction > 0 ? relayPhUp : relayPhDown;
+    float flow = direction > 0 ? flowRatePhUp : flowRatePhDown;
+    float durationSec = phController.calculateDosageTime(ml, flow);
+
+    Serial.println("\n🧪 === CONTROLE AUTOMÁTICO pH ===");
+    Serial.printf("📊 pH Atual: %.2f | Setpoint: %.2f | ml: %.3f\n", pH, phSetpoint, ml);
+    startPhAutoDosage(relay, durationSec);
+}
+
+const char* HydroControl::getPhOperationStateName() const {
+    if (!autoPHEnabled && phAutoState == PH_IDLE) return "idle";
+    switch (phAutoState) {
+        case PH_DOSING: return "dosing";
+        case PH_RECIRCULATING: return "recirculating";
+        case PH_IDLE:
+        default:
+            if (autoPHEnabled && getPhNextCheckInSec() > 0) return "ph_check_pending";
+            return "idle";
+    }
+}
+
+int HydroControl::getPhOperationRemainingSec() const {
+    if (phAutoState == PH_IDLE) return 0;
+    unsigned long elapsed = (millis() - phStateStartMs) / 1000UL;
+    if (phAutoState == PH_DOSING && phActiveRelay >= 0) {
+        long rem = (long)timerSeconds[phActiveRelay] - (long)elapsed;
+        return rem > 0 ? (int)rem : 0;
+    }
+    if (phAutoState == PH_RECIRCULATING) {
+        long rem = (long)phRecircSeconds - (long)elapsed;
+        return rem > 0 ? (int)rem : 0;
+    }
+    return 0;
+}
+
+int HydroControl::getPhNextCheckInSec() const {
+    if (!autoPHEnabled || phAutoState != PH_IDLE || currentState != IDLE) return 0;
+    unsigned long checkInterval = autoPHIntervalSeconds > 0
+        ? (autoPHIntervalSeconds * 1000UL) : 300000UL;
+    if (lastPHCheckAtMs == 0) return (int)(checkInterval / 1000UL);
+    unsigned long elapsed = millis() - lastPHCheckAtMs;
+    if (elapsed >= checkInterval) return 0;
+    return (int)((checkInterval - elapsed) / 1000UL);
 }

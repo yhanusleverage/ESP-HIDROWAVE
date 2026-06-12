@@ -83,6 +83,7 @@ bool HydroSystemCore::begin() {
 
     hydroControl.setNutrientDoseCallback(&HydroSystemCore::onNutrientDoseStatic, this);
     hydroControl.setEcOperationSyncCallback(&HydroSystemCore::onEcOperationSyncStatic, this);
+    hydroControl.setPhOperationSyncCallback(&HydroSystemCore::onPhOperationSyncStatic, this);
     
     // ===== CONECTAR SUPABASE =====
     Serial.println("☁️ Conectando ao Supabase...");
@@ -363,16 +364,22 @@ void HydroSystemCore::loop() {
         lastDebugPrint = now;
     }
     
-    // ✅ BUSCAR SEMPRE (não depende de auto_enabled) - permite ativação remota
+    // ✅ Poll config a cada 30s (read-only GET) — independente de intervalo_auto_ec do check EC
+    // Evita: poll só a cada 1800s + RPC activate_auto_ec reativar auto_enabled indevidamente
+    static const unsigned long EC_CONFIG_POLL_MS = 30000UL;
     if (supabaseConnected) {
-        int intervalSeconds = hydroControl.getAutoECInterval();
-        unsigned long checkInterval = intervalSeconds > 0 ? (intervalSeconds * 1000) : 30000; //IMPORTANTE Default: 30 segundos
-        
-        if (now - lastECConfigCheck >= checkInterval) {
-            Serial.println("⏰ [EC CONFIG] Intervalo atingido - chamando checkECConfigFromSupabase()");
-            Serial.println("   💡 Buscando mesmo se auto_enabled=false (permite ativação remota)");
+        if (now - lastECConfigCheck >= EC_CONFIG_POLL_MS) {
+            Serial.println("⏰ [EC CONFIG] Poll 30s — GET ec_config_view (sem activate_auto_ec)");
             checkECConfigFromSupabase();
             lastECConfigCheck = now;
+        }
+
+        static unsigned long lastPHConfigCheck = 0;
+        int phIntervalSeconds = hydroControl.getAutoPHInterval();
+        unsigned long phCheckInterval = phIntervalSeconds > 0 ? (phIntervalSeconds * 1000UL) : 300000UL;
+        if (now - lastPHConfigCheck >= phCheckInterval) {
+            checkPHConfigFromSupabase();
+            lastPHConfigCheck = now;
         }
     }
     
@@ -681,6 +688,7 @@ void HydroSystemCore::checkECConfigFromSupabase() {
         double total_ml = -1;
         double kp = -1;
         double ec_setpoint = -1;
+        double tolerance = -1;
         bool auto_enabled = false;
         int intervalo_auto_ec = -1;
         unsigned long tempo_recirculacao = 0;
@@ -698,6 +706,7 @@ void HydroSystemCore::checkECConfigFromSupabase() {
                lastAppliedEcConfig.total_ml == config.total_ml &&
                lastAppliedEcConfig.kp == config.kp &&
                lastAppliedEcConfig.ec_setpoint == config.ec_setpoint &&
+               lastAppliedEcConfig.tolerance == config.tolerance &&
                lastAppliedEcConfig.auto_enabled == config.auto_enabled &&
                lastAppliedEcConfig.intervalo_auto_ec == config.intervalo_auto_ec &&
                lastAppliedEcConfig.tempo_recirculacao == config.tempo_recirculacao &&
@@ -711,6 +720,7 @@ void HydroSystemCore::checkECConfigFromSupabase() {
         lastAppliedEcConfig.total_ml = config.total_ml;
         lastAppliedEcConfig.kp = config.kp;
         lastAppliedEcConfig.ec_setpoint = config.ec_setpoint;
+        lastAppliedEcConfig.tolerance = config.tolerance;
         lastAppliedEcConfig.auto_enabled = config.auto_enabled;
         lastAppliedEcConfig.intervalo_auto_ec = config.intervalo_auto_ec;
         lastAppliedEcConfig.tempo_recirculacao = config.tempo_recirculacao;
@@ -728,9 +738,13 @@ void HydroSystemCore::checkECConfigFromSupabase() {
             hydroControl.getECController().setVolume(config.volume);
             hydroControl.getECController().setTotalMl(config.total_ml);
             hydroControl.getECController().setKp(config.kp);
-            hydroControl.setECSetpoint(config.ec_setpoint);
-            hydroControl.setAutoECEnabled(config.auto_enabled);
-            hydroControl.setAutoECInterval(config.intervalo_auto_ec);
+            hydroControl.setECSetpoint(config.ec_setpoint, false);
+            hydroControl.setECTolerance((float)config.tolerance, false);
+            hydroControl.setAutoECEnabled(config.auto_enabled, false);
+            if (!config.auto_enabled) {
+                hydroControl.cancelCurrentDosage();
+            }
+            hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);
             hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
             
             // ✅ PASSAR NUTRIENTES PARA HYDROCONTROL (alimento para automação)
@@ -785,6 +799,9 @@ void HydroSystemCore::checkECConfigFromSupabase() {
             
             hydroControl.saveECControllerConfig();
             rememberEcConfig(config);
+            if (!config.auto_enabled) {
+                syncEcOperationStateToSupabase();
+            }
             Serial.println("✅ [EC CONFIG] Configuração atualizada e salva em NVS");
             } else {
                 Serial.println("ℹ️ [EC CONFIG] Config inalterada — NVS não reescrito");
@@ -1161,6 +1178,60 @@ void HydroSystemCore::onEcOperationSyncStatic(void* userData) {
     if (userData) {
         static_cast<HydroSystemCore*>(userData)->syncEcOperationStateToSupabase();
     }
+}
+
+void HydroSystemCore::onPhOperationSyncStatic(void* userData) {
+    if (userData) {
+        static_cast<HydroSystemCore*>(userData)->syncPhOperationStateToSupabase();
+    }
+}
+
+void HydroSystemCore::syncPhOperationStateToSupabase() {
+    const char* stateName = hydroControl.getPhOperationStateName();
+    const int remainingSec = hydroControl.getPhOperationRemainingSec();
+    const int nextCheckSec = hydroControl.getPhNextCheckInSec();
+
+    if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
+        return;
+    }
+    supabase.updatePhOperationState(
+        getDeviceID(),
+        String(stateName),
+        remainingSec,
+        nextCheckSec
+    );
+}
+
+void HydroSystemCore::checkPHConfigFromSupabase() {
+    if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
+        return;
+    }
+
+    PHConfig config;
+    if (!supabase.getPHConfigFromSupabase(config)) {
+        return;
+    }
+
+    if (!config.isValid) {
+        if (hydroControl.isAutoPHEnabled()) {
+            hydroControl.setAutoPHEnabled(false, false);
+            syncPhOperationStateToSupabase();
+        }
+        return;
+    }
+
+    hydroControl.setPHSetpoint((float)config.ph_setpoint, false);
+    hydroControl.setPHTolerance((float)config.ph_tolerance);
+    hydroControl.setPhPumpConfig(
+        config.relay_ph_up,
+        config.relay_ph_down,
+        (float)config.flow_rate_ph_up,
+        (float)config.flow_rate_ph_down,
+        (float)config.ml_per_ph_unit
+    );
+    hydroControl.setAutoPHInterval(config.intervalo_auto_ph, false);
+    hydroControl.setAutoPHEnabled(config.auto_enabled, false);
+    hydroControl.setPhRecirculacaoSeconds(config.tempo_recirculacao);
 }
 
 void HydroSystemCore::handleNutrientDoseEvent(const NutrientDoseEvent* event) {
