@@ -21,6 +21,11 @@ struct HydroReading {
     float ph;
     float tds;
     bool waterLevelOk;
+    bool level1Wet;
+    bool level2Wet;
+    bool level3Wet;
+    bool level4Wet;
+    const char* waterLevel;
     unsigned long timestamp;
 };
 
@@ -88,11 +93,21 @@ struct PHConfig {
     double flow_rate_ph_down;
     double volume;
     double ml_per_ph_unit;
+    double ml_per_ph_unit_acid;
+    double ml_per_ph_unit_base;
     int relay_ph_up;
     int relay_ph_down;
     bool auto_enabled;
     int intervalo_auto_ph;
     unsigned long tempo_recirculacao;
+    double aggressiveness;
+    double gain_alpha;
+    double k_acid;
+    double k_base;
+    double max_dose_ml_per_cycle;
+    int max_pulse_seconds;
+    int max_consecutive_corrections;
+    bool reset_k_gains;
     bool isValid;
 };
 
@@ -186,7 +201,33 @@ public:
 
     bool updatePhOperationState(const String& deviceId, const String& state,
                                 int operationRemainingSec, int nextCheckInSec);
-    
+
+    bool insertPhDosage(const String& deviceId, const String& sequenceId,
+                        const String& direction, int relayNumber,
+                        float dosageMl, float dosageTimeSeconds,
+                        float phBefore, float phSetpoint,
+                        const String& source = "auto_ph");
+
+    bool insertEcControllerMetric(const String& deviceId,
+                                  float ecSetpoint, float ecActual, float ecError,
+                                  float kValue, float dosageMl, float dosageTimeSeconds,
+                                  float baseDose, float flowRate, float volume, float totalMl,
+                                  float kp, bool autoEnabled,
+                                  bool adjustmentNeeded, bool adjustmentApplied,
+                                  const String& sequenceId);
+
+    bool insertPhControllerMetric(const String& deviceId,
+                                  float phSetpoint, float phBefore, float errorH,
+                                  const String& direction,
+                                  float kAcid, float kBase, float kUsed,
+                                  float doseIdealMl, float doseRealMl, float dosageTimeSeconds,
+                                  float aggressiveness, bool autoEnabled,
+                                  bool adjustmentNeeded, bool adjustmentApplied,
+                                  const String& sequenceId);
+
+    bool patchPhConfigGains(const String& deviceId, float kAcid, float kBase,
+                            bool clearResetFlag = false);
+
     // Utilitários
     bool testConnection();
     String getLastError() { return lastError; }

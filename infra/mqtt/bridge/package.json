@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node index.js",
     "test:pub": "node scripts/test-publish.js",
-    "test:pub:ec-dose": "node scripts/test-publish-ec-dose.js"
+    "test:pub:ec-dose": "node scripts/test-publish-ec-dose.js",
+    "test:pub:ph-dose": "node scripts/test-publish-ph-dose.js",
+    "test:pub:ec-metric": "node scripts/test-publish-ec-metric.js",
+    "test:pub:ph-metric": "node scripts/test-publish-ph-metric.js",
+    "monitor": "node scripts/monitor-mqtt-realtime.js"
   },
   "engines": {
     "node": ">=18"

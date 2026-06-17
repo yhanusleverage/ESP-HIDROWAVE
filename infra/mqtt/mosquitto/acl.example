@@ -9,6 +9,10 @@ topic read hidrowave/+/telemetry
 topic read hidrowave/+/status
 topic read hidrowave/+/ec_operation
 topic read hidrowave/+/dose
+topic read hidrowave/+/ph_operation
+topic read hidrowave/+/ph_dose
+topic read hidrowave/+/ec_metric
+topic read hidrowave/+/ph_metric
 topic read hidrowave/+/relay/state
 topic write hidrowave/+/command
 

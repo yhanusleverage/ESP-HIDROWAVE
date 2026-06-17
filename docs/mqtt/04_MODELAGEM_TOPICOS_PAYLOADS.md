@@ -37,6 +37,10 @@ hidrowave/{device_id}/{recurso}
 | `.../status` | ESP → broker | 1 | **true** | connect + LWT | Bridge → `is_online` |
 | `.../relay/state` | ESP → broker | 1 | false | on change | Bridge opcional / debug |
 | `.../command` | broker → ESP | 1 | false | sob demanda | ESP subscribe |
+| `.../ec_operation` | ESP → broker | 0 | false | 12s activo / 30s idle | Bridge → `relay_master.ec_operation_*` |
+| `.../dose` | ESP → broker | 1 | false | por nutriente | Bridge → `nutrient_dosages` |
+| `.../ph_operation` | ESP → broker | 0 | false | 12s activo / 30s idle | Bridge → `relay_master.ph_operation_*` |
+| `.../ph_dose` | ESP → broker | 1 | false | por corrección pH | Bridge → `ph_dosages` |
 
 ### Last Will and Testament (LWT)
 
@@ -193,14 +197,88 @@ Publicar **somente quando mudar** (após comando local, ESP-NOW ou remoto).
 
 **Cuidado:** não substituir ainda `relay_master` no Supabase sem política clara — na fase 2–3 MQTT é espelho; Supabase continua autoritativo para UI.
 
+### 3.5 Estado Auto EC → `.../ec_operation`
+
+```json
+{
+  "v": 1,
+  "device_id": "ESP32_HIDRO_269844",
+  "ec_operation_state": "recirculating",
+  "ec_operation_remaining_sec": 60,
+  "ec_next_check_in_sec": 0
+}
+```
+
+**Mapeamento Supabase (`relay_master`):** `ec_operation_state`, `ec_operation_remaining_sec`, `ec_next_check_in_sec`.
+
+Estados válidos: `idle`, `dosing`, `waiting_nutrient`, `recirculating`, `ec_check_pending`.
+
+### 3.6 Dosagem EC → `.../dose`
+
+```json
+{
+  "v": 1,
+  "device_id": "ESP32_HIDRO_269844",
+  "sequence_id": "abc123",
+  "nutrient_name": "22CCC",
+  "relay_number": 3,
+  "dosage_ml": 10.5,
+  "dosage_time_seconds": 5.0,
+  "ec_before": 850.0,
+  "ec_setpoint": 1200.0,
+  "source": "auto_ec"
+}
+```
+
+**Mapeamento Supabase (`nutrient_dosages`):** INSERT completo. `relay_number` **0-based** (relé 4 → `3`).
+
+### 3.7 Estado Auto pH → `.../ph_operation`
+
+```json
+{
+  "v": 1,
+  "device_id": "ESP32_HIDRO_269844",
+  "ph_operation_state": "recirculating",
+  "ph_operation_remaining_sec": 45,
+  "ph_next_check_in_sec": 0
+}
+```
+
+**Mapeamento Supabase (`relay_master`):** `ph_operation_state`, `ph_operation_remaining_sec`, `ph_next_check_in_sec`.
+
+Estados válidos: `idle`, `dosing`, `recirculating`, `ph_check_pending`.
+
+Heartbeat firmware: 12s durante ciclo activo; 30s en `idle` (limpia estados huérfanos).
+
+### 3.8 Dosagem pH → `.../ph_dose`
+
+```json
+{
+  "v": 1,
+  "device_id": "ESP32_HIDRO_269844",
+  "sequence_id": "1716490123",
+  "direction": "up",
+  "relay_number": 1,
+  "dosage_ml": 2.5,
+  "dosage_time_seconds": 3.0,
+  "ph_before": 5.8,
+  "ph_setpoint": 6.0,
+  "source": "auto_ph"
+}
+```
+
+**Mapeamento Supabase (`ph_dosages`):** INSERT completo. `direction`: `up` (pH+) o `down` (pH−/ácido). `relay_number` **0-based**.
+
+**Nota:** tópico separado de `dose` (EC) — payloads distintos; no mezclar en un solo handler.
+
 ---
 
 ## 4. QoS e semântica de entrega
 
 | QoS | Uso no HIDROWAVE |
 |-----|------------------|
-| 0 | heartbeat, telemetry (perda aceitável; próximo ciclo corrige) |
-| 1 | status, command, relay/state (entrega pelo menos uma vez) |
+| 0 | heartbeat, telemetry, ec_operation, ph_operation (perda aceitável; próximo ciclo corrige) |
+| 1 | status, command, relay/state, dose, ph_dose (entrega pelo menos uma vez) |
 | 2 | **não usar** no ESP (overhead e pouco suporte) |
 
 **Duplicata QoS 1:** bridge e ESP devem tolerar mesma mensagem duas vezes (idempotência por `id` ou `ts`).

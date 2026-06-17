@@ -1,6 +1,20 @@
 # 07 — Plano de firmware ESP32 (MQTT)
 
-**Status:** especificação — **não implementado** no código (maio/2026).
+**Status:** MQTT **implementado** para EC + pH (jun/2026). Este doc mantém notas gerais; procedimentos Auto pH em handoffs serial.
+
+---
+
+## Auto pH — procedimentos firmware
+
+| Paso | Doc | Conteúdo |
+|------|-----|----------|
+| S04 | [`HIDROWAVE-main/docs/handoffs/ph/S04_FLUJO_POLL_CONFIG.md`](../../../HIDROWAVE-main/docs/handoffs/ph/S04_FLUJO_POLL_CONFIG.md) | Poll `ph_config_view`, apply config |
+| S05 | [`HIDROWAVE-main/docs/handoffs/ph/S05_FLUJO_CICLO_ADAPTATIVO.md`](../../../HIDROWAVE-main/docs/handoffs/ph/S05_FLUJO_CICLO_ADAPTATIVO.md) | Ciclo adaptativo, `ph_dose`, heartbeat 12s/30s |
+| S07 | [`HIDROWAVE-main/docs/handoffs/ph/S07_BRIDGE_MQTT.md`](../../../HIDROWAVE-main/docs/handoffs/ph/S07_BRIDGE_MQTT.md) | Bridge Lightsail, ACL, test publish |
+
+Código: `MqttClient::publishPhOperation`, `publishPhDose`; `HydroSystemCore::syncPhOperationStateToSupabase`, `handlePhDoseEvent`; NVS boot `HydroControl::loadPHControllerConfig()`.
+
+Índice completo: [`HIDROWAVE-main/docs/handoffs/ph/00_INDICE_SERIAL.md`](../../../HIDROWAVE-main/docs/handoffs/ph/00_INDICE_SERIAL.md)
 
 ---
 

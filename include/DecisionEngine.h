@@ -147,6 +147,11 @@ struct SystemState {
     float temp_environment;
     float humidity;
     bool water_level_ok;
+    bool level_1;
+    bool level_2;
+    bool level_3;
+    bool level_4;
+    char water_level[8];
     
     // Estados dos relés
     bool relay_states[MAX_RELAYS];
@@ -155,6 +160,7 @@ struct SystemState {
     // Status do sistema
     bool wifi_connected;
     bool supabase_connected;
+    bool auto_ph_active;
     unsigned long uptime;
     uint32_t free_heap;
     
@@ -163,8 +169,11 @@ struct SystemState {
     
     SystemState() : ph(7.0), tds(0.0), ec(0.0), temp_water(20.0),
                    temp_environment(20.0), humidity(50.0), water_level_ok(false),
-                   wifi_connected(false), supabase_connected(false),
+                   level_1(false), level_2(false), level_3(false), level_4(false),
+                   wifi_connected(false), supabase_connected(false), auto_ph_active(false),
                    uptime(0), free_heap(0), last_update(0) {
+        strncpy(water_level, "vazio", sizeof(water_level));
+        water_level[sizeof(water_level) - 1] = '\0';
         memset(relay_states, false, sizeof(relay_states));
         memset(relay_start_times, 0, sizeof(relay_start_times));
     }

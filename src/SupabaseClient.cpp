@@ -319,7 +319,7 @@ bool SupabaseClient::makeRequest(const String& method, const String& endpoint, c
         Serial.printf("   Heap: %d bytes\n", ESP.getFreeHeap());
         setError("Erro HTTP: " + String(httpCode) + " - " + httpClient->errorToString(httpCode));
         httpClient->end();  // ✅ FECHAR conexão sempre
-        networkWatchdog.endOperation(false);
+        networkWatchdog.endOperation(false, httpCode);
         // ✅ Delay para liberação de memória SSL (saúde operacional)
         vTaskDelay(pdMS_TO_TICKS(200));
         // ✅ Liberar pools se estavam em uso
@@ -363,7 +363,7 @@ bool SupabaseClient::makeRequest(const String& method, const String& endpoint, c
     }
     
     httpClient->end();  // ✅ FECHAR conexão sempre
-    networkWatchdog.endOperation(false);
+    networkWatchdog.endOperation(false, httpCode);
     // ✅ Dar tempo para SSL liberar memória
     vTaskDelay(pdMS_TO_TICKS(50));
     
@@ -606,6 +606,13 @@ String SupabaseClient::buildHydroPayload(const HydroReading& reading) {
     doc["ph"] = reading.ph;
     doc["tds"] = reading.tds;
     doc["water_level_ok"] = reading.waterLevelOk;
+    doc["level_1"] = reading.level1Wet;
+    doc["level_2"] = reading.level2Wet;
+    doc["level_3"] = reading.level3Wet;
+    doc["level_4"] = reading.level4Wet;
+    if (reading.waterLevel && reading.waterLevel[0]) {
+        doc["water_level"] = reading.waterLevel;
+    }
     
     String payload;
     serializeJson(doc, payload);
@@ -1933,14 +1940,14 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
 }
 
 bool SupabaseClient::markCommandSent(int commandId, bool isSlave) {
+    (void)isSlave;
     if (secureClient == nullptr) {
         setError("Cliente SSL não inicializado");
         return false;
     }
     
-    // ✅ NOVO: Usar tabela correta (master ou slave)
-    String table = isSlave ? "relay_commands_slave" : "relay_commands_master";
-    String endpoint = table + "?id=eq." + String(commandId);
+    // Prod unificado: relay_commands (mesma tabela do poll e do frontend)
+    String endpoint = String(SUPABASE_RELAY_TABLE) + "?id=eq." + String(commandId);
     String payload = "{\"status\": \"sent\", \"sent_at\": \"now()\"}";
     
     // ✅ Cerrar cualquier conexión previa antes de reutilizar http
@@ -1953,6 +1960,9 @@ bool SupabaseClient::markCommandSent(int commandId, bool isSlave) {
     http.setTimeout(SUPABASE_TIMEOUT_MS);
     
     int httpCode = http.PATCH(payload);
+    if (httpCode < 200 || httpCode >= 300) {
+        Serial.printf("❌ [ACK] markCommandSent id=%d HTTP %d\n", commandId, httpCode);
+    }
     http.end();
     // ✅ Dar tempo para SSL liberar memória
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -1961,14 +1971,13 @@ bool SupabaseClient::markCommandSent(int commandId, bool isSlave) {
 }
 
 bool SupabaseClient::markCommandCompleted(int commandId, bool currentState, bool isSlave) {
+    (void)isSlave;
     if (secureClient == nullptr) {
         setError("Cliente SSL não inicializado");
         return false;
     }
     
-    // ✅ NOVO: Usar tabela correta (master ou slave)
-    String table = isSlave ? "relay_commands_slave" : "relay_commands_master";
-    String endpoint = table + "?id=eq." + String(commandId);
+    String endpoint = String(SUPABASE_RELAY_TABLE) + "?id=eq." + String(commandId);
     
     // ✅ NOVO: Incluir current_state no payload
     DynamicJsonDocument doc(256);
@@ -1989,6 +1998,28 @@ bool SupabaseClient::markCommandCompleted(int commandId, bool currentState, bool
     http.setTimeout(SUPABASE_TIMEOUT_MS);
     
     int httpCode = http.PATCH(payload);
+    if (httpCode < 200 || httpCode >= 300) {
+        Serial.printf("⚠️ [ACK] markCommandCompleted id=%d HTTP %d — retry sem current_state\n", commandId, httpCode);
+        http.end();
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        DynamicJsonDocument docFallback(128);
+        docFallback["status"] = "completed";
+        docFallback["completed_at"] = "now()";
+        String payloadFallback;
+        serializeJson(docFallback, payloadFallback);
+
+        http.end();
+        http.begin(*secureClient, baseUrl + "/rest/v1/" + endpoint);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
+        http.addHeader("apikey", apiKey);
+        http.setTimeout(SUPABASE_TIMEOUT_MS);
+        httpCode = http.PATCH(payloadFallback);
+    }
+    if (httpCode < 200 || httpCode >= 300) {
+        Serial.printf("❌ [ACK] markCommandCompleted id=%d HTTP %d\n", commandId, httpCode);
+    }
     http.end();
     // ✅ Dar tempo para SSL liberar memória
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -1997,14 +2028,13 @@ bool SupabaseClient::markCommandCompleted(int commandId, bool currentState, bool
 }
 
 bool SupabaseClient::markCommandFailed(int commandId, const String& errorMessage, bool isSlave) {
+    (void)isSlave;
     if (secureClient == nullptr) {
         setError("Cliente SSL não inicializado");
         return false;
     }
     
-    // ✅ NOVO: Usar tabela correta (master ou slave)
-    String table = isSlave ? "relay_commands_slave" : "relay_commands_master";
-    String endpoint = table + "?id=eq." + String(commandId);
+    String endpoint = String(SUPABASE_RELAY_TABLE) + "?id=eq." + String(commandId);
     
     DynamicJsonDocument doc(256);
     doc["status"] = "failed";
@@ -3670,34 +3700,41 @@ bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     config.isValid = false;
     if (!isConnected || !isReady()) return false;
 
-    DynamicJsonDocument payloadDoc(256);
-    payloadDoc["p_device_id"] = getDeviceID();
-    String payload;
-    serializeJson(payloadDoc, payload);
+    if (commandCheckMutex != nullptr) {
+        if (xSemaphoreTake(commandCheckMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            return false;
+        }
+    }
 
-    String fullUrl = baseUrl + "/rest/v1/rpc/activate_auto_ph";
+    String deviceId = getDeviceID();
+    String endpoint = "ph_config_view?device_id=eq." + deviceId + "&select=*";
+    String fullUrl = baseUrl + "/rest/v1/" + endpoint;
     bool ok = false;
     String response;
 
     if (secureClient != nullptr && http.begin(*secureClient, fullUrl)) {
         http.addHeader("apikey", apiKey);
         http.addHeader("Authorization", buildAuthHeader());
-        http.addHeader("Content-Type", "application/json");
         http.addHeader("Accept", "application/json");
         http.setTimeout(12000);
-        int code = http.POST(payload);
+        int code = http.GET();
         if (code == 200) {
             response = http.getString();
             ok = true;
         } else {
-            Serial.printf("❌ [RPC PH_CONFIG] HTTP %d\n", code);
+            Serial.printf("❌ [PH_CONFIG] GET HTTP %d\n", code);
         }
         http.end();
     }
 
-    if (!ok || response.length() == 0) return false;
+    if (commandCheckMutex != nullptr) {
+        xSemaphoreGive(commandCheckMutex);
+    }
 
-    DynamicJsonDocument doc(1024);
+    if (!ok) return false;
+    if (response.length() == 0) return false;
+
+    DynamicJsonDocument doc(2048);
     if (deserializeJson(doc, response)) return false;
 
     JsonArray arr = doc.as<JsonArray>();
@@ -3710,12 +3747,180 @@ bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     config.flow_rate_ph_down = o["flow_rate_ph_down"] | 1.0;
     config.volume = o["volume"] | 100.0;
     config.ml_per_ph_unit = o["ml_per_ph_unit"] | 2.0;
+    config.ml_per_ph_unit_acid = o["ml_per_ph_unit_acid"] | config.ml_per_ph_unit;
+    config.ml_per_ph_unit_base = o["ml_per_ph_unit_base"] | config.ml_per_ph_unit;
     config.relay_ph_up = o["relay_ph_up"] | 1;
     config.relay_ph_down = o["relay_ph_down"] | 0;
     config.auto_enabled = o["auto_enabled"] | false;
     config.intervalo_auto_ph = o["intervalo_auto_ph"] | 300;
     config.tempo_recirculacao = o["tempo_recirculacao"] | 60;
+    config.aggressiveness = o["aggressiveness"] | 0.5;
+    config.gain_alpha = o["gain_alpha"] | 0.2;
+    config.k_acid = o["k_acid"] | 0.0;
+    config.k_base = o["k_base"] | 0.0;
+    config.max_dose_ml_per_cycle = o["max_dose_ml_per_cycle"] | 50.0;
+    config.max_pulse_seconds = o["max_pulse_seconds"] | 120;
+    config.max_consecutive_corrections = o["max_consecutive_corrections"] | 5;
+    config.reset_k_gains = o["reset_k_gains"] | false;
     config.isValid = true;
     return true;
+}
+
+bool SupabaseClient::insertPhDosage(const String& deviceId, const String& sequenceId,
+                                      const String& direction, int relayNumber,
+                                      float dosageMl, float dosageTimeSeconds,
+                                      float phBefore, float phSetpoint,
+                                      const String& source) {
+    if (!isReady()) {
+        setError("Supabase não está pronto para insertPhDosage");
+        return false;
+    }
+
+    DynamicJsonDocument doc(512);
+    doc["device_id"] = deviceId;
+    doc["sequence_id"] = sequenceId;
+    doc["direction"] = direction;
+    doc["relay_number"] = relayNumber;
+    doc["dosage_ml"] = round(dosageMl * 1000.0) / 1000.0;
+    doc["dosage_time_seconds"] = round(dosageTimeSeconds * 100.0) / 100.0;
+    doc["ph_before"] = round(phBefore * 1000.0) / 1000.0;
+    doc["ph_setpoint"] = round(phSetpoint * 1000.0) / 1000.0;
+    doc["source"] = source.length() > 0 ? source : "auto_ph";
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Serial.printf("💾 [PH DOSAGEM] INSERT ph_dosages: %s %.2f ml relé %d\n",
+        direction.c_str(), dosageMl, relayNumber + 1);
+
+    return insert("ph_dosages", payload);
+}
+
+bool SupabaseClient::insertEcControllerMetric(const String& deviceId,
+                                              float ecSetpoint, float ecActual, float ecError,
+                                              float kValue, float dosageMl, float dosageTimeSeconds,
+                                              float baseDose, float flowRate, float volume, float totalMl,
+                                              float kp, bool autoEnabled,
+                                              bool adjustmentNeeded, bool adjustmentApplied,
+                                              const String& sequenceId) {
+    if (!isReady()) {
+        setError("Supabase não está pronto para insertEcControllerMetric");
+        return false;
+    }
+
+    DynamicJsonDocument doc(768);
+    doc["device_id"] = deviceId;
+    doc["ec_setpoint"] = round(ecSetpoint * 100.0) / 100.0;
+    doc["ec_actual"] = round(ecActual * 100.0) / 100.0;
+    doc["ec_error"] = round(ecError * 100.0) / 100.0;
+    doc["k_value"] = kValue;
+    doc["dosage_ml"] = round(dosageMl * 1000.0) / 1000.0;
+    doc["dosage_time_seconds"] = round(dosageTimeSeconds * 100.0) / 100.0;
+    doc["base_dose"] = baseDose;
+    doc["flow_rate"] = flowRate;
+    doc["volume"] = volume;
+    doc["total_ml"] = totalMl;
+    doc["kp"] = kp;
+    doc["auto_enabled"] = autoEnabled;
+    doc["adjustment_needed"] = adjustmentNeeded;
+    doc["adjustment_applied"] = adjustmentApplied;
+    if (sequenceId.length() > 0) {
+        doc["sequence_id"] = sequenceId;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Serial.printf("💾 [EC METRIC] INSERT ec_controller_metrics err=%.0f u(t)=%.2f ml\n",
+                  ecError, dosageMl);
+
+    return insert("ec_controller_metrics", payload);
+}
+
+bool SupabaseClient::insertPhControllerMetric(const String& deviceId,
+                                              float phSetpoint, float phBefore, float errorH,
+                                              const String& direction,
+                                              float kAcid, float kBase, float kUsed,
+                                              float doseIdealMl, float doseRealMl, float dosageTimeSeconds,
+                                              float aggressiveness, bool autoEnabled,
+                                              bool adjustmentNeeded, bool adjustmentApplied,
+                                              const String& sequenceId) {
+    if (!isReady()) {
+        setError("Supabase não está pronto para insertPhControllerMetric");
+        return false;
+    }
+
+    DynamicJsonDocument doc(768);
+    doc["device_id"] = deviceId;
+    doc["ph_setpoint"] = round(phSetpoint * 1000.0) / 1000.0;
+    doc["ph_before"] = round(phBefore * 1000.0) / 1000.0;
+    doc["error_h"] = errorH;
+    if (direction.length() > 0) {
+        doc["direction"] = direction;
+    }
+    doc["k_acid"] = kAcid;
+    doc["k_base"] = kBase;
+    doc["k_used"] = kUsed;
+    doc["dose_ideal_ml"] = round(doseIdealMl * 1000.0) / 1000.0;
+    doc["dose_real_ml"] = round(doseRealMl * 1000.0) / 1000.0;
+    doc["dosage_time_seconds"] = round(dosageTimeSeconds * 100.0) / 100.0;
+    doc["aggressiveness"] = aggressiveness;
+    doc["auto_enabled"] = autoEnabled;
+    doc["adjustment_needed"] = adjustmentNeeded;
+    doc["adjustment_applied"] = adjustmentApplied;
+    if (sequenceId.length() > 0) {
+        doc["sequence_id"] = sequenceId;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Serial.printf("💾 [PH METRIC] INSERT ph_controller_metrics errH=%.3e u(t)=%.2f ml\n",
+                  errorH, doseRealMl);
+
+    return insert("ph_controller_metrics", payload);
+}
+
+bool SupabaseClient::patchPhConfigGains(const String& deviceId, float kAcid, float kBase,
+                                        bool clearResetFlag) {
+    if (!isReady()) return false;
+
+    if (requestMutex != nullptr) {
+        if (xSemaphoreTake(requestMutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            return false;
+        }
+    }
+
+    DynamicJsonDocument doc(256);
+    doc["k_acid"] = kAcid;
+    doc["k_base"] = kBase;
+    if (clearResetFlag) {
+        doc["reset_k_gains"] = false;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String patchUrl = baseUrl + "/rest/v1/ph_config_view?device_id=eq." + deviceId;
+    bool patchOk = false;
+
+    if (secureClient != nullptr && http.begin(*secureClient, patchUrl)) {
+        http.addHeader("apikey", apiKey);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Prefer", "return=minimal");
+        http.setTimeout(8000);
+        int code = http.PATCH(payload);
+        patchOk = (code >= 200 && code < 300);
+        if (!patchOk) {
+            Serial.printf("⚠️ [PH CONFIG] PATCH k_acid/k_base falhou HTTP %d\n", code);
+        }
+        http.end();
+    }
+
+    if (requestMutex != nullptr) {
+        xSemaphoreGive(requestMutex);
+    }
+    return patchOk;
 }
  

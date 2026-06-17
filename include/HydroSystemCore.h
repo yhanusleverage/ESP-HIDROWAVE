@@ -83,8 +83,45 @@ private:
     unsigned long lastMqttHeartbeatSend;
     unsigned long lastEcOperationSync;
     unsigned long lastEcOperationIdleSync;
+    unsigned long lastPhOperationSync;
+    unsigned long lastPhOperationIdleSync;
     unsigned long commandPollIntervalMs;
     MqttCommandDedup mqttCommandDedup;
+
+    /** Cola de respaldo HTTPS para dose EC (evita pérdida silenciosa quando MQTT OK mas bridge falha). */
+    struct PendingNutrientDoseExport {
+        char sequenceId[24];
+        char nutrientName[32];
+        char source[16];
+        int relayNumber;
+        float dosageMl;
+        float dosageTimeSeconds;
+        float ecBefore;
+        float ecSetpoint;
+        uint8_t attempts;
+    };
+    static const size_t PENDING_NUTRIENT_DOSE_CAP = 4;
+    PendingNutrientDoseExport pendingNutrientDoseQueue[PENDING_NUTRIENT_DOSE_CAP];
+    uint8_t pendingNutrientDoseHead;
+    uint8_t pendingNutrientDoseCount;
+
+    /** Cola de respaldo HTTPS para dose pH (paridade EC). */
+    struct PendingPhDoseExport {
+        char sequenceId[24];
+        char direction[8];
+        char source[16];
+        int relayNumber;
+        float dosageMl;
+        float dosageTimeSeconds;
+        float phBefore;
+        float phSetpoint;
+        uint8_t attempts;
+    };
+    static const size_t PENDING_PH_DOSE_CAP = 4;
+    PendingPhDoseExport pendingPhDoseQueue[PENDING_PH_DOSE_CAP];
+    uint8_t pendingPhDoseHead;
+    uint8_t pendingPhDoseCount;
+    static const uint8_t PENDING_DOSE_MAX_ATTEMPTS = 30;
     
     // Intervalos otimizados para resposta mais rápida
     static const unsigned long SENSOR_SEND_INTERVAL = 30000;      // 30s
@@ -92,6 +129,8 @@ private:
     static const unsigned long RELAY_STATES_SYNC_INTERVAL = 10000; // 10s — espelho relay_master/slaves (após comando há update imediato)
     static const unsigned long EC_OPERATION_SYNC_INTERVAL = 12000; // 12s — remaining_sec fresco durante dosing/recirc
     static const unsigned long EC_OPERATION_IDLE_SYNC_INTERVAL = 30000; // 30s — limpa ec_operation huérfano em Supabase
+    static const unsigned long PH_OPERATION_SYNC_INTERVAL = 12000;
+    static const unsigned long PH_OPERATION_IDLE_SYNC_INTERVAL = 30000;
     static const unsigned long STATUS_PRINT_INTERVAL = 30000;     // 30s
     static const unsigned long RULES_CHECK_INTERVAL = 30000;      // ✅ 30s - Verificação de regras de automação (decision_rules)
     // Eliminar macro antes de definir constante estática
@@ -180,7 +219,7 @@ private:
     void checkSupabaseCommands();
     void checkSupabaseRules();  // ✅ NOVO: Verificar regras de automação (decision_rules)
     void checkECConfigFromSupabase();  // ✅ NOVO: Buscar EC config do Supabase via RPC activate_auto_ec
-    void checkPHConfigFromSupabase();  // ✅ Buscar pH config via RPC activate_auto_ph
+    void checkPHConfigFromSupabase();  // GET ph_config_view (read-only poll)
     void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "https");
     
     static void mqttCommandReceived(const char* payload, size_t length, void* userData);
@@ -206,7 +245,23 @@ private:
     void syncEcOperationStateToSupabase();
     void syncPhOperationStateToSupabase();
     void handleNutrientDoseEvent(const NutrientDoseEvent* event);
+    void handlePhDoseEvent(const PhDoseEvent* event);
+    void handleEcMetricEvent(const EcControllerMetricEvent* event);
+    void handlePhMetricEvent(const PhControllerMetricEvent* event);
+    void enqueuePendingNutrientDose(const NutrientDoseEvent* event);
+    void enqueuePendingPhDose(const PhDoseEvent* event);
+    bool tryInsertNutrientDoseHttps(const PendingNutrientDoseExport& item, const char* logLabel);
+    bool tryInsertPhDoseHttps(const PendingPhDoseExport& item, const char* logLabel);
+    void flushPendingNutrientDoseExports();
+    void flushPendingPhDoseExports();
+    static void copyNutrientDoseToPending(const NutrientDoseEvent* event, PendingNutrientDoseExport& out);
+    static void copyPhDoseToPending(const PhDoseEvent* event, PendingPhDoseExport& out);
+    void handlePhGainLearned();
+    static void onPhGainLearnedStatic(void* userData);
     static void onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData);
+    static void onPhDoseStatic(const PhDoseEvent* event, void* userData);
+    static void onEcMetricStatic(const EcControllerMetricEvent* event, void* userData);
+    static void onPhMetricStatic(const PhControllerMetricEvent* event, void* userData);
     static void onEcOperationSyncStatic(void* userData);
     static void onPhOperationSyncStatic(void* userData);
     void publishMqttTelemetry();

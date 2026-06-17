@@ -1,6 +1,8 @@
 #include "HydroControl.h"
 #include "PreferencesManager.h"  // ✅ Para persistência em NVS
+#include "SensorSanitize.h"
 #include <cmath>
+#include <cstring>
 
 HydroControl::HydroControl()
     : lcd(0x27, 16, 2)
@@ -35,6 +37,8 @@ HydroControl::HydroControl()
     nutrientDoseCallbackUserData = nullptr;
     ecOperationSyncCallback = nullptr;
     ecOperationSyncCallbackUserData = nullptr;
+    ecMetricCallback = nullptr;
+    ecMetricCallbackUserData = nullptr;
 
     phSetpoint = 6.0f;
     phTolerance = 0.2f;
@@ -46,13 +50,32 @@ HydroControl::HydroControl()
     relayPhDown = 0;
     flowRatePhUp = 1.0f;
     flowRatePhDown = 1.0f;
-    mlPerPhUnit = 2.0f;
+    mlPerPhUnitAcid = 2.0f;
+    mlPerPhUnitBase = 2.0f;
+    phAggressiveness = 0.5f;
+    phGainAlpha = 0.2f;
+    phMaxDoseMl = 50.0f;
+    phMaxPulseSec = 120;
+    phMaxConsecutive = 5;
+    phConsecutiveCorrections = 0;
     phRecircSeconds = 60;
     phAutoState = PH_IDLE;
     phStateStartMs = 0;
     phActiveRelay = -1;
+    phActivePath = PH_PATH_NONE;
+    phCycleHBefore = 0.0f;
+    phCyclePhBefore = 0.0f;
+    phCycleMlApplied = 0.0f;
+    phCycleDurationSec = 0.0f;
+    phCycleDurationMs = 0;
     phOperationSyncCallback = nullptr;
     phOperationSyncCallbackUserData = nullptr;
+    phDoseCallback = nullptr;
+    phDoseCallbackUserData = nullptr;
+    phMetricCallback = nullptr;
+    phMetricCallbackUserData = nullptr;
+    phGainLearnedCallback = nullptr;
+    phGainLearnedCallbackUserData = nullptr;
     
     // ✅ Inicializar sistema sequencial de dosagem
     currentState = IDLE;
@@ -145,6 +168,7 @@ bool HydroControl::begin() {
     // Inicializar sensor de nível
     tankSensor = new LevelSensor(TANK_LOW_PIN, TANK_HIGH_PIN);
     tankSensor->begin();
+    levelBank.begin();
 
     // Pequena pausa para estabilizar o barramento I2C
     delay(100);
@@ -218,6 +242,11 @@ bool HydroControl::begin() {
     // ✅ Carregar configuração persistida do Controller KP
     loadECControllerConfig();
     loadNutrientProportions();
+    loadPHControllerConfig();
+    adaptivePhController.loadFromNVS();
+    if (adaptivePhController.getValidLearningCycles() == 0) {
+        adaptivePhController.setSeedFromMlPerPhUnit(phSetpoint, mlPerPhUnitAcid, mlPerPhUnitBase);
+    }
     
     // Return true if basic initialization succeeded (even with PCF errors)
     return true;
@@ -267,7 +296,54 @@ void HydroControl::updateSensors() {
         sensorsOk = false;
     }
 
-    tankLevelOk = tankSensor->checkWaterLevel();
+    if (levelBank.poll(pcf1, pcf1_ok)) {
+        tankLevelOk = levelBank.isLevelOk();
+        static unsigned long lastLevelLog = 0;
+        if (millis() - lastLevelLog >= 10000) {
+            lastLevelLog = millis();
+            Serial.printf("LEVEL L1=%s L2=%s L3=%s L4=%s → %s\n",
+                levelBank.isWet(1) ? "MOJADO" : "SECO",
+                levelBank.isWet(2) ? "MOJADO" : "SECO",
+                levelBank.isWet(3) ? "MOJADO" : "SECO",
+                levelBank.isWet(4) ? "MOJADO" : "SECO",
+                levelBank.getWaterLevel());
+        }
+    } else if (tankSensor) {
+        tankLevelOk = tankSensor->checkWaterLevel();
+    } else {
+        tankLevelOk = false;
+    }
+}
+
+bool HydroControl::isLevelWet(int levelIndex) const {
+    if (levelBank.isAvailable()) {
+        return levelBank.isWet(levelIndex);
+    }
+    if (!tankSensor || levelIndex < 1 || levelIndex > 4) {
+        return false;
+    }
+    const String status = tankSensor->getStatus();
+    if (levelIndex == 4) {
+        return status != "BAIXO" && status != "ERRO";
+    }
+    if (levelIndex == 1) {
+        return status == "CHEIO";
+    }
+    return status == "MÉDIO" || status == "CHEIO";
+}
+
+const char* HydroControl::getWaterLevelAggregate() const {
+    if (levelBank.isAvailable()) {
+        return levelBank.getWaterLevel();
+    }
+    if (!tankSensor) {
+        return "vazio";
+    }
+    const String status = tankSensor->getStatus();
+    if (status == "CHEIO") return "alto";
+    if (status == "MÉDIO") return "medio";
+    if (status == "BAIXO") return "baixo";
+    return "vazio";
 }
 
 void HydroControl::updateDisplay() {
@@ -377,7 +453,7 @@ void HydroControl::toggleRelay(int relay, int seconds) {
     // Configurar timer se necessário
     if (seconds > 0 && relayStates[relay]) {
         startTimes[relay] = millis();
-        timerSeconds[relay] = seconds / 1000;  // Converter ms para segundos
+        timerSeconds[relay] = seconds;
         Serial.printf(" (timer: %d segundos)", timerSeconds[relay]);
     } else {
         startTimes[relay] = 0;
@@ -456,44 +532,62 @@ void HydroControl::checkAutoEC() {
     
     lastECCheck = currentMillis;
     lastECCheckAtMs = currentMillis;
+
+    float ecForControl = ec;
+#if !HIDRO_DEV_RELAX_SENSORS
+    if (!isValidEcMicroSiemens(ec)) {
+        static unsigned long lastInvalidEcLog = 0;
+        if (currentMillis - lastInvalidEcLog >= 60000) {
+            lastInvalidEcLog = currentMillis;
+            Serial.printf("⚠️ [AUTO EC] Lectura EC inválida (%.0f µS/cm) — omitiendo dosaje\n", ec);
+        }
+        return;
+    }
+#endif
     
     // Verificar se precisa de ajuste (tolerância configurável — default 50 µS/cm)
-    if (ecController.needsAdjustment(ecSetpoint, ec, ecTolerance)) {
-        // Calcular dosagem necessária
-        float dosageML = ecController.calculateDosage(ecSetpoint, ec);
-        
-        if (dosageML > 0.1) {  // Só dosar se for significativo (> 0.1 ml)
-            float dosageTime = ecController.calculateDosageTime(dosageML);
-            
+    const bool needsAdj = ecController.needsAdjustment(ecSetpoint, ecForControl, ecTolerance);
+    const float ecError = ecSetpoint - ec;
+    float dosageML = 0.0f;
+    float dosageTime = 0.0f;
+    bool applied = false;
+    String seqForMetric;
+
+    if (needsAdj) {
+        dosageML = ecController.calculateDosage(ecSetpoint, ecForControl);
+
+        if (dosageML > 0.1f) {
+            dosageTime = ecController.calculateDosageTime(dosageML);
+
             Serial.println("\n🤖 === CONTROLE AUTOMÁTICO EC ===");
             Serial.printf("📊 EC Atual: %.0f µS/cm\n", ec);
             Serial.printf("🎯 EC Setpoint: %.0f µS/cm\n", ecSetpoint);
-            Serial.printf("⚡ Erro: %.0f µS/cm\n", (ecSetpoint - ec));
+            Serial.printf("⚡ Erro: %.0f µS/cm\n", ecError);
             Serial.printf("💧 u(t) calculado: %.3f ml (proporção milimétrica)\n", dosageML);
             Serial.printf("⏱️ Tempo de dosagem: %.2f segundos\n", dosageTime);
             Serial.printf("⏱️  Tempo de dosagem: %.1f segundos\n", dosageTime);
             Serial.println("================================\n");
-            
-            // ✅ EXECUTAR DOSAGEM SEQUENCIAL AUTOMÁTICA
-            // Verificar se não há dosagem ativa antes de iniciar nova
+
             if (currentState == IDLE) {
                 startSimpleSequentialDosage(dosageML, ecSetpoint, ec);
+                applied = true;
+                seqForMetric = currentSequenceId;
             } else {
                 Serial.println("⚠️  Auto EC: Sistema sequencial já ativo - aguardando conclusão");
             }
-            
         } else {
             Serial.printf("ℹ️  Auto EC: Dosagem muito pequena (%.3f ml) - ignorada\n", dosageML);
         }
     } else {
-        // Log ocasional quando não precisa ajuste
         static unsigned long lastNoAdjustLog = 0;
-        if (currentMillis - lastNoAdjustLog > 60000) {  // Log a cada 1 minuto
+        if (currentMillis - lastNoAdjustLog > 60000) {
             lastNoAdjustLog = currentMillis;
             float error = abs(ecSetpoint - ec);
             Serial.printf("✅ Auto EC: Sem ajuste necessário (Erro: %.0f µS/cm, Tolerância: %.0f µS/cm)\n", error, ecTolerance);
         }
     }
+
+    emitEcControllerMetric(needsAdj, applied, dosageML, dosageTime, ecError, seqForMetric);
 }
 
 // ✅ Máquina de estados para dosagem sequencial
@@ -991,6 +1085,32 @@ void HydroControl::loadECControllerConfig() {
     Serial.println("╚════════════════════════════════════════════════════╝\n");
 }
 
+void HydroControl::loadPHControllerConfig() {
+    Serial.println("\n╔════════════════════════════════════════════════════╗");
+    Serial.println("║   📂 CARREGANDO PH_CONFIG DO NVS                    ║");
+    Serial.println("╚════════════════════════════════════════════════════╝");
+
+    float setpoint = 0.0f;
+    bool autoEnabled = false;
+    int32_t intervalSeconds = 300;
+
+    PreferencesManager::loadConfigFloat("ph_setpoint", setpoint);
+    PreferencesManager::loadConfigInt("ph_autoEnabled", (int32_t&)autoEnabled);
+    PreferencesManager::loadConfigInt("ph_interval", intervalSeconds);
+
+    Serial.println("📊 Valores carregados do NVS (PH):");
+    Serial.printf("   • ph_setpoint:       %.2f\n", setpoint);
+    Serial.printf("   • auto_enabled:      %s\n", autoEnabled ? "true" : "false");
+    Serial.printf("   • intervalo_auto_ph: %ld segundos\n", (long)intervalSeconds);
+
+    if (setpoint > 0.0f) phSetpoint = setpoint;
+    autoPHEnabled = autoEnabled;
+    if (intervalSeconds > 0) autoPHIntervalSeconds = (int)intervalSeconds;
+
+    Serial.println("✅ PH_CONFIG carregado e aplicado com sucesso");
+    Serial.println("╚════════════════════════════════════════════════════╝\n");
+}
+
 // ✅ Salvar configuração do Controller KP no NVS
 void HydroControl::saveECControllerConfig() {
     Serial.println("\n╔════════════════════════════════════════════════════╗");
@@ -1161,6 +1281,79 @@ void HydroControl::setEcOperationSyncCallback(EcOperationSyncCallback cb, void* 
     ecOperationSyncCallbackUserData = userData;
 }
 
+void HydroControl::setEcMetricCallback(EcMetricCallback cb, void* userData) {
+    ecMetricCallback = cb;
+    ecMetricCallbackUserData = userData;
+}
+
+void HydroControl::setPhMetricCallback(PhMetricCallback cb, void* userData) {
+    phMetricCallback = cb;
+    phMetricCallbackUserData = userData;
+}
+
+void HydroControl::emitEcControllerMetric(bool adjustmentNeeded, bool adjustmentApplied,
+                                            float dosageMl, float dosageTimeSec, float ecError,
+                                            const String& sequenceId) {
+    if (!ecMetricCallback) {
+        return;
+    }
+    EcControllerMetricEvent event = {};
+    event.ecSetpoint = ecSetpoint;
+    event.ecActual = ec;
+    event.ecError = ecError;
+    event.kValue = ecController.getKValue();
+    event.dosageMl = dosageMl;
+    event.dosageTimeSeconds = dosageTimeSec;
+    event.baseDose = ecController.getBaseDose();
+    event.flowRate = ecController.getFlowRate();
+    event.volume = ecController.getVolume();
+    event.totalMl = ecController.getTotalMl();
+    event.kp = ecController.getKp();
+    event.autoEnabled = autoECEnabled;
+    event.adjustmentNeeded = adjustmentNeeded;
+    event.adjustmentApplied = adjustmentApplied;
+    sequenceId.toCharArray(event.sequenceId, sizeof(event.sequenceId));
+    ecMetricCallback(&event, ecMetricCallbackUserData);
+}
+
+void HydroControl::emitPhControllerMetric(bool adjustmentNeeded, bool adjustmentApplied,
+                                            PhCorrectionPath path, const PhDosePlan* plan,
+                                            const String& sequenceId) {
+    if (!phMetricCallback) {
+        return;
+    }
+    PhControllerMetricEvent event = {};
+    event.phSetpoint = phSetpoint;
+    event.phBefore = pH;
+    event.errorH = AdaptivePHController::errorH(phSetpoint, pH);
+    if (!isfinite(event.errorH)) {
+        const float linearErr = phSetpoint - pH;
+        event.errorH = isfinite(linearErr) ? linearErr * 1e-6f : 0.0f;
+    }
+    event.kAcid = adaptivePhController.getKAcid();
+    event.kBase = adaptivePhController.getKBase();
+    event.aggressiveness = phAggressiveness;
+    event.autoEnabled = autoPHEnabled;
+    event.adjustmentNeeded = adjustmentNeeded;
+    event.adjustmentApplied = adjustmentApplied;
+    if (path == PH_PATH_BASE) {
+        strncpy(event.direction, "up", sizeof(event.direction) - 1);
+    } else if (path == PH_PATH_ACID) {
+        strncpy(event.direction, "down", sizeof(event.direction) - 1);
+    }
+    if (plan != nullptr) {
+        event.kUsed = plan->kUsed;
+        event.doseIdealMl = plan->doseIdealMl;
+        event.doseRealMl = plan->doseRealMl;
+        event.dosageTimeSeconds = plan->durationSec;
+        const float doseCap = 9999999.0f;
+        if (event.doseIdealMl > doseCap) event.doseIdealMl = doseCap;
+        if (event.doseRealMl > doseCap) event.doseRealMl = doseCap;
+    }
+    sequenceId.toCharArray(event.sequenceId, sizeof(event.sequenceId));
+    phMetricCallback(&event, phMetricCallbackUserData);
+}
+
 void HydroControl::notifyEcOperationChanged() {
     if (ecOperationSyncCallback) {
         ecOperationSyncCallback(ecOperationSyncCallbackUserData);
@@ -1309,12 +1502,48 @@ void HydroControl::setAutoPHInterval(int intervalSeconds, bool saveToNVS) {
     }
 }
 
-void HydroControl::setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown, float mlPerUnit) {
+void HydroControl::setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
+                                     float mlPerUnitAcid, float mlPerUnitBase) {
     relayPhUp = relayUp;
     relayPhDown = relayDown;
     flowRatePhUp = flowUp > 0 ? flowUp : 1.0f;
     flowRatePhDown = flowDown > 0 ? flowDown : 1.0f;
-    mlPerPhUnit = mlPerUnit > 0 ? mlPerUnit : 2.0f;
+    mlPerPhUnitAcid = mlPerUnitAcid > 0 ? mlPerUnitAcid : 2.0f;
+    mlPerPhUnitBase = mlPerUnitBase > 0 ? mlPerUnitBase : 2.0f;
+    if (adaptivePhController.getValidLearningCycles() == 0) {
+        adaptivePhController.setSeedFromMlPerPhUnit(phSetpoint, mlPerPhUnitAcid, mlPerPhUnitBase);
+    }
+}
+
+void HydroControl::setPhAdaptiveConfig(float aggressiveness, float gainAlpha,
+                                       float maxDoseMl, int maxPulseSec, int maxConsecutive) {
+    phAggressiveness = aggressiveness >= 0.05f ? aggressiveness : 0.5f;
+    if (phAggressiveness > 1.0f) phAggressiveness = 1.0f;
+    phGainAlpha = gainAlpha >= 0.05f ? gainAlpha : 0.2f;
+    if (phGainAlpha > 0.5f) phGainAlpha = 0.5f;
+    phMaxDoseMl = maxDoseMl > 0 ? maxDoseMl : 50.0f;
+    phMaxPulseSec = maxPulseSec > 0 ? maxPulseSec : 120;
+    phMaxConsecutive = maxConsecutive > 0 ? maxConsecutive : 5;
+}
+
+void HydroControl::resetPhLearnedGains() {
+    adaptivePhController.setSeedFromMlPerPhUnit(phSetpoint, mlPerPhUnitAcid, mlPerPhUnitBase);
+    adaptivePhController.saveToNVS();
+    phConsecutiveCorrections = 0;
+}
+
+void HydroControl::setPhDoseCallback(PhDoseCallback cb, void* userData) {
+    phDoseCallback = cb;
+    phDoseCallbackUserData = userData;
+}
+
+void HydroControl::setPhGainLearnedCallback(PhGainLearnedCallback cb, void* userData) {
+    phGainLearnedCallback = cb;
+    phGainLearnedCallbackUserData = userData;
+}
+
+float HydroControl::getPhErrorH() const {
+    return AdaptivePHController::errorH(phSetpoint, pH);
 }
 
 void HydroControl::setPhOperationSyncCallback(PhOperationSyncCallback cb, void* userData) {
@@ -1328,51 +1557,152 @@ void HydroControl::notifyPhOperationChanged() {
     }
 }
 
-void HydroControl::startPhAutoDosage(int relay, float durationSec) {
+void HydroControl::startPhAutoDosage(int relay, float durationSec, PhCorrectionPath path,
+                                     float mlApplied, float hBefore, float phBefore) {
+#if PH_PROTOTYPE_RELAX_GUARDS
+    if (relay < 0 || relay >= 8 || durationSec < 0.1f) return;
+#else
     if (relay < 0 || relay >= 8 || durationSec < 0.5f) return;
     if (currentState != IDLE) {
         Serial.println("⚠️ [AUTO PH] EC sequencial ativo — adiando dosagem pH");
         return;
     }
-    int sec = max(1, (int)round(durationSec));
-    toggleRelay(relay, sec);
+#endif
+    const char* pathLabel = (path == PH_PATH_BASE) ? "pH+" : (path == PH_PATH_ACID) ? "pH-" : "pH";
+
     phAutoState = PH_DOSING;
     phActiveRelay = relay;
+    phActivePath = path;
+    phCycleHBefore = hBefore;
+    phCyclePhBefore = phBefore;
+    phCycleMlApplied = mlApplied;
+    phCycleDurationSec = durationSec;
+    phCycleDurationMs = (unsigned long)(durationSec * 1000.0f);
+    if (phCycleDurationMs < 1000UL) {
+        phCycleDurationMs = 1000UL;
+    }
+    phCurrentSequenceId = String(millis());
+    phConsecutiveCorrections++;
     phStateStartMs = millis();
-    Serial.printf("🧪 [AUTO PH] Dosagem relé %d por %d s\n", relay + 1, sec);
+
+    Serial.printf("🚀 [DOSAGEM pH] Iniciando: %s - %.3fml por %.3fs - Relé %d\n",
+        pathLabel, mlApplied, phCycleDurationMs / 1000.0, relay + 1);
+
+    relayStates[relay] = true;
+    bool state = !relayStates[relay];
+    if (relay >= 0 && relay < 8) {
+        if (pcf2_ok) {
+            pcf2.write(relay, state);
+        } else {
+            Serial.println("❌ [RELAY] PCF8574 #2 (0x24) não conectado!");
+        }
+    }
+
+    Serial.printf("✅ [DOSAGEM pH] Ciclo iniciado: %.3f ml, relé %d\n", mlApplied, relay + 1);
     notifyPhOperationChanged();
+}
+
+void HydroControl::finishPhRecirculation() {
+    const float hAfter = AdaptivePHController::toH(pH);
+    const bool kLearned = adaptivePhController.updateGainAfterDose(
+        phActivePath, phCycleHBefore, hAfter, phCycleMlApplied, phGainAlpha);
+
+    if (kLearned && phGainLearnedCallback) {
+        phGainLearnedCallback(phGainLearnedCallbackUserData);
+    }
+
+    if (adaptivePhController.needsAdjustment(phSetpoint, pH, phTolerance)) {
+        // ainda fora da banda — mantém contador consecutivo
+    } else {
+        phConsecutiveCorrections = 0;
+    }
+
+    phAutoState = PH_IDLE;
+    phActiveRelay = -1;
+    phActivePath = PH_PATH_NONE;
+    phCycleDurationMs = 0;
+    lastPHCheck = millis();
+    lastPHCheckAtMs = millis();
+    Serial.println("✅ SEQUÊNCIA pH COMPLETA");
+    notifyPhOperationChanged();
+}
+
+void HydroControl::emitPhDoseEvent() {
+    if (!phDoseCallback) return;
+
+    PhDoseEvent event = {};
+    phCurrentSequenceId.toCharArray(event.sequenceId, sizeof(event.sequenceId));
+    if (phActivePath == PH_PATH_BASE) {
+        strncpy(event.direction, "up", sizeof(event.direction) - 1);
+    } else if (phActivePath == PH_PATH_ACID) {
+        strncpy(event.direction, "down", sizeof(event.direction) - 1);
+    } else {
+        strncpy(event.direction, "none", sizeof(event.direction) - 1);
+    }
+    event.relayNumber = phActiveRelay;
+    event.dosageMl = phCycleMlApplied;
+    event.dosageTimeSeconds = phCycleDurationSec;
+    event.phBefore = phCyclePhBefore;
+    event.phSetpoint = phSetpoint;
+    event.kAcid = adaptivePhController.getKAcid();
+    event.kBase = adaptivePhController.getKBase();
+    event.errorH = AdaptivePHController::errorH(phSetpoint, phCyclePhBefore);
+    event.source = "auto_ph";
+    phDoseCallback(&event, phDoseCallbackUserData);
 }
 
 void HydroControl::processPhAutoState() {
     if (phAutoState == PH_IDLE) return;
-    unsigned long now = millis();
+
+    const unsigned long now = millis();
+    const unsigned long elapsedMs = now - phStateStartMs;
+
     if (phAutoState == PH_DOSING) {
-        int durationMs = (phActiveRelay >= 0 && phActiveRelay < NUM_RELAYS)
-            ? timerSeconds[phActiveRelay] * 1000
-            : 0;
-        unsigned long elapsed = now - phStateStartMs;
-        if (elapsed >= (unsigned long)max(durationMs, 1000)) {
+        if (elapsedMs >= phCycleDurationMs) {
+            if (phActiveRelay >= 0 && phActiveRelay < 8) {
+                relayStates[phActiveRelay] = false;
+                bool state = !relayStates[phActiveRelay];
+                if (pcf2_ok) {
+                    pcf2.write(phActiveRelay, state);
+                }
+                Serial.printf("🔴 [DOSAGEM pH] Relé %d DESLIGADO após %.3fs\n",
+                    phActiveRelay + 1, phCycleDurationMs / 1000.0);
+            }
+
+            emitPhDoseEvent();
+
             phAutoState = PH_RECIRCULATING;
             phStateStartMs = now;
-            Serial.printf("⏳ [AUTO PH] Recirculando %lu s\n", phRecircSeconds);
+            Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n", phRecircSeconds);
             notifyPhOperationChanged();
         }
-    } else if (phAutoState == PH_RECIRCULATING) {
-        if ((now - phStateStartMs) >= phRecircSeconds * 1000UL) {
-            phAutoState = PH_IDLE;
-            phActiveRelay = -1;
-            lastPHCheck = now;
-            lastPHCheckAtMs = now;
-            Serial.println("✅ [AUTO PH] Recirculação concluída");
-            notifyPhOperationChanged();
+        return;
+    }
+
+    if (phAutoState == PH_RECIRCULATING) {
+        if (elapsedMs >= phRecircSeconds * 1000UL) {
+            Serial.println("✅ [RECIRC] Tempo de recirculação concluído");
+            finishPhRecirculation();
         }
     }
 }
 
 void HydroControl::checkAutoPH() {
-    if (!autoPHEnabled) return;
+    if (!autoPHEnabled) {
+        static unsigned long lastPhDebugPrint = 0;
+        const unsigned long now = millis();
+        if (now - lastPhDebugPrint >= 30000) {
+            Serial.println("⚠️ [AUTO pH] auto_enabled = false - ative no frontend primeiro!");
+            Serial.printf("   💡 Valores atuais: setpoint=%.2f, ph=%.2f, tolerance=%.2f\n",
+                phSetpoint, pH, phTolerance);
+            lastPhDebugPrint = now;
+        }
+        return;
+    }
     if (phAutoState != PH_IDLE) return;
+#if !PH_PROTOTYPE_RELAX_GUARDS
     if (currentState != IDLE) return;
+#endif
 
     unsigned long now = millis();
     unsigned long checkInterval = autoPHIntervalSeconds > 0
@@ -1382,23 +1712,68 @@ void HydroControl::checkAutoPH() {
     lastPHCheck = now;
     lastPHCheckAtMs = now;
 
-    if (!phController.needsAdjustment(phSetpoint, pH, phTolerance)) {
+    float phForControl = pH;
+#if !HIDRO_DEV_RELAX_SENSORS
+    if (!isfinite(pH) || !isValidPhReading(pH)) {
+        static unsigned long lastInvalidPhLog = 0;
+        const unsigned long t = millis();
+        if (t - lastInvalidPhLog >= 60000) {
+            lastInvalidPhLog = t;
+            Serial.printf("⚠️ [AUTO PH] Lectura pH inválida (%.2f) — omitiendo ciclo\n", pH);
+        }
+        return;
+    }
+#else
+    if (!isfinite(pH)) {
+        return;
+    }
+#endif
+
+    if (!adaptivePhController.needsAdjustment(phSetpoint, phForControl, phTolerance)) {
+        phConsecutiveCorrections = 0;
+        emitPhControllerMetric(false, false, PH_PATH_NONE, nullptr, "");
         return;
     }
 
-    int direction = phController.getDirection(phSetpoint, pH, phTolerance);
-    if (direction == 0) return;
+#if !PH_PROTOTYPE_RELAX_GUARDS
+    if (phConsecutiveCorrections >= phMaxConsecutive) {
+        Serial.printf("🛑 [AUTO PH] Limite consecutivo (%d) — pausa\n", phMaxConsecutive);
+        return;
+    }
+#endif
 
-    float ml = phController.calculateDosageMl(phSetpoint, pH, mlPerPhUnit);
-    if (ml < 0.1f) return;
+    const PhCorrectionPath path = adaptivePhController.selectPath(phSetpoint, phForControl, phTolerance);
+    if (path == PH_PATH_NONE) {
+        emitPhControllerMetric(true, false, PH_PATH_NONE, nullptr, "");
+        return;
+    }
 
-    int relay = direction > 0 ? relayPhUp : relayPhDown;
-    float flow = direction > 0 ? flowRatePhUp : flowRatePhDown;
-    float durationSec = phController.calculateDosageTime(ml, flow);
+    const float flow = path == PH_PATH_BASE ? flowRatePhUp : flowRatePhDown;
+    const bool commissioning = adaptivePhController.getValidLearningCycles() < 3;
+    const PhDosePlan plan = adaptivePhController.planDose(
+        phSetpoint, phForControl, phTolerance, phAggressiveness, flow,
+        phMaxDoseMl, (float)phMaxPulseSec, commissioning);
 
-    Serial.println("\n🧪 === CONTROLE AUTOMÁTICO pH ===");
-    Serial.printf("📊 pH Atual: %.2f | Setpoint: %.2f | ml: %.3f\n", pH, phSetpoint, ml);
-    startPhAutoDosage(relay, durationSec);
+    if (!plan.valid) {
+        emitPhControllerMetric(true, false, path, &plan, "");
+        return;
+    }
+
+    const int relay = path == PH_PATH_BASE ? relayPhUp : relayPhDown;
+    const float hBefore = AdaptivePHController::toH(phForControl);
+    const float phError = phSetpoint - pH;
+
+    Serial.println("\n🤖 === CONTROLE AUTOMÁTICO pH ===");
+    Serial.printf("📊 pH Atual: %.2f\n", pH);
+    Serial.printf("🎯 pH Setpoint: %.2f\n", phSetpoint);
+    Serial.printf("⚡ Erro: %.2f\n", phError);
+    Serial.printf("💧 u(t) calculado: %.3f ml (domínio H, K=%.3e)\n", plan.doseRealMl, plan.kUsed);
+    Serial.printf("⏱️ Tempo de dosagem: %.2f segundos\n", plan.durationSec);
+    Serial.printf("⏱️  Tempo de dosagem: %.1f segundos\n", plan.durationSec);
+    Serial.println("================================\n");
+
+    startPhAutoDosage(relay, plan.durationSec, path, plan.doseRealMl, hBefore, pH);
+    emitPhControllerMetric(true, true, path, &plan, phCurrentSequenceId);
 }
 
 const char* HydroControl::getPhOperationStateName() const {
@@ -1413,22 +1788,31 @@ const char* HydroControl::getPhOperationStateName() const {
     }
 }
 
-int HydroControl::getPhOperationRemainingSec() const {
-    if (phAutoState == PH_IDLE) return 0;
-    unsigned long elapsed = (millis() - phStateStartMs) / 1000UL;
-    if (phAutoState == PH_DOSING && phActiveRelay >= 0) {
-        long rem = (long)timerSeconds[phActiveRelay] - (long)elapsed;
+int HydroControl::computePhOperationRemainingSec() const {
+    if (phAutoState == PH_IDLE) {
+        return 0;
+    }
+    const unsigned long elapsedMs = millis() - phStateStartMs;
+    if (phAutoState == PH_DOSING) {
+        long rem = (long)(phCycleDurationMs - elapsedMs) / 1000L;
         return rem > 0 ? (int)rem : 0;
     }
     if (phAutoState == PH_RECIRCULATING) {
-        long rem = (long)phRecircSeconds - (long)elapsed;
+        long rem = (long)phRecircSeconds - (long)(elapsedMs / 1000UL);
         return rem > 0 ? (int)rem : 0;
     }
     return 0;
 }
 
+int HydroControl::getPhOperationRemainingSec() const {
+    return computePhOperationRemainingSec();
+}
+
 int HydroControl::getPhNextCheckInSec() const {
-    if (!autoPHEnabled || phAutoState != PH_IDLE || currentState != IDLE) return 0;
+    if (!autoPHEnabled || phAutoState != PH_IDLE) return 0;
+#if !PH_PROTOTYPE_RELAX_GUARDS
+    if (currentState != IDLE) return 0;
+#endif
     unsigned long checkInterval = autoPHIntervalSeconds > 0
         ? (autoPHIntervalSeconds * 1000UL) : 300000UL;
     if (lastPHCheckAtMs == 0) return (int)(checkInterval / 1000UL);

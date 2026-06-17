@@ -164,6 +164,13 @@ void DecisionEngineIntegration::updateSystemStateFromSensors() {
     state.temp_water = hydroControl->getWaterTemp();
     state.temp_environment = hydroControl->getTemperature();
     state.water_level_ok = hydroControl->isWaterLevelOk();
+    state.level_1 = hydroControl->isLevelWet(1);
+    state.level_2 = hydroControl->isLevelWet(2);
+    state.level_3 = hydroControl->isLevelWet(3);
+    state.level_4 = hydroControl->isLevelWet(4);
+    const char* wl = hydroControl->getWaterLevelAggregate();
+    strncpy(state.water_level, wl ? wl : "vazio", sizeof(state.water_level) - 1);
+    state.water_level[sizeof(state.water_level) - 1] = '\0';
     
     // Estados dos relés
     bool* relay_states = hydroControl->getRelayStates();
@@ -174,6 +181,7 @@ void DecisionEngineIntegration::updateSystemStateFromSensors() {
     // Status do sistema
     state.wifi_connected = WiFi.isConnected();
     state.supabase_connected = (supabase && supabase->isReady());
+    state.auto_ph_active = hydroControl->isAutoPHEnabled();
     state.uptime = millis();
     state.free_heap = ESP.getFreeHeap();
     state.last_update = millis();

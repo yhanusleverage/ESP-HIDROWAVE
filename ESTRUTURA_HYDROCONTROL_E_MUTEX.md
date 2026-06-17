@@ -15,6 +15,7 @@ Este documento explica profundamente a estrutura do `HydroControl`, como funcion
 - ✅ **Relés físicos** (via PCF8574 - expansores I/O I2C)
 - ✅ **Sensores** (pH, TDS, temperatura, nível de água)
 - ✅ **ECController** (controlador PID para dosagem proporcional)
+- ✅ **AdaptivePHController** (Auto pH adaptativo en dominio H)
 - ✅ **Sistema sequencial de dosagem** (dosagem de múltiplos nutrientes)
 - ✅ **LCD** (display I2C para status)
 
@@ -108,6 +109,33 @@ private:
 - Executa dosagem sequencial de múltiplos nutrientes
 - Controla intervalo entre nutrientes
 - Máquina de estados (IDLE → DOSING → WAITING → DOSING...)
+
+---
+
+#### E. Auto pH adaptativo (`AdaptivePHController`)
+
+```cpp
+class HydroControl {
+private:
+    AdaptivePHController adaptivePhController;
+    PhAutoState phAutoState;           // PH_IDLE, PH_DOSING, PH_RECIRCULATING
+    float phSetpoint;
+    bool autoPHEnabled;
+    int autoPHIntervalSeconds;
+    int relayPhUp, relayPhDown;
+    // ml/unid, flows, recirc — RAM; poll Supabase (não NVS)
+};
+```
+
+**O que faz:**
+- Control adaptativo en dominio H (`ErroH = H_med - H_sp`)
+- Máquina `phAutoState`: idle → dosing → recirculating → idle
+- Interlock: não dosar se `currentState != IDLE` (EC sequencial activo)
+- NVS boot: `loadPHControllerConfig()` → `ph_setpoint`, `ph_autoEnabled`, `ph_interval`
+- NVS K: `adaptivePhController.loadFromNVS()` → `ph_k_acid`, `ph_k_base`, `ph_k_cycles`
+- Poll remoto: `HydroSystemCore::checkPHConfigFromSupabase()` (relés, flows, ml/unid, auto)
+
+**Handoffs:** [`HIDROWAVE-main/docs/handoffs/ph/00_INDICE_SERIAL.md`](../HIDROWAVE-main/docs/handoffs/ph/00_INDICE_SERIAL.md) — S02 (NVS), S04 (poll), S05 (ciclo)
 
 ---
 

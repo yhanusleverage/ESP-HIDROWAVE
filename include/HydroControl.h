@@ -11,7 +11,9 @@
 #include "PHSensor.h"
 #include "TDSReaderSerial.h"
 #include "LevelSensor.h"
+#include "DiscreteLevelBank.h"
 #include "Controller.h"  // ✅ Controller KP para controle automático de EC
+#include "AdaptivePHController.h"
 #include <ArduinoJson.h>  // ✅ Para JsonArray en executeWebDosage
 #include "PreferencesManager.h"  // ✅ Para persistência em NVS
 #include "freertos/FreeRTOS.h"
@@ -49,6 +51,65 @@ typedef void (*NutrientDoseCallback)(const NutrientDoseEvent* event, void* userD
 typedef void (*EcOperationSyncCallback)(void* userData);
 typedef void (*PhOperationSyncCallback)(void* userData);
 
+/** Evento emitido ao completar dosagem pH (para Supabase ph_dosages). */
+struct PhDoseEvent {
+    char sequenceId[24];
+    char direction[8];
+    int relayNumber;
+    float dosageMl;
+    float dosageTimeSeconds;
+    float phBefore;
+    float phSetpoint;
+    float kAcid;
+    float kBase;
+    float errorH;
+    const char* source;
+};
+
+typedef void (*PhDoseCallback)(const PhDoseEvent* event, void* userData);
+typedef void (*PhGainLearnedCallback)(void* userData);
+
+/** Métricas de ciclo Auto EC (cada checkAutoEC con PV válido). */
+struct EcControllerMetricEvent {
+    float ecSetpoint;
+    float ecActual;
+    float ecError;
+    float kValue;
+    float dosageMl;
+    float dosageTimeSeconds;
+    float baseDose;
+    float flowRate;
+    float volume;
+    float totalMl;
+    float kp;
+    bool autoEnabled;
+    bool adjustmentNeeded;
+    bool adjustmentApplied;
+    char sequenceId[24];
+};
+
+/** Métricas de ciclo Auto pH (cada checkAutoPH con PV válido). */
+struct PhControllerMetricEvent {
+    float phSetpoint;
+    float phBefore;
+    float errorH;
+    char direction[8];
+    float kAcid;
+    float kBase;
+    float kUsed;
+    float doseIdealMl;
+    float doseRealMl;
+    float dosageTimeSeconds;
+    float aggressiveness;
+    bool autoEnabled;
+    bool adjustmentNeeded;
+    bool adjustmentApplied;
+    char sequenceId[24];
+};
+
+typedef void (*EcMetricCallback)(const EcControllerMetricEvent* event, void* userData);
+typedef void (*PhMetricCallback)(const PhControllerMetricEvent* event, void* userData);
+
 class HydroControl {
 public:
     #ifndef NUM_RELAYS
@@ -70,6 +131,9 @@ public:
     bool* getRelayStates() { return relayStates; }
     bool areSensorsWorking() { return sensorsOk; }
     bool isWaterLevelOk() { return tankLevelOk; }
+    bool isLevelWet(int levelIndex) const;
+    const char* getWaterLevelAggregate() const;
+    bool isDiscreteLevelBankActive() const { return levelBank.isAvailable(); }
     
     // Getters para leituras dos sensores
     float& getTemperature() { return temperature; }
@@ -98,14 +162,17 @@ public:
     unsigned long getTempoRecirculacaoSeconds() const { return tempoRecirculacaoSeconds; }
     void setNutrientDoseCallback(NutrientDoseCallback cb, void* userData);
     void setEcOperationSyncCallback(EcOperationSyncCallback cb, void* userData);
+    void setEcMetricCallback(EcMetricCallback cb, void* userData);
+    void setPhMetricCallback(PhMetricCallback cb, void* userData);
 
     /** Estado operacional Auto EC para UI (relay_master.ec_operation_*). */
     const char* getEcOperationStateName() const;
     int getEcOperationRemainingSec() const;
     int getEcNextCheckInSec() const;
 
-    // ✅ Auto pH
-    PHController& getPHController() { return phController; }
+    // ✅ Auto pH adaptativo
+    AdaptivePHController& getAdaptivePHController() { return adaptivePhController; }
+    const AdaptivePHController& getAdaptivePHController() const { return adaptivePhController; }
     void setPHSetpoint(float setpoint, bool saveToNVS = true);
     float getPHSetpoint() const { return phSetpoint; }
     void setPHTolerance(float tolerance) { phTolerance = tolerance; }
@@ -114,7 +181,14 @@ public:
     bool isAutoPHEnabled() const { return autoPHEnabled; }
     void setAutoPHInterval(int intervalSeconds, bool saveToNVS = true);
     int getAutoPHInterval() const { return autoPHIntervalSeconds; }
-    void setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown, float mlPerUnit);
+    void setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
+                         float mlPerUnitAcid, float mlPerUnitBase);
+    void setPhAdaptiveConfig(float aggressiveness, float gainAlpha,
+                             float maxDoseMl, int maxPulseSec, int maxConsecutive);
+    void resetPhLearnedGains();
+    void setPhDoseCallback(PhDoseCallback cb, void* userData);
+    void setPhGainLearnedCallback(PhGainLearnedCallback cb, void* userData);
+    float getPhErrorH() const;
     void setPhRecirculacaoSeconds(unsigned long seconds) { phRecircSeconds = seconds > 0 ? seconds : 60; }
     void setPhOperationSyncCallback(PhOperationSyncCallback cb, void* userData);
     const char* getPhOperationStateName() const;
@@ -157,6 +231,7 @@ private:
     phSensor* pHSensor;
     TDSReaderSerial* tdsSensor;
     LevelSensor* tankSensor;
+    DiscreteLevelBank levelBank;
     
     // Status dos PCF8574
     bool pcf1_ok;
@@ -197,8 +272,8 @@ private:
     EcOperationSyncCallback ecOperationSyncCallback;
     void* ecOperationSyncCallbackUserData;
 
-    // ✅ Auto pH
-    PHController phController;
+    // ✅ Auto pH adaptativo
+    AdaptivePHController adaptivePhController;
     float phSetpoint;
     float phTolerance;
     bool autoPHEnabled;
@@ -209,14 +284,36 @@ private:
     int relayPhDown;
     float flowRatePhUp;
     float flowRatePhDown;
-    float mlPerPhUnit;
+    float mlPerPhUnitAcid;
+    float mlPerPhUnitBase;
+    float phAggressiveness;
+    float phGainAlpha;
+    float phMaxDoseMl;
+    int phMaxPulseSec;
+    int phMaxConsecutive;
+    int phConsecutiveCorrections;
     unsigned long phRecircSeconds;
     enum PhAutoState { PH_IDLE, PH_DOSING, PH_RECIRCULATING };
     PhAutoState phAutoState;
     unsigned long phStateStartMs;
     int phActiveRelay;
+    PhCorrectionPath phActivePath;
+    float phCycleHBefore;
+    float phCyclePhBefore;
+    float phCycleMlApplied;
+    float phCycleDurationSec;
+    unsigned long phCycleDurationMs;
+    String phCurrentSequenceId;
     PhOperationSyncCallback phOperationSyncCallback;
     void* phOperationSyncCallbackUserData;
+    PhDoseCallback phDoseCallback;
+    void* phDoseCallbackUserData;
+    EcMetricCallback ecMetricCallback;
+    void* ecMetricCallbackUserData;
+    PhMetricCallback phMetricCallback;
+    void* phMetricCallbackUserData;
+    PhGainLearnedCallback phGainLearnedCallback;
+    void* phGainLearnedCallbackUserData;
     
     // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
     unsigned long lastDosageCompleteTime;  // Timestamp da última dosagem completa
@@ -260,11 +357,22 @@ private:
     void emitNutrientDoseEvent(const SimpleNutrient& nutrient);
     void notifyEcOperationChanged();
     void notifyPhOperationChanged();
-    void startPhAutoDosage(int relay, float durationSec);
+    void startPhAutoDosage(int relay, float durationSec, PhCorrectionPath path,
+                           float mlApplied, float hBefore, float phBefore);
+    void finishPhRecirculation();
+    void emitPhDoseEvent();
+    void emitEcControllerMetric(bool adjustmentNeeded, bool adjustmentApplied,
+                                float dosageMl, float dosageTimeSec, float ecError,
+                                const String& sequenceId);
+    void emitPhControllerMetric(bool adjustmentNeeded, bool adjustmentApplied,
+                                PhCorrectionPath path, const PhDosePlan* plan,
+                                const String& sequenceId);
     int computeEcOperationRemainingSec() const;
+    int computePhOperationRemainingSec() const;
     
     // ✅ Persistência em NVS (privadas - carregamento automático)
     void loadECControllerConfig();  // Carregar configuração do Controller ao iniciar
+    void loadPHControllerConfig();  // Carregar SP/auto/interval pH do NVS ao iniciar
     void loadNutrientProportions();  // Carregar proporções nutricionais ao iniciar
 };
 

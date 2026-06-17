@@ -129,8 +129,13 @@
 #define TDS_RX_PIN 36                  // Sensor TDS (RX) - CORRIGIDO: pino ADC válido
 #define TDS_TX_PIN 17                  // Sensor TDS (TX)
 #define TEMP_PIN 4                     // Sensor de temperatura DS18B20
-#define TANK_LOW_PIN 32                // Sensor de nível baixo
-#define TANK_HIGH_PIN 33               // Sensor de nível alto
+#define TANK_LOW_PIN 32                // Sensor de nível baixo (legacy GPIO)
+#define TANK_HIGH_PIN 33               // Sensor de nível alto (legacy GPIO)
+
+// ===== 4 SONDAS NPN VIA PCF8574 #1 (P0-P3) =====
+#define LEVEL_DEBOUNCE_MS 300
+#define LEVEL_NPN_ACTIVE_LOW 1         // NPN ON → LOW no PCF (após opto)
+#define LEVEL_SENSOR_PCF_PINS 0, 1, 2, 3
 #define WATER_TEMP_PIN 25              // Sensor de temperatura da água
 #define WATER_LEVEL_NPN_PIN 32         // Sensor de nível NPN
 #define WATER_LEVEL_PNP_PIN 33         // Sensor de nível PNP
@@ -165,6 +170,16 @@
 // ===== LIMITES DE SENSORES =====
 #define MIN_PH 0.0
 #define MAX_PH 14.0
+
+// Auto pH: 1 = prototipo (relaja guards G4/G5/G9-G11/G14); 0 = producción
+#ifndef PH_PROTOTYPE_RELAX_GUARDS
+#define PH_PROTOTYPE_RELAX_GUARDS 1
+#endif
+
+// Banco/dev: 1 = sin interlocks por sensor (métricas + telemetría parcial); 0 = producción
+#ifndef HIDRO_DEV_RELAX_SENSORS
+#define HIDRO_DEV_RELAX_SENSORS 1
+#endif
 #define MIN_TDS 0.0
 #define MAX_TDS 5000.0
 #define MIN_TEMP 0.0

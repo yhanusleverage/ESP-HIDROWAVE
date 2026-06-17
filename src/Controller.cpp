@@ -16,7 +16,7 @@ void ECController::setParameters(float baseDose, float flowRate, float volume, f
     this->totalMl = totalMl;
 }
 
-float ECController::calculateK() {
+float ECController::calculateK() const {
     // k = EC base / mililitros totais
     if (totalMl > 0) {
         return baseDose / totalMl;

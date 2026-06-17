@@ -48,6 +48,7 @@ ESP-HIDROWAVE-main/infra/mqtt/
 | MVP soak hydro | 📄 [MVP_SOAK_CHECKLIST.md](./MVP_SOAK_CHECKLIST.md) |
 | **MVP device_status (AGORA)** | 📄 [MVP_DEVICE_STATUS_HEARTBEAT.md](./MVP_DEVICE_STATUS_HEARTBEAT.md) |
 | Próximo: comandos híbridos | Fase 3 em [03_PLANO_IMPLEMENTACAO_FASES.md](./03_PLANO_IMPLEMENTACAO_FASES.md) |
+| Auto pH MQTT (paridad EC) | `ph_operation` + `ph_dose` — ver [04_MODELAGEM](./04_MODELAGEM_TOPICOS_PAYLOADS.md) §3.7–3.8 y handoff pH en HIDROWAVE-main |
 
 ## Regra do projeto
 

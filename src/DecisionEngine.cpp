@@ -2,6 +2,61 @@
 #include "MasterSlaveManager.h"  // ✅ Normalizado: usar MasterSlaveManager en lugar de ESPNowTask
 #include <LittleFS.h>
 
+namespace {
+
+bool levelLabelExpectsWet(const String& label) {
+    if (label == "alto" || label == "mojado" || label == "cheio" || label == "on" || label == "true") {
+        return true;
+    }
+    if (label == "vazio" || label == "seco" || label == "baixo" || label == "off" || label == "false") {
+        return false;
+    }
+    return false;
+}
+
+bool getLevelWetFromState(const String& sensorName, const SystemState& state) {
+    if (sensorName == "level_1") return state.level_1;
+    if (sensorName == "level_2") return state.level_2;
+    if (sensorName == "level_3") return state.level_3;
+    if (sensorName == "level_4") return state.level_4;
+    return false;
+}
+
+bool evaluateDiscreteLevelCondition(const RuleCondition& condition, const SystemState& state) {
+    const bool actualWet = getLevelWetFromState(condition.sensor_name, state);
+    const String expected = condition.string_value.length() > 0
+        ? condition.string_value
+        : String(condition.value_min > 0.5f ? "alto" : "vazio");
+    const bool expectWet = levelLabelExpectsWet(expected);
+
+    switch (condition.op) {
+        case OP_EQUAL:
+            return actualWet == expectWet;
+        case OP_NOT_EQUAL:
+            return actualWet != expectWet;
+        default:
+            return false;
+    }
+}
+
+bool evaluateWaterLevelCondition(const RuleCondition& condition, const SystemState& state) {
+    const String actual = String(state.water_level);
+    const String expected = condition.string_value.length() > 0
+        ? condition.string_value
+        : String("medio");
+
+    switch (condition.op) {
+        case OP_EQUAL:
+            return actual.equalsIgnoreCase(expected);
+        case OP_NOT_EQUAL:
+            return !actual.equalsIgnoreCase(expected);
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 // ===== CONSTRUTOR E DESTRUTOR =====
 DecisionEngine::DecisionEngine() : 
     last_evaluation(0),
@@ -205,6 +260,11 @@ void DecisionEngine::evaluateAllRules() {
     
     for (auto& rule : rules) {
         if (!rule.enabled) continue;
+
+        // Mutex Auto pH: não executar ph_low_control quando Auto pH está ativo
+        if (rule.id == "ph_low_control" && current_state.auto_ph_active) {
+            continue;
+        }
         
         // Verificar cooldown
         if (isInCooldown(rule)) continue;
@@ -249,8 +309,14 @@ bool DecisionEngine::evaluateCondition(const RuleCondition& condition, const Sys
     
     switch (condition.type) {
         case SENSOR_COMPARE: {
-            float sensor_value = getSensorValue(condition.sensor_name, state);
-            result = compareValues(sensor_value, condition.op, condition.value_min, condition.value_max);
+            if (condition.sensor_name == "water_level") {
+                result = evaluateWaterLevelCondition(condition, state);
+            } else if (condition.sensor_name.startsWith("level_")) {
+                result = evaluateDiscreteLevelCondition(condition, state);
+            } else {
+                float sensor_value = getSensorValue(condition.sensor_name, state);
+                result = compareValues(sensor_value, condition.op, condition.value_min, condition.value_max);
+            }
             break;
         }
         

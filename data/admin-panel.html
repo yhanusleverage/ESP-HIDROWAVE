@@ -8,7 +8,7 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
             font-family: system-ui, -apple-system, sans-serif;
-            background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
+            background: linear-gradient(135deg, #e0f2fe 0%, #b2ebf2 50%, #e0f7fa 100%);
             min-height: 100vh;
             padding: 1rem;
         }
@@ -25,9 +25,16 @@
             text-align: center;
         }
         .header h1 {
-            color: #1e40af;
+            color: #1e293b;
             font-size: 2rem;
             margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+        }
+        .header h1 .brand-wave {
+            color: #0284c7;
         }
         .status-indicator {
             display: inline-flex;
@@ -308,7 +315,14 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>ESP32 Hidropônico - Painel Admin</h1>
+            <h1>
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="36" height="36" fill="none" aria-hidden="true">
+                    <g transform="translate(4 4)">
+                        <path d="M18 7V4H6l6 8-6 8h12v-3" stroke="#0284c7" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/>
+                    </g>
+                </svg>
+                <span>Hydro<span class="brand-wave">Wave</span> — Painel Admin</span>
+            </h1>
             <div id="connection-status" class="status-indicator status-disconnected">
                 <span>●</span>
                 <span>Desconectado</span>

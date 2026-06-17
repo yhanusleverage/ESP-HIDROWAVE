@@ -182,15 +182,23 @@ public:
             consecutiveFailures = 0;
             lastSuccessfulOperation = now;
         } else {
-            // 404/401/400 = schema/auth — não é falha de rede; evita reboot em loop
-            const bool schemaOrClientError = (httpCode == 404 || httpCode == 401 || httpCode == 400);
-            if (schemaOrClientError) {
-                Serial.printf("⚠️ [NETWORK_WDT] HTTP %d (config/schema) — não conta para reboot\n", httpCode);
+            // Operação falhou - incrementar contador
+            // 409 = dedup (bridge já persistiu); <=0 = SSL OOM / transporte — não forçar reboot
+            const bool duplicateOk = (httpCode == 409);
+            const bool transportGlitch = (httpCode <= 0);
+            const bool nonFatalClient = (httpCode == 404 || httpCode == 401 || httpCode == 400);
+            if (duplicateOk || transportGlitch || nonFatalClient) {
+                if (duplicateOk) {
+                    Serial.println("ℹ️ [NETWORK_WDT] HTTP 409 duplicate — não conta para reboot");
+                } else if (transportGlitch) {
+                    Serial.printf("ℹ️ [NETWORK_WDT] HTTP %d (SSL/transporte) — não conta para reboot\n", httpCode);
+                } else {
+                    Serial.printf("⚠️ [NETWORK_WDT] HTTP %d (config/schema) — não conta para reboot\n", httpCode);
+                }
                 esp_task_wdt_reset();
                 vTaskDelay(pdMS_TO_TICKS(50));
                 return;
             }
-            // Operação falhou - incrementar contador
             consecutiveFailures++;
             Serial.printf("⚠️ [NETWORK_WDT] Fallo #%d consecutivo\n", consecutiveFailures);
             

@@ -1,4 +1,5 @@
 #include "MqttClient.h"
+#include "SensorSanitize.h"
 
 #if ENABLE_MQTT
 
@@ -64,6 +65,10 @@ bool MqttClientWrapper::begin(const String& id) {
     commandTopic = String("hidrowave/") + deviceId + "/command";
     ecOperationTopic = String("hidrowave/") + deviceId + "/ec_operation";
     doseTopic = String("hidrowave/") + deviceId + "/dose";
+    phOperationTopic = String("hidrowave/") + deviceId + "/ph_operation";
+    phDoseTopic = String("hidrowave/") + deviceId + "/ph_dose";
+    ecMetricTopic = String("hidrowave/") + deviceId + "/ec_metric";
+    phMetricTopic = String("hidrowave/") + deviceId + "/ph_metric";
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     callbackInstance = this;
     mqtt.setCallback(mqttMessageCallback);
@@ -80,9 +85,11 @@ bool MqttClientWrapper::begin(const String& id) {
     serializeJson(lwtDoc, lwtPayload, sizeof(lwtPayload));
 
     Serial.printf("[MQTT] Broker %s:%d\n", MQTT_HOST, MQTT_PORT);
-    Serial.printf("[MQTT] topics telemetry=%s heartbeat=%s status=%s command=%s ec_op=%s dose=%s\n",
+    Serial.printf("[MQTT] topics telemetry=%s heartbeat=%s status=%s command=%s ec_op=%s dose=%s ph_op=%s ph_dose=%s ec_metric=%s ph_metric=%s\n",
                   telemetryTopic.c_str(), heartbeatTopic.c_str(), statusTopic.c_str(),
-                  commandTopic.c_str(), ecOperationTopic.c_str(), doseTopic.c_str());
+                  commandTopic.c_str(), ecOperationTopic.c_str(), doseTopic.c_str(),
+                  phOperationTopic.c_str(), phDoseTopic.c_str(),
+                  ecMetricTopic.c_str(), phMetricTopic.c_str());
     return ensureConnected();
 }
 
@@ -155,17 +162,53 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
         return false;
     }
 
-    StaticJsonDocument<256> doc;
+    const float waterTemp = sanitizeSensorRange(reading.temperature, MIN_TEMP, MAX_TEMP);
+    const float ph = sanitizeSensorRange(reading.ph, MIN_PH, MAX_PH);
+    const float tds = sanitizeSensorRange(reading.tds, MIN_TDS, MAX_TDS);
+
+#if !HIDRO_DEV_RELAX_SENSORS
+    if (isnan(waterTemp) || isnan(ph) || isnan(tds)) {
+        Serial.println("[MQTT] telemetry skipped — lecturas hidro inválidas");
+        return false;
+    }
+#endif
+
+    StaticJsonDocument<384> doc;
     doc["v"] = 1;
     doc["device_id"] = deviceId;
-    doc["temperature"] = reading.temperature;
-    doc["ph"] = reading.ph;
-    doc["tds"] = reading.tds;
+#if HIDRO_DEV_RELAX_SENSORS
+    if (isfinite(reading.temperature)) {
+        doc["temperature"] = reading.temperature;
+    }
+    if (isfinite(reading.ph)) {
+        doc["ph"] = reading.ph;
+    }
+    if (isfinite(reading.tds)) {
+        doc["tds"] = reading.tds;
+    }
+    const float ecRaw = reading.tds >= 0 && isfinite(reading.tds) ? reading.tds * 2.0f : NAN;
+    if (isfinite(ecRaw)) {
+        doc["ec"] = round(ecRaw * 100.0) / 100.0;
+    }
+#else
+    doc["temperature"] = waterTemp;
+    doc["ph"] = ph;
+    doc["tds"] = tds;
+#endif
     doc["water_level_ok"] = reading.waterLevelOk;
-    doc["air_temp"] = reading.airTemperature;
-    doc["humidity"] = reading.humidity;
+    doc["level_1"] = reading.level1Wet;
+    doc["level_2"] = reading.level2Wet;
+    doc["level_3"] = reading.level3Wet;
+    doc["level_4"] = reading.level4Wet;
+    if (reading.waterLevel && reading.waterLevel[0]) {
+        doc["water_level"] = reading.waterLevel;
+    }
+    if (isValidEnvironmentReading(reading.airTemperature, reading.humidity)) {
+        doc["air_temp"] = reading.airTemperature;
+        doc["humidity"] = reading.humidity;
+    }
 
-    char payload[256];
+    char payload[384];
     size_t len = serializeJson(doc, payload, sizeof(payload));
     if (len == 0) {
         return false;
@@ -271,6 +314,169 @@ bool MqttClientWrapper::publishDose(const MqttDoseReading& reading) {
                       reading.relayNumber + 1);
     } else {
         Serial.println("[MQTT] dose publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishPhOperation(const MqttPhOperationReading& reading) {
+    if (!ensureConnected()) {
+        return false;
+    }
+
+    StaticJsonDocument<256> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ph_operation_state"] = reading.state ? reading.state : "idle";
+    doc["ph_operation_remaining_sec"] = reading.operationRemainingSec > 0 ? reading.operationRemainingSec : 0;
+    doc["ph_next_check_in_sec"] = reading.nextCheckInSec > 0 ? reading.nextCheckInSec : 0;
+
+    char payload[256];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(phOperationTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ph_operation %s rem=%ds next=%ds\n",
+                      reading.state ? reading.state : "idle",
+                      reading.operationRemainingSec,
+                      reading.nextCheckInSec);
+    } else {
+        Serial.println("[MQTT] ph_operation publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishPhDose(const MqttPhDoseReading& reading) {
+    if (!ensureConnected()) {
+        return false;
+    }
+
+    StaticJsonDocument<512> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["sequence_id"] = reading.sequenceId ? reading.sequenceId : "";
+    doc["direction"] = reading.direction ? reading.direction : "";
+    doc["relay_number"] = reading.relayNumber;
+    doc["dosage_ml"] = round(reading.dosageMl * 1000.0) / 1000.0;
+    doc["dosage_time_seconds"] = round(reading.dosageTimeSeconds * 100.0) / 100.0;
+    doc["ph_before"] = round(reading.phBefore * 100.0) / 100.0;
+    doc["ph_setpoint"] = round(reading.phSetpoint * 100.0) / 100.0;
+    doc["source"] = reading.source && reading.source[0] ? reading.source : "auto_ph";
+
+    char payload[512];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(phDoseTopic.c_str(), payload, true);
+    if (published) {
+        Serial.printf("[MQTT] ph_dose %s %.2f ml relé %d\n",
+                      reading.direction ? reading.direction : "?",
+                      reading.dosageMl,
+                      reading.relayNumber + 1);
+    } else {
+        Serial.println("[MQTT] ph_dose publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishEcMetric(const MqttEcMetricReading& reading) {
+    if (!ensureConnected()) {
+        return false;
+    }
+
+    StaticJsonDocument<768> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ec_setpoint"] = round(reading.ecSetpoint * 100.0) / 100.0;
+    doc["ec_actual"] = round(reading.ecActual * 100.0) / 100.0;
+    doc["ec_error"] = round(reading.ecError * 100.0) / 100.0;
+    doc["k_value"] = reading.kValue;
+    doc["dosage_ml"] = round(reading.dosageMl * 1000.0) / 1000.0;
+    doc["dosage_time_seconds"] = round(reading.dosageTimeSeconds * 100.0) / 100.0;
+    doc["base_dose"] = reading.baseDose;
+    doc["flow_rate"] = reading.flowRate;
+    doc["volume"] = reading.volume;
+    doc["total_ml"] = reading.totalMl;
+    doc["kp"] = reading.kp;
+    doc["auto_enabled"] = reading.autoEnabled;
+    doc["adjustment_needed"] = reading.adjustmentNeeded;
+    doc["adjustment_applied"] = reading.adjustmentApplied;
+    if (reading.sequenceId && reading.sequenceId[0]) {
+        doc["sequence_id"] = reading.sequenceId;
+    }
+
+    char payload[768];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(ecMetricTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ec_metric err=%.0f u(t)=%.2fml adj=%d\n",
+                      reading.ecError, reading.dosageMl, reading.adjustmentApplied ? 1 : 0);
+    } else {
+        Serial.println("[MQTT] ec_metric publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishPhMetric(const MqttPhMetricReading& reading) {
+    if (!ensureConnected()) {
+        return false;
+    }
+
+    StaticJsonDocument<768> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ph_setpoint"] = round(reading.phSetpoint * 1000.0) / 1000.0;
+    float phBeforeMetric = reading.phBefore;
+#if HIDRO_DEV_RELAX_SENSORS
+    if (isfinite(phBeforeMetric)) {
+        if (phBeforeMetric > 99.999f) phBeforeMetric = 99.999f;
+        else if (phBeforeMetric < -99.999f) phBeforeMetric = -99.999f;
+    }
+#endif
+    doc["ph_before"] = round(phBeforeMetric * 1000.0) / 1000.0;
+    float errorH = reading.errorH;
+    if (!isfinite(errorH)) {
+        const float linearErr = reading.phSetpoint - reading.phBefore;
+        errorH = isfinite(linearErr) ? linearErr * 1e-6f : 0.0f;
+    }
+    doc["error_h"] = errorH;
+    if (reading.direction && reading.direction[0]) {
+        doc["direction"] = reading.direction;
+    }
+    doc["k_acid"] = reading.kAcid;
+    doc["k_base"] = reading.kBase;
+    doc["k_used"] = reading.kUsed;
+    doc["dose_ideal_ml"] = round(reading.doseIdealMl * 1000.0) / 1000.0;
+    doc["dose_real_ml"] = round(reading.doseRealMl * 1000.0) / 1000.0;
+    doc["dosage_time_seconds"] = round(reading.dosageTimeSeconds * 100.0) / 100.0;
+    doc["aggressiveness"] = reading.aggressiveness;
+    doc["auto_enabled"] = reading.autoEnabled;
+    doc["adjustment_needed"] = reading.adjustmentNeeded;
+    doc["adjustment_applied"] = reading.adjustmentApplied;
+    if (reading.sequenceId && reading.sequenceId[0]) {
+        doc["sequence_id"] = reading.sequenceId;
+    }
+
+    char payload[768];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(phMetricTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ph_metric errH=%.3e u(t)=%.2fml adj=%d\n",
+                      reading.errorH, reading.doseRealMl, reading.adjustmentApplied ? 1 : 0);
+    } else {
+        Serial.println("[MQTT] ph_metric publish failed");
     }
     return published;
 }

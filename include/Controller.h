@@ -32,6 +32,8 @@ public:
     // Função para verificar se precisa de ajuste
     bool needsAdjustment(float ecSetpoint, float ecActual, float tolerance = 50.0);
 
+    float getKValue() const { return calculateK(); }
+
 private:
     float baseDose;     // EC base em µS/cm (1525)
     float flowRate;     // Taxa de vazão peristáltica em ml/s (0.974)
@@ -40,7 +42,7 @@ private:
     float Kp;           // Ganho proporcional (1.0)
     
     // Função para calcular k
-    float calculateK();
+    float calculateK() const;
 };
 
 /** Controlador proporcional bidirecional para pH (pH+ / pH-). */

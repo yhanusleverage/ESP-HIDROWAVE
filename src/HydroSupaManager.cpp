@@ -145,6 +145,11 @@ void HydroSupaManager::sendHttpData() {
         .ph = 6.5,
         .tds = 850.0,
         .waterLevelOk = true,
+        .level1Wet = false,
+        .level2Wet = false,
+        .level3Wet = true,
+        .level4Wet = true,
+        .waterLevel = "medio",
         .timestamp = millis()
     };
     
