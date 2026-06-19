@@ -37,6 +37,8 @@ HydroControl::HydroControl()
     nutrientDoseCallbackUserData = nullptr;
     ecOperationSyncCallback = nullptr;
     ecOperationSyncCallbackUserData = nullptr;
+    physicalRecircCallback = nullptr;
+    physicalRecircCallbackUserData = nullptr;
     ecMetricCallback = nullptr;
     ecMetricCallbackUserData = nullptr;
 
@@ -76,6 +78,7 @@ HydroControl::HydroControl()
     phMetricCallbackUserData = nullptr;
     phGainLearnedCallback = nullptr;
     phGainLearnedCallbackUserData = nullptr;
+    tankScriptHoldUntilMs = 0;
     
     // ✅ Inicializar sistema sequencial de dosagem
     currentState = IDLE;
@@ -502,6 +505,29 @@ String HydroControl::getTankStatus() {
     return tankSensor->getStatus();
 }
 
+bool HydroControl::isAutoDosingPausedByInterlock() const {
+    if (!tankLevelOk) {
+        return true;
+    }
+    const unsigned long now = millis();
+    return tankScriptHoldUntilMs > 0 && now < tankScriptHoldUntilMs;
+}
+
+void HydroControl::holdAutoDosingForTankScript(unsigned long durationMs) {
+    if (durationMs < TANK_SCRIPT_HOLD_MIN_MS) {
+        durationMs = TANK_SCRIPT_HOLD_MIN_MS;
+    }
+    const unsigned long until = millis() + durationMs;
+    if (until > tankScriptHoldUntilMs) {
+        tankScriptHoldUntilMs = until;
+        Serial.printf(
+            "🔒 [INTERLOCK P1] Auto EC/pH pausados ~%lu s (script tanque priority >= %d)\n",
+            durationMs / 1000UL,
+            TANK_SCRIPT_PRIORITY_THRESHOLD
+        );
+    }
+}
+
 // ✅ Função para verificar e ajustar EC automaticamente
 void HydroControl::checkAutoEC() {
     // Se controle automático não está habilitado, não fazer nada
@@ -513,6 +539,20 @@ void HydroControl::checkAutoEC() {
             Serial.printf("   💡 Valores atuais: setpoint=%.0f, ec=%.0f, base_dose=%.2f\n", 
                 ecSetpoint, ec, ecController.getBaseDose());
             lastDebugPrint = now;
+        }
+        return;
+    }
+
+    if (isAutoDosingPausedByInterlock()) {
+        static unsigned long lastEcInterlockLog = 0;
+        const unsigned long nowMs = millis();
+        if (nowMs - lastEcInterlockLog >= 60000UL) {
+            lastEcInterlockLog = nowMs;
+            if (!tankLevelOk) {
+                Serial.println("⚠️ [AUTO EC] Pausado — nível de água baixo (water_level_ok=false)");
+            } else {
+                Serial.println("⚠️ [AUTO EC] Pausado — script tanque P1 activo");
+            }
         }
         return;
     }
@@ -601,6 +641,7 @@ void HydroControl::processSimpleSequential() {
     if (currentState == RECIRCULATING) {
         unsigned long elapsedSec = (currentTime - stateStartTime) / 1000UL;
         if (elapsedSec >= tempoRecirculacaoSeconds) {
+            notifyPhysicalRecirc(false, "ec");
             Serial.println("✅ [RECIRC] Tempo de recirculação concluído");
             currentState = IDLE;
             totalNutrients = 0;
@@ -644,6 +685,7 @@ void HydroControl::processSimpleSequential() {
                     Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n",
                         tempoRecirculacaoSeconds);
                     showMessage("Recirculando...");
+                    notifyPhysicalRecirc(true, "ec");
                     notifyEcOperationChanged();
                 } else {
                     currentState = IDLE;
@@ -922,6 +964,10 @@ void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
 void HydroControl::cancelCurrentDosage() {
     if (currentState != IDLE) {
         Serial.println("\n🛑 CANCELANDO DOSAGEM SEQUENCIAL EM ANDAMENTO...");
+
+        if (currentState == RECIRCULATING) {
+            notifyPhysicalRecirc(false, "ec");
+        }
         
         if (currentState == DOSING) {
             // Desligar relé atual imediatamente
@@ -1281,6 +1327,11 @@ void HydroControl::setEcOperationSyncCallback(EcOperationSyncCallback cb, void* 
     ecOperationSyncCallbackUserData = userData;
 }
 
+void HydroControl::setPhysicalRecircCallback(PhysicalRecircCallback cb, void* userData) {
+    physicalRecircCallback = cb;
+    physicalRecircCallbackUserData = userData;
+}
+
 void HydroControl::setEcMetricCallback(EcMetricCallback cb, void* userData) {
     ecMetricCallback = cb;
     ecMetricCallbackUserData = userData;
@@ -1357,6 +1408,12 @@ void HydroControl::emitPhControllerMetric(bool adjustmentNeeded, bool adjustment
 void HydroControl::notifyEcOperationChanged() {
     if (ecOperationSyncCallback) {
         ecOperationSyncCallback(ecOperationSyncCallbackUserData);
+    }
+}
+
+void HydroControl::notifyPhysicalRecirc(bool starting, const char* domain) {
+    if (physicalRecircCallback) {
+        physicalRecircCallback(starting, domain, physicalRecircCallbackUserData);
     }
 }
 
@@ -1603,6 +1660,7 @@ void HydroControl::startPhAutoDosage(int relay, float durationSec, PhCorrectionP
 }
 
 void HydroControl::finishPhRecirculation() {
+    notifyPhysicalRecirc(false, "ph");
     const float hAfter = AdaptivePHController::toH(pH);
     const bool kLearned = adaptivePhController.updateGainAfterDose(
         phActivePath, phCycleHBefore, hAfter, phCycleMlApplied, phGainAlpha);
@@ -1674,6 +1732,7 @@ void HydroControl::processPhAutoState() {
             phAutoState = PH_RECIRCULATING;
             phStateStartMs = now;
             Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n", phRecircSeconds);
+            notifyPhysicalRecirc(true, "ph");
             notifyPhOperationChanged();
         }
         return;
@@ -1700,6 +1759,21 @@ void HydroControl::checkAutoPH() {
         return;
     }
     if (phAutoState != PH_IDLE) return;
+
+    if (isAutoDosingPausedByInterlock()) {
+        static unsigned long lastPhInterlockLog = 0;
+        const unsigned long nowMs = millis();
+        if (nowMs - lastPhInterlockLog >= 60000UL) {
+            lastPhInterlockLog = nowMs;
+            if (!tankLevelOk) {
+                Serial.println("⚠️ [AUTO PH] Pausado — nível de água baixo (water_level_ok=false)");
+            } else {
+                Serial.println("⚠️ [AUTO PH] Pausado — script tanque P1 activo");
+            }
+        }
+        return;
+    }
+
 #if !PH_PROTOTYPE_RELAX_GUARDS
     if (currentState != IDLE) return;
 #endif

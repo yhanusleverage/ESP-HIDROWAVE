@@ -180,6 +180,16 @@
 #ifndef HIDRO_DEV_RELAX_SENSORS
 #define HIDRO_DEV_RELAX_SENSORS 1
 #endif
+
+// Grow cycle P1: pausar Auto EC/pH mientras script tanque (priority >= umbral)
+#define TANK_SCRIPT_PRIORITY_THRESHOLD 80
+#define TANK_SCRIPT_HOLD_MIN_MS 60000UL
+#define TANK_SCRIPT_HOLD_BUFFER_MS 30000UL
+#define TANK_SCRIPT_HOLD_DEFAULT_MS 120000UL
+
+#ifndef CIRCULATION_RELAY_DEFAULT
+#define CIRCULATION_RELAY_DEFAULT 7
+#endif
 #define MIN_TDS 0.0
 #define MAX_TDS 5000.0
 #define MIN_TEMP 0.0

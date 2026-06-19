@@ -50,7 +50,7 @@ public:
     // ✅ Setters para configurar dependências externas (Injeção de Dependências)
     void setWebServerTask(WebServerTask* webTask) { webServerTask = webTask; }
     void setESPNowController(ESPNowController* espNow) { espNowController = espNow; }
-    void setMasterManager(MasterSlaveManager* masterMgr) { masterManager = masterMgr; }  // ✅ NOVO: Elimina uso de extern
+    void setMasterManager(MasterSlaveManager* masterMgr);  // late-bind após ESP-NOW init
     
     // Controle de estados
     void begin();

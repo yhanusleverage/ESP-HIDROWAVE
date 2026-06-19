@@ -188,11 +188,11 @@ ACL actual (VM): `bridge_internal` read telemetría; `hidrowave` read command + 
 
 ## 6. Pendientes antes de “Fase 3 cerrada” en prod
 
-- [ ] Railway: `MQTT_HOST`, `MQTT_PUBLISH_USER`, `MQTT_PUBLISH_PASS`
-- [ ] Deploy frontend con `mqtt-relay-command-schema.ts`
-- [ ] Fix init `masterManager` antes de `HydroSystemCore::begin()` (slave)
+- [ ] Railway: `MQTT_HOST`, `MQTT_PUBLISH_USER`, `MQTT_PUBLISH_PASS` — guía [`HIDROWAVE-main/docs/RAILWAY_MQTT_ENV.md`](../../../HIDROWAVE-main/docs/RAILWAY_MQTT_ENV.md)
+- [x] Deploy frontend con `mqtt-relay-command-schema.ts` (Railway jun/2026)
+- [x] Fix init `masterManager` late-bind — `HydroStateManager::setMasterManager` → `HydroSystemCore` (jun/2026)
 - [ ] Slave ESP-NOW online + test MQTT→ESP-NOW
-- [ ] KPI: 100 comandos manuales, 0 dup, latencia MQTT &lt;2 s
+- [ ] KPI: 10 comandos manuales — [`BANCADA_MANUAL_COMMANDS_KPI.md`](../../../HIDROWAVE-main/scripts/BANCADA_MANUAL_COMMANDS_KPI.md)
 - [ ] Desactivar Auto EC en bancada si EC=0 falsea dosagem (relés 4/6 ~863 s)
 - [ ] Fase 2b: reducir REST sync si soak MQTT estable
 

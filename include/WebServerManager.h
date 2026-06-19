@@ -136,8 +136,7 @@ public:
     
     // Método principal para iniciar o painel admin (✅ MELHORIA #3: agora usa WebServerTask Core 1)
     void beginAdminServer(WiFiManager& wifiManager, HydroControl& hydroControl, WebServerTask* webTask, MasterSlaveManager* masterMgr = nullptr);
-    
-    void begin();
+    void setMasterManager(MasterSlaveManager* masterMgr) { masterManager = masterMgr; }
     void update();
     bool isActive() { return isRunning; }
     

@@ -1,8 +1,25 @@
 #include "DecisionEngine.h"
-#include "MasterSlaveManager.h"  // ✅ Normalizado: usar MasterSlaveManager en lugar de ESPNowTask
+#include "Config.h"
+#include "MasterSlaveManager.h"
+#include "RelayCoordinator.h"
 #include <LittleFS.h>
 
 namespace {
+
+unsigned long tankHoldMsFromRule(const DecisionRule& rule) {
+    unsigned long holdMs = TANK_SCRIPT_HOLD_DEFAULT_MS;
+    for (const auto& action : rule.actions) {
+        if (action.type == RELAY_ON || action.type == RELAY_PULSE || action.type == RELAY_PWM) {
+            if (action.duration_ms > 0) {
+                const unsigned long d = action.duration_ms + TANK_SCRIPT_HOLD_BUFFER_MS;
+                if (d > holdMs) {
+                    holdMs = d;
+                }
+            }
+        }
+    }
+    return holdMs;
+}
 
 bool levelLabelExpectsWet(const String& label) {
     if (label == "alto" || label == "mojado" || label == "cheio" || label == "on" || label == "true") {
@@ -65,7 +82,8 @@ DecisionEngine::DecisionEngine() :
     total_evaluations(0),
     total_actions_executed(0),
     total_safety_blocks(0),
-    masterManager(nullptr) {  // ✅ INTEGRAÇÃO ESP-NOW - Normalizado
+    masterManager(nullptr),
+    relayCoordinator(nullptr) {
 }
 
 DecisionEngine::~DecisionEngine() {
@@ -293,6 +311,9 @@ void DecisionEngine::evaluateAllRules() {
             executeActions(rule.actions, rule.id);
             updateExecutionCounts(rule);
             total_actions_executed++;
+            if (rule.priority >= TANK_SCRIPT_PRIORITY_THRESHOLD && tank_script_hold_callback) {
+                tank_script_hold_callback(tankHoldMsFromRule(rule));
+            }
         }
         
         logRuleExecution(rule.id, "EXECUTED", true);
@@ -450,28 +471,38 @@ bool DecisionEngine::compareValues(float sensor_value, CompareOperator op, float
 }
 
 void DecisionEngine::executeRelayAction(const RuleAction& action, const String& rule_id) {
-    // ✅ MELHORIA #3: Verificar se é relé local ou remoto
     bool state = (action.type == RELAY_ON || action.type == RELAY_PULSE);
-    
+    String actionStr = state ? "on" : "off";
+    if (action.type == RELAY_PULSE) {
+        actionStr = "toggle";
+    }
+    const uint32_t durationSec = action.duration_ms / 1000;
+
     if (action.target_device_id.isEmpty() || action.target_device_id == "local" || action.target_device_id == "MASTER") {
-        // ===== RELÉ LOCAL =====
-        if (relay_control_callback) {
+        if (relayCoordinator) {
+            relayCoordinator->actuateLocal(
+                RelayOwner::DecisionRule,
+                action.target_relay,
+                actionStr,
+                (int)durationSec);
+            Serial.printf("⚡ [LOCAL/COORD] Relé %d: %s por %lu ms (regra: %s)\n",
+                action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str());
+        } else if (relay_control_callback) {
             relay_control_callback(action.target_relay, state, action.duration_ms);
-            
             Serial.printf("⚡ [LOCAL] Relé %d: %s por %lu ms (regra: %s)\n",
-                         action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str());
+                action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str());
         }
-    } else {
-        // ===== RELÉ REMOTO (ESP-NOW) =====
-        if (!masterManager) {
-            Serial.printf("⚠️ [REMOTO] ESP-NOW não disponível - device_id=%s relay=%d (regra: %s)\n",
-                         action.target_device_id.c_str(), action.target_relay, rule_id.c_str());
-            Serial.println("💡 Use decisionEngine.setMasterManager(&masterManager) para habilitar");
-            return;
-        }
-        
-        // ✅ INTEGRAÇÃO ESP-NOW: Buscar Slave por nombre en MasterSlaveManager
-        const uint8_t* targetMac = nullptr;
+        return;
+    }
+
+    if (!masterManager && !relayCoordinator) {
+        Serial.printf("⚠️ [REMOTO] ESP-NOW não disponível - device_id=%s relay=%d (regra: %s)\n",
+            action.target_device_id.c_str(), action.target_relay, rule_id.c_str());
+        return;
+    }
+
+    const uint8_t* targetMac = nullptr;
+    if (masterManager) {
         auto trustedSlaves = masterManager->getAllTrustedSlaves();
         for (const auto& slave : trustedSlaves) {
             if (slave.deviceName == action.target_device_id || slave.deviceName.equalsIgnoreCase(action.target_device_id)) {
@@ -479,30 +510,34 @@ void DecisionEngine::executeRelayAction(const RuleAction& action, const String& 
                 break;
             }
         }
-        
-        if (!targetMac) {
-            Serial.printf("⚠️ [REMOTO] Slave '%s' não encontrado (regra: %s)\n",
-                         action.target_device_id.c_str(), rule_id.c_str());
-            return;
-        }
-        
-        // Determinar a ação baseada no tipo e estado
-        String actionStr = state ? "on" : "off";
-        if (action.type == RELAY_PULSE) {
-            actionStr = "toggle";  // Pulso usa toggle
-        }
-        
-        // Enviar comando via ESP-NOW usando MasterSlaveManager
-        bool success = masterManager->sendRelayCommandToSlave(targetMac, action.target_relay, actionStr, action.duration_ms / 1000);
-        
-        if (success) {
-            Serial.printf("✅ [REMOTO] device_id=%s relay=%d: %s por %lu ms (regra: %s)\n",
-                         action.target_device_id.c_str(), action.target_relay, 
-                         actionStr, action.duration_ms, rule_id.c_str());
-        } else {
-            Serial.printf("❌ [REMOTO] Falha ao enviar comando - device_id=%s relay=%d (regra: %s)\n",
-                         action.target_device_id.c_str(), action.target_relay, rule_id.c_str());
-        }
+    }
+
+    if (!targetMac) {
+        Serial.printf("⚠️ [REMOTO] Slave '%s' não encontrado (regra: %s)\n",
+            action.target_device_id.c_str(), rule_id.c_str());
+        return;
+    }
+
+    bool success = false;
+    if (relayCoordinator) {
+        success = relayCoordinator->actuateSlave(
+            RelayOwner::DecisionRule,
+            targetMac,
+            action.target_relay,
+            actionStr,
+            (int)durationSec) > 0;
+    } else if (masterManager) {
+        success = masterManager->sendRelayCommandToSlave(
+            targetMac, action.target_relay, actionStr, (int)durationSec) > 0;
+    }
+
+    if (success) {
+        Serial.printf("✅ [REMOTO] device_id=%s relay=%d: %s por %lu ms (regra: %s)\n",
+            action.target_device_id.c_str(), action.target_relay,
+            actionStr.c_str(), action.duration_ms, rule_id.c_str());
+    } else {
+        Serial.printf("❌ [REMOTO] Falha ao enviar comando - device_id=%s relay=%d (regra: %s)\n",
+            action.target_device_id.c_str(), action.target_relay, rule_id.c_str());
     }
 }
 

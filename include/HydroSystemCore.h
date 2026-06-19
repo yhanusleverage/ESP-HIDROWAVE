@@ -16,6 +16,7 @@
 #include "ESPNowController.h"  // ✅ NOVO: Para macToString
 #include "MqttClient.h"
 #include "MqttCommandDedup.h"
+#include "RelayCoordinator.h"
 
 // ===== 🎯 CACHE NVS DE ESTADOS DE MASTER RELAYS (LOCAL, NÃO ESP-NOW) =====
 /**
@@ -54,6 +55,7 @@ class MasterSlaveManager;  // ✅ Para integración ESP-NOW
 class HydroSystemCore {
 private:
     HydroControl hydroControl;
+    RelayCoordinator relayCoordinator;
     RelayCommandBox relayController;  // ✅ Controlador de relés (8 relés)
     SupabaseClient supabase;
     HydroSupaManager hybridSupabase;  // ✅ Manager híbrido
@@ -178,7 +180,7 @@ public:
     // ✅ Setters para configurar dependências depois da construção (opcional)
     void setWebServerTask(WebServerTask* webTask);
     void setESPNowController(ESPNowController* espNow) { espNowController = espNow; }
-    void setMasterManager(MasterSlaveManager* masterMgr) { masterManager = masterMgr; }
+    void setMasterManager(MasterSlaveManager* masterMgr);
     void setWebServerManager(WebServerManager* webMgr) { webServerManager = webMgr; }  // ✅ TÓPICO 4
     
     // ✅ Método para registrar endpoints quando webServerTask estiver disponível
@@ -191,6 +193,7 @@ public:
     
     // Acesso aos módulos (para comandos seriais)
     HydroControl& getHydroControl() { return hydroControl; }
+    RelayCoordinator& getRelayCoordinator() { return relayCoordinator; }
     SupabaseClient& getSupabase() { return supabase; }
     
     // ✅ NOVO: Cache NVS de estados dos relés master (EVENT-DRIVEN)
@@ -264,6 +267,8 @@ private:
     static void onPhMetricStatic(const PhControllerMetricEvent* event, void* userData);
     static void onEcOperationSyncStatic(void* userData);
     static void onPhOperationSyncStatic(void* userData);
+    static void onPhysicalRecircStatic(bool starting, const char* domain, void* userData);
+    static RelayOwner resolveCommandOwner(const RelayCommand& cmd);
     void publishMqttTelemetry();
     void publishMqttHeartbeat();
     void performMemoryProtection();
@@ -273,6 +278,7 @@ private:
     
     // ✅ Método privado para registrar endpoints do WebServer
     void tryRegisterEndpoints();  // Tenta registrar endpoints se webServerTask estiver disponível
+    void wireMasterManagerIntegration();
     
     // Utilities
     bool hasEnoughMemoryForHTTPS();

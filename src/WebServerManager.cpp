@@ -43,12 +43,6 @@ WebServerManager::~WebServerManager() {
     }
 }
 
-void WebServerManager::begin() {
-    // Esta função é mantida para compatibilidade, mas não será usada
-    // pois agora usamos beginAdminServer() diretamente
-    Serial.println("⚠️ Use beginAdminServer() em vez de begin()");
-}
-
 void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& hydroControl, WebServerTask* webTask, MasterSlaveManager* masterMgr) {
     Serial.println("\n🌐 ========================================");
     Serial.println("🌐 WebServerManager::beginAdminServer()");

@@ -1,4 +1,5 @@
 #include "DecisionEngineIntegration.h"
+#include "RelayCoordinator.h"
 #include "Config.h"
 #include <ArduinoJson.h>
 
@@ -7,7 +8,8 @@ DecisionEngineIntegration::DecisionEngineIntegration(DecisionEngine* engine, Hyd
     engine(engine),
     hydroControl(hydro),
     supabase(supa),
-    masterManager(masterMgr),  // ✅ INTEGRAÇÃO ESP-NOW
+    masterManager(masterMgr),
+    relayCoordinator(nullptr),
     emergency_mode(false),
     manual_override_active(false),
     total_relay_commands(0),
@@ -45,6 +47,12 @@ bool DecisionEngineIntegration::begin() {
     
     engine->setLogCallback([this](const String& event, const String& data) {
         this->handleLogEvent(event, data);
+    });
+
+    engine->setTankScriptHoldCallback([this](unsigned long holdMs) {
+        if (hydroControl) {
+            hydroControl->holdAutoDosingForTankScript(holdMs);
+        }
     });
     
     // ✅ INTEGRAÇÃO ESP-NOW: Configurar MasterSlaveManager no DecisionEngine
@@ -222,7 +230,14 @@ void DecisionEngineIntegration::handleRelayControl(int relay, bool state, unsign
     }
     
     // Executar comando
-    if (duration > 0) {
+    if (relayCoordinator) {
+        String actionStr = state ? "on" : "off";
+        const int durationSec = duration > 0 ? (int)(duration / 1000) : 0;
+        if (relayCoordinator->actuateLocal(RelayOwner::DecisionRule, relay, actionStr, durationSec)) {
+            Serial.printf("⚡ [COORD] Relé %d acionado owner=DecisionRule\n", relay);
+            addToExecutionLog("Relay " + String(relay) + " via RelayCoordinator");
+        }
+    } else if (duration > 0) {
         hydroControl->toggleRelay(relay, duration / 1000); // HydroControl usa segundos
         Serial.printf("⚡ Relé %d acionado por %lu ms\n", relay, duration);
         addToExecutionLog("Relay " + String(relay) + " pulsed for " + String(duration) + "ms");

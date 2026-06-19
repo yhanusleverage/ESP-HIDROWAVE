@@ -50,6 +50,7 @@ struct NutrientDoseEvent {
 typedef void (*NutrientDoseCallback)(const NutrientDoseEvent* event, void* userData);
 typedef void (*EcOperationSyncCallback)(void* userData);
 typedef void (*PhOperationSyncCallback)(void* userData);
+typedef void (*PhysicalRecircCallback)(bool starting, const char* domain, void* userData);
 
 /** Evento emitido ao completar dosagem pH (para Supabase ph_dosages). */
 struct PhDoseEvent {
@@ -131,6 +132,10 @@ public:
     bool* getRelayStates() { return relayStates; }
     bool areSensorsWorking() { return sensorsOk; }
     bool isWaterLevelOk() { return tankLevelOk; }
+    /** true si nivel bajo o hold P1 activo — pausa checkAutoEC/checkAutoPH. */
+    bool isAutoDosingPausedByInterlock() const;
+    /** Extiende pausa de dosaje químico durante script tanque (P1). */
+    void holdAutoDosingForTankScript(unsigned long durationMs);
     bool isLevelWet(int levelIndex) const;
     const char* getWaterLevelAggregate() const;
     bool isDiscreteLevelBankActive() const { return levelBank.isAvailable(); }
@@ -162,6 +167,7 @@ public:
     unsigned long getTempoRecirculacaoSeconds() const { return tempoRecirculacaoSeconds; }
     void setNutrientDoseCallback(NutrientDoseCallback cb, void* userData);
     void setEcOperationSyncCallback(EcOperationSyncCallback cb, void* userData);
+    void setPhysicalRecircCallback(PhysicalRecircCallback cb, void* userData);
     void setEcMetricCallback(EcMetricCallback cb, void* userData);
     void setPhMetricCallback(PhMetricCallback cb, void* userData);
 
@@ -271,6 +277,8 @@ private:
     void* nutrientDoseCallbackUserData;
     EcOperationSyncCallback ecOperationSyncCallback;
     void* ecOperationSyncCallbackUserData;
+    PhysicalRecircCallback physicalRecircCallback;
+    void* physicalRecircCallbackUserData;
 
     // ✅ Auto pH adaptativo
     AdaptivePHController adaptivePhController;
@@ -317,6 +325,7 @@ private:
     
     // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
     unsigned long lastDosageCompleteTime;  // Timestamp da última dosagem completa
+    unsigned long tankScriptHoldUntilMs;   // P1 interlock: pausa Auto EC/pH até este millis
     unsigned long tempoRecirculacao;       // Tempo de espera em SEGUNDOS
     
     // ✅ Sistema Sequencial de Dosagem (variáveis privadas)
@@ -357,6 +366,7 @@ private:
     void emitNutrientDoseEvent(const SimpleNutrient& nutrient);
     void notifyEcOperationChanged();
     void notifyPhOperationChanged();
+    void notifyPhysicalRecirc(bool starting, const char* domain);
     void startPhAutoDosage(int relay, float durationSec, PhCorrectionPath path,
                            float mlApplied, float hBefore, float phBefore);
     void finishPhRecirculation();

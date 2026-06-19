@@ -27,6 +27,14 @@ HydroStateManager::~HydroStateManager() {
     cleanup();
 }
 
+void HydroStateManager::setMasterManager(MasterSlaveManager* masterMgr) {
+    masterManager = masterMgr;
+    if (hydroCore) {
+        hydroCore->setMasterManager(masterMgr);
+        Serial.println("✅ MasterSlaveManager re-injectado no HydroSystemCore (late bind)");
+    }
+}
+
 // ===== MÉTODOS PRINCIPAIS =====
 void HydroStateManager::begin() {
     Serial.println("🏗️ Inicializando HydroStateManager...");

@@ -300,6 +300,7 @@ function validateTelemetry(deviceId, payload) {
   return {
     ok: true,
     hydroRow,
+    sensorFields: { hasPh, hasTemp, hasTds, hasEc },
     deviceStatusPatch: buildLevelDeviceStatusPatch(payload),
     envRow,
     envSkip,
@@ -791,7 +792,26 @@ function pickHydroInsertRow(row) {
   return out;
 }
 
-/** Legacy NOT NULL en Supabase (temperature/ph/tds) hasta ejecutar ALLOW_NULL_HYDRO_SENSOR_COLUMNS.sql */
+function hasHydroSensorPayload(hydroRow, sensorFields) {
+  if (sensorFields) {
+    return !!(sensorFields.hasPh || sensorFields.hasTemp || sensorFields.hasTds || sensorFields.hasEc);
+  }
+  if (!hydroRow) return false;
+  const finiteNonZero = (v) => {
+    if (v == null) return false;
+    const n = Number(v);
+    return Number.isFinite(n) && n !== 0;
+  };
+  return (
+    finiteNonZero(hydroRow.ph_raw) ||
+    finiteNonZero(hydroRow.temperature_raw) ||
+    finiteNonZero(hydroRow.tds) ||
+    finiteNonZero(hydroRow.ec_raw) ||
+    finiteNonZero(hydroRow.temperature)
+  );
+}
+
+/** Legacy NOT NULL en Supabase — solo rellena columnas que faltan cuando hay PV real */
 function applyLegacyHydroNotNullDefaults(row) {
   const out = { ...row };
   if (out.ph == null && out.ph_display_clamped != null) {
@@ -800,9 +820,12 @@ function applyLegacyHydroNotNullDefaults(row) {
     const clamped = clampPhDisplay(out.ph_raw);
     if (clamped != null) out.ph = clamped;
   }
-  if (out.temperature == null) out.temperature = 0;
-  if (out.ph == null) out.ph = 0;
-  if (out.tds == null) out.tds = 0;
+  if (out.temperature == null && out.temperature_raw == null) {
+    out.temperature = 0;
+  }
+  if (out.tds == null) {
+    out.tds = 0;
+  }
   return out;
 }
 
@@ -1076,7 +1099,11 @@ async function handleTelemetry(topic, message) {
     return;
   }
 
-  await insertHydro(validated.hydroRow);
+  if (hasHydroSensorPayload(validated.hydroRow, validated.sensorFields)) {
+    await insertHydro(validated.hydroRow);
+  } else {
+    console.log(`[bridge] telemetry ${deviceId} levels-only — skip hydro_measurements INSERT`);
+  }
   if (validated.deviceStatusPatch) {
     await patchDeviceLevel(deviceId, validated.deviceStatusPatch);
   }

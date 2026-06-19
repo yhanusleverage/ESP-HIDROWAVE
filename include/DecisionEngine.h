@@ -10,6 +10,7 @@
 
 // Forward declaration - ✅ Normalizado: usar MasterSlaveManager en lugar de ESPNowTask
 class MasterSlaveManager;
+class RelayCoordinator;
 
 // ===== ESTRUTURAS DO MOTOR DE DECISÕES =====
 
@@ -247,22 +248,27 @@ public:
     typedef std::function<void(int relay, bool state, unsigned long duration)> RelayControlCallback;
     typedef std::function<void(const String& message, bool is_critical)> AlertCallback;
     typedef std::function<void(const String& event, const String& data)> LogCallback;
+    typedef std::function<void(unsigned long holdMs)> TankScriptHoldCallback;
     
     void setRelayControlCallback(RelayControlCallback callback) { relay_control_callback = callback; }
     void setAlertCallback(AlertCallback callback) { alert_callback = callback; }
     void setLogCallback(LogCallback callback) { log_callback = callback; }
+    void setTankScriptHoldCallback(TankScriptHoldCallback callback) { tank_script_hold_callback = callback; }
     
     // ✅ INTEGRAÇÃO ESP-NOW - Normalizado: usar MasterSlaveManager
     void setMasterManager(MasterSlaveManager* mgr) { masterManager = mgr; }
+    void setRelayCoordinator(RelayCoordinator* coordinator) { relayCoordinator = coordinator; }
 
 private:
     // ===== CALLBACKS INTERNOS =====
     RelayControlCallback relay_control_callback;
     AlertCallback alert_callback;
     LogCallback log_callback;
+    TankScriptHoldCallback tank_script_hold_callback;
     
     // ✅ INTEGRAÇÃO ESP-NOW - Normalizado: usar MasterSlaveManager
     MasterSlaveManager* masterManager;
+    RelayCoordinator* relayCoordinator;
     
     // ===== MÉTODOS INTERNOS =====
     bool parseRuleFromJSON(const JsonObject& json_rule, DecisionRule& rule);

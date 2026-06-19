@@ -7,6 +7,8 @@
 #include "DataTypes.h"
 #include "MasterSlaveManager.h"  // ✅ INTEGRAÇÃO ESP-NOW
 
+class RelayCoordinator;
+
 /**
  * @brief Classe de integração entre DecisionEngine e sistema ESP-HIDROWAVE
  * 
@@ -19,6 +21,7 @@ private:
     HydroControl* hydroControl;
     SupabaseClient* supabase;
     MasterSlaveManager* masterManager;  // ✅ INTEGRAÇÃO ESP-NOW
+    RelayCoordinator* relayCoordinator;
     
     // Estados e configurações
     bool emergency_mode;
@@ -41,6 +44,12 @@ public:
     
     // ✅ INTEGRAÇÃO ESP-NOW: Setter para MasterSlaveManager
     void setMasterManager(MasterSlaveManager* masterMgr) { masterManager = masterMgr; }
+    void setRelayCoordinator(RelayCoordinator* coordinator) {
+        relayCoordinator = coordinator;
+        if (engine) {
+            engine->setRelayCoordinator(coordinator);
+        }
+    }
     
     // ===== CONTROLE PRINCIPAL =====
     bool begin();

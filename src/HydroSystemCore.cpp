@@ -86,6 +86,83 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     }
 }
 
+void HydroSystemCore::wireMasterManagerIntegration() {
+    if (!masterManager) {
+        return;
+    }
+
+    masterManager->setRelayAckCallback([this](const uint8_t* senderMac, uint32_t commandId,
+                                              bool success, uint8_t relayNumber, uint8_t currentState) {
+        Serial.println("\n🎊 === ACK DE RELAY RECEBIDO (EVENT-DRIVEN) ===");
+        Serial.println("📱 De: " + ESPNowController::macToString(senderMac));
+        Serial.println("🆔 Command ID (ESP-NOW): " + String(commandId));
+        Serial.println("🔌 Relé: " + String(relayNumber));
+        Serial.println("✅ Success: " + String(success ? "Sim" : "Não"));
+        Serial.println("💡 Estado: " + String(currentState ? "ON" : "OFF"));
+
+        int supabaseCommandId = findSupabaseCommandId(commandId);
+
+        if (supabaseCommandId > 0 && supabaseConnected) {
+            if (success) {
+                supabase.markCommandCompleted(supabaseCommandId, currentState, true);
+
+                String slaveMacStr = ESPNowController::macToString(senderMac);
+                String slaveDeviceId = "ESP32_SLAVE_" + slaveMacStr;
+                slaveDeviceId.replace(":", "_");
+
+                updateRelaySlaveState(slaveDeviceId, senderMac, relayNumber, currentState);
+
+                Serial.println("✅ [CALLBACK] Comando marcado como completed e relay_slaves atualizado");
+            } else {
+                supabase.markCommandFailed(supabaseCommandId, "Slave não confirmou", true);
+                Serial.println("❌ [CALLBACK] Comando marcado como failed");
+            }
+        } else if (supabaseCommandId == 0) {
+            Serial.println("⚠️ [CALLBACK] Mapeamento não encontrado para commandId=" + String(commandId));
+            Serial.println("💡 Comando pode ter sido processado antes do mapeamento ser criado");
+        }
+
+        Serial.println("========================================\n");
+    });
+
+    masterManager->setSupabaseCommandCallback([this](int supabaseCommandId, bool success, const String& errorMessage) {
+        if (supabaseCommandId > 0 && supabaseConnected) {
+            if (success) {
+                bool currentState = (errorMessage == "true" || errorMessage == "1");
+                supabase.markCommandCompleted(supabaseCommandId, currentState, true);
+            } else {
+                supabase.markCommandFailed(supabaseCommandId, errorMessage, true);
+            }
+        }
+    });
+
+    masterManager->setSupabaseRelayStateCallback([this](const String& masterDeviceId, const String& slaveMacAddress,
+                                                        const String& slaveDeviceId, int relayNumber,
+                                                        bool state, bool hasTimer, int remainingTime) {
+        if (supabaseConnected) {
+            supabase.updateSlaveRelayState(masterDeviceId, slaveMacAddress, slaveDeviceId,
+                                           relayNumber, state, hasTimer, remainingTime);
+        }
+    });
+
+    Serial.println("✅ Callback de Supabase configurado en MasterSlaveManager (EVENT-DRIVEN)");
+}
+
+void HydroSystemCore::setMasterManager(MasterSlaveManager* masterMgr) {
+    masterManager = masterMgr;
+    if (!masterMgr) {
+        return;
+    }
+    Serial.println("✅ HydroSystemCore: MasterSlaveManager atualizado (late bind)");
+    relayCoordinator.begin(&hydroControl, masterMgr);
+    if (supabaseConnected) {
+        wireMasterManagerIntegration();
+    }
+    if (webServerManager) {
+        webServerManager->setMasterManager(masterMgr);
+    }
+}
+
 HydroSystemCore::~HydroSystemCore() {
     end();
 }
@@ -119,6 +196,9 @@ bool HydroSystemCore::begin() {
     hydroControl.setPhGainLearnedCallback(&HydroSystemCore::onPhGainLearnedStatic, this);
     hydroControl.setEcOperationSyncCallback(&HydroSystemCore::onEcOperationSyncStatic, this);
     hydroControl.setPhOperationSyncCallback(&HydroSystemCore::onPhOperationSyncStatic, this);
+    hydroControl.setPhysicalRecircCallback(&HydroSystemCore::onPhysicalRecircStatic, this);
+
+    relayCoordinator.begin(&hydroControl, masterManager);
     
     // ===== CONECTAR SUPABASE =====
     Serial.println("☁️ Conectando ao Supabase...");
@@ -138,71 +218,7 @@ bool HydroSystemCore::begin() {
         }
         
         // ✅ CONFIGURAR CALLBACK PARA SUPABASE EN MASTERSLAVEMANAGER
-        if (masterManager) {
-            // ✅ NOVO: Callback event-driven para ACK de relay (CEREJA DO BOLO!)
-            masterManager->setRelayAckCallback([this](const uint8_t* senderMac, uint32_t commandId, 
-                                                       bool success, uint8_t relayNumber, uint8_t currentState) {
-                Serial.println("\n🎊 === ACK DE RELAY RECEBIDO (EVENT-DRIVEN) ===");
-                Serial.println("📱 De: " + ESPNowController::macToString(senderMac));
-                Serial.println("🆔 Command ID (ESP-NOW): " + String(commandId));
-                Serial.println("🔌 Relé: " + String(relayNumber));
-                Serial.println("✅ Success: " + String(success ? "Sim" : "Não"));
-                Serial.println("💡 Estado: " + String(currentState ? "ON" : "OFF"));
-                
-                // ✅ Buscar supabaseCommandId do mapeamento
-                int supabaseCommandId = findSupabaseCommandId(commandId);
-                
-                if (supabaseCommandId > 0 && supabaseConnected) {
-                    if (success) {
-                        // ✅ PASSO 3: Marcar como completed no Supabase
-                        supabase.markCommandCompleted(supabaseCommandId, currentState, true);
-                        
-                        // ✅ PASSO 4: Atualizar relay_slaves com estado real (CEREJA DO BOLO!)
-                        String slaveMacStr = ESPNowController::macToString(senderMac);
-                        String slaveDeviceId = "ESP32_SLAVE_" + slaveMacStr;
-                        slaveDeviceId.replace(":", "_");
-                        
-                        updateRelaySlaveState(slaveDeviceId, senderMac, relayNumber, currentState);
-                        
-                        Serial.println("✅ [CALLBACK] Comando marcado como completed e relay_slaves atualizado");
-                    } else {
-                        // ✅ Marcar como failed
-                        supabase.markCommandFailed(supabaseCommandId, "Slave não confirmou", true);
-                        Serial.println("❌ [CALLBACK] Comando marcado como failed");
-                    }
-                } else if (supabaseCommandId == 0) {
-                    Serial.println("⚠️ [CALLBACK] Mapeamento não encontrado para commandId=" + String(commandId));
-                    Serial.println("💡 Comando pode ter sido processado antes do mapeamento ser criado");
-                }
-                
-                Serial.println("========================================\n");
-            });
-            
-            // ✅ Callback alternativo (mantido para compatibilidade)
-            masterManager->setSupabaseCommandCallback([this](int supabaseCommandId, bool success, const String& errorMessage) {
-                if (supabaseCommandId > 0 && supabaseConnected) {
-                    if (success) {
-                        bool currentState = (errorMessage == "true" || errorMessage == "1");
-                        supabase.markCommandCompleted(supabaseCommandId, currentState, true);
-                    } else {
-                        supabase.markCommandFailed(supabaseCommandId, errorMessage, true);
-                    }
-                }
-            });
-            
-            // ✅ CRÍTICO: Configurar callback para actualizar estados de relés de slaves en Supabase
-            // Esto garantiza que Supabase sea la fuente única de verdad
-            masterManager->setSupabaseRelayStateCallback([this](const String& masterDeviceId, const String& slaveMacAddress, 
-                                                               const String& slaveDeviceId, int relayNumber, 
-                                                               bool state, bool hasTimer, int remainingTime) {
-                if (supabaseConnected) {
-                    supabase.updateSlaveRelayState(masterDeviceId, slaveMacAddress, slaveDeviceId, 
-                                                   relayNumber, state, hasTimer, remainingTime);
-                }
-            });
-            
-            Serial.println("✅ Callback de Supabase configurado en MasterSlaveManager (EVENT-DRIVEN)");
-        }
+        wireMasterManagerIntegration();
     } else {
         Serial.println("❌ Erro ao conectar Supabase - Sistema continuará sem cloud");
         supabaseConnected = false;
@@ -938,6 +954,15 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
         }
         return;
     }
+
+    if (isSlave && !masterManager) {
+        Serial.println("❌ [ESP-NOW] masterManager é nullptr — comando slave ignorado");
+        Serial.println("💡 Ordem: MasterSlaveManager::begin() → setMasterManager() antes de comandos slave");
+        if (supabaseConnected) {
+            supabase.markCommandFailed(cmd.id, "masterManager unavailable", true);
+        }
+        return;
+    }
     
     if (isSlave && masterManager) {
         // ===== COMANDO SLAVE (ESP-NOW) =====
@@ -971,17 +996,15 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
             Serial.println("💡 Comando será enviado mesmo assim (pode ser novo slave)");
         }
         
-        // ✅ PASSO 2: Enviar via ESP-NOW (usando código existente)
-        // O sistema já tem retry automático e fila de pendentes
-        // ✅ NOVO: sendRelayCommandToSlave agora retorna commandId do ESP-NOW
-        uint32_t espNowCommandId = masterManager->sendRelayCommandToSlave(
-            targetMac, 
-            cmd.relayNumber, 
-            cmd.action.c_str(), 
+        // ✅ PASSO 2: Enviar via RelayCoordinator (ESP-NOW + mutex circulación)
+        const RelayOwner owner = resolveCommandOwner(cmd);
+        uint32_t espNowCommandId = relayCoordinator.actuateSlave(
+            owner,
+            targetMac,
+            cmd.relayNumber,
+            cmd.action,
             cmd.durationSeconds,
-            cmd.id,  // ✅ Passar supabaseCommandId para tracking
-            false    // updateStatus = false (vamos atualizar no callback)
-        );
+            cmd.id);
         
         // ✅ CEREJA DO BOLO: Criar mapeamento IMEDIATAMENTE após enviar
         if (espNowCommandId > 0 && cmd.id > 0) {
@@ -990,7 +1013,7 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
                          espNowCommandId, cmd.id);
         }
         
-        bool success = (espNowCommandId > 0);  // ✅ Compatibilidade com código antigo
+        bool success = (espNowCommandId > 0);
         
         // ✅ NÃO marcar como completed aqui!
         // ✅ O callback será chamado quando receber ACK e encontrará o mapeamento!
@@ -1032,7 +1055,15 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
 // ✅ FORK: Processar comando de regra (automação)
 void HydroSystemCore::processRuleCommand(const RelayCommand& cmd, bool isSlave) {
     Serial.println("🤖 [RULE] Processando comando de regra de automação");
-    Serial.printf("   Regra: %s (%s)\n", cmd.rule_name.c_str(), cmd.rule_id.c_str());
+    Serial.printf("   Regra: %s (%s) priority=%d\n", cmd.rule_name.c_str(), cmd.rule_id.c_str(), cmd.priority);
+
+    if (cmd.priority >= TANK_SCRIPT_PRIORITY_THRESHOLD) {
+        unsigned long holdMs = TANK_SCRIPT_HOLD_DEFAULT_MS;
+        if (cmd.durationSeconds > 0) {
+            holdMs = (unsigned long)cmd.durationSeconds * 1000UL + TANK_SCRIPT_HOLD_BUFFER_MS;
+        }
+        hydroControl.holdAutoDosingForTankScript(holdMs);
+    }
     
     // ✅ Validações específicas para comandos de regra
     // 1. Verificar se regra ainda está enabled (será verificado quando buscar regras)
@@ -1073,29 +1104,12 @@ void HydroSystemCore::processPeristalticCommand(const RelayCommand& cmd, bool is
 
 // ✅ Função auxiliar para executar comando local
 void HydroSystemCore::executeLocalRelayCommand(const RelayCommand& cmd) {
-    Serial.println("🏠 [LOCAL] Comando para relés locais");
+    Serial.println("🏠 [LOCAL] Comando para relés locais via RelayCoordinator");
     
-    bool success = false;
-    bool* relayStates = hydroControl.getRelayStates();
+    const RelayOwner owner = resolveCommandOwner(cmd);
+    bool success = relayCoordinator.actuateLocal(
+        owner, cmd.relayNumber, cmd.action, cmd.durationSeconds);
     
-    if (cmd.action == "on") {
-        if (!relayStates[cmd.relayNumber]) {
-            hydroControl.toggleRelay(cmd.relayNumber, cmd.durationSeconds);
-            success = true;
-        } else {
-            success = true; // Já estava ligado
-        }
-    } else if (cmd.action == "off") {
-        if (relayStates[cmd.relayNumber]) {
-            hydroControl.toggleRelay(cmd.relayNumber, 0);
-            success = true;
-        } else {
-            success = true; // Já estava desligado
-        }
-    }
-    
-    // ✅ NOTA: Não marcar como completed aqui
-    // Isso é feito em processManualCommand() após executar
     if (success) {
         Serial.println("✅ Comando local executado com sucesso");
     } else {
@@ -1290,6 +1304,36 @@ void HydroSystemCore::onPhOperationSyncStatic(void* userData) {
     if (userData) {
         static_cast<HydroSystemCore*>(userData)->syncPhOperationStateToSupabase();
     }
+}
+
+void HydroSystemCore::onPhysicalRecircStatic(bool starting, const char* domain, void* userData) {
+    if (!userData) {
+        return;
+    }
+    HydroSystemCore* self = static_cast<HydroSystemCore*>(userData);
+    RelayOwner owner = RelayOwner::AutoEcRecirc;
+    if (domain && strcmp(domain, "ph") == 0) {
+        owner = RelayOwner::AutoPhRecirc;
+    }
+    if (starting) {
+        self->relayCoordinator.startPostDoseRecirc(owner);
+    } else {
+        self->relayCoordinator.endPostDoseRecirc(owner);
+    }
+}
+
+RelayOwner HydroSystemCore::resolveCommandOwner(const RelayCommand& cmd) {
+    String commandType = cmd.command_type.length() > 0 ? cmd.command_type : "manual";
+    if (commandType == "rule") {
+        if (cmd.priority >= TANK_SCRIPT_PRIORITY_THRESHOLD) {
+            return RelayOwner::TankScriptP1;
+        }
+        if (cmd.priority >= 20 && cmd.priority <= 40) {
+            return RelayOwner::ScheduleP4;
+        }
+        return RelayOwner::DecisionRule;
+    }
+    return RelayOwner::Manual;
 }
 
 void HydroSystemCore::syncPhOperationStateToSupabase() {
