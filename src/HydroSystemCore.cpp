@@ -1217,7 +1217,7 @@ void HydroSystemCore::sendSensorDataToSupabase() {
     hydroData.timestamp = millis();
     
     // ✅ DEBUG: Mostrar valores antes de enviar
-    Serial.printf("📊 [SENSORES] Valores: Temp=%.2f°C, pH=%.2f, TDS=%.2f ppm\n", 
+    Serial.printf("📊 [SENSORES] Valores: Temp=%.2f°C, pH=%.2f, EC=%.0f uS/cm\n",
         hydroData.temperature, hydroData.ph, hydroData.ec);
 
     // Enviar dados

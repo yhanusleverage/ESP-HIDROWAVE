@@ -194,6 +194,16 @@ function clampPhDisplay(ph) {
   return Math.round(ph * 1000) / 1000;
 }
 
+function resolveEcUsCmFromPayload({ ec, tds }) {
+  if (Number.isFinite(ec)) {
+    return Math.round(ec * 100) / 100;
+  }
+  if (Number.isFinite(tds)) {
+    return Math.round(tds * 100) / 100;
+  }
+  return null;
+}
+
 function applyHydroRawColumns(hydroRow, { ph, temperature, tds, ec }) {
   if (Number.isFinite(ph)) {
     hydroRow.ph_raw = ph;
@@ -207,15 +217,9 @@ function applyHydroRawColumns(hydroRow, { ph, temperature, tds, ec }) {
     hydroRow.temperature_raw = temperature;
     hydroRow.temperature = temperature;
   }
-  let ecUsCm = null;
-  if (Number.isFinite(ec)) {
-    ecUsCm = Math.round(ec * 100) / 100;
-  } else if (Number.isFinite(tds)) {
-    ecUsCm = Math.round(tds * 100) / 100;
-  }
+  const ecUsCm = resolveEcUsCmFromPayload({ ec, tds });
   if (ecUsCm != null) {
     hydroRow.ec = ecUsCm;
-    hydroRow.ec_raw = ecUsCm;
   }
 }
 
@@ -243,10 +247,11 @@ function validateTelemetry(deviceId, payload) {
 
   const hasTemp = payload.temperature != null;
   const hasPh = payload.ph != null;
-  const hasTds = payload.tds != null;
   const temperature = hasTemp ? Number(payload.temperature) : null;
   const ph = hasPh ? Number(payload.ph) : null;
-  const tds = hasTds ? Number(payload.tds) : null;
+
+  const legacyTdsRaw = payload.tds != null ? Number(payload.tds) : null;
+  const ecPayload = payload.ec != null ? Number(payload.ec) : null;
 
   if (hasTemp && !Number.isFinite(temperature)) {
     return { ok: false, reason: 'temperature must be a finite number when present' };
@@ -254,15 +259,18 @@ function validateTelemetry(deviceId, payload) {
   if (hasPh && !Number.isFinite(ph)) {
     return { ok: false, reason: 'ph must be a finite number when present' };
   }
-  if (hasTds && !Number.isFinite(tds)) {
-    return { ok: false, reason: 'tds must be a finite number when present' };
-  }
-
-  const ecPayload = payload.ec != null ? Number(payload.ec) : null;
-  const hasEc = payload.ec != null;
-  if (hasEc && !Number.isFinite(ecPayload)) {
+  if (payload.ec != null && !Number.isFinite(ecPayload)) {
     return { ok: false, reason: 'ec must be a finite number when present' };
   }
+  if (payload.tds != null && !Number.isFinite(legacyTdsRaw)) {
+    return { ok: false, reason: 'tds must be a finite number when present (legacy alias for ec µS/cm)' };
+  }
+
+  const resolvedEc = resolveEcUsCmFromPayload({
+    ec: payload.ec != null ? ecPayload : null,
+    tds: payload.tds != null ? legacyTdsRaw : null,
+  });
+  const hasEc = resolvedEc != null;
 
   const hydroRow = {
     device_id: deviceId,
@@ -280,8 +288,8 @@ function validateTelemetry(deviceId, payload) {
   applyHydroRawColumns(hydroRow, {
     ph: hasPh ? ph : null,
     temperature: hasTemp ? temperature : null,
-    tds: hasTds ? tds : null,
-    ec: hasEc ? ecPayload : null,
+    tds: payload.tds != null ? legacyTdsRaw : null,
+    ec: payload.ec != null ? ecPayload : null,
   });
 
   const airTempRaw =
@@ -304,7 +312,7 @@ function validateTelemetry(deviceId, payload) {
   return {
     ok: true,
     hydroRow,
-    sensorFields: { hasPh, hasTemp, hasTds, hasEc },
+    sensorFields: { hasPh, hasTemp, hasEc },
     deviceStatusPatch: buildLevelDeviceStatusPatch(payload),
     envRow,
     envSkip,
@@ -788,7 +796,6 @@ const HYDRO_INSERT_COLUMNS = new Set([
   'ph_raw',
   'ph_display_clamped',
   'ec',
-  'ec_raw',
 ]);
 
 function pickHydroInsertRow(row) {
@@ -804,7 +811,7 @@ function pickHydroInsertRow(row) {
 
 function hasHydroSensorPayload(hydroRow, sensorFields) {
   if (sensorFields) {
-    return !!(sensorFields.hasPh || sensorFields.hasTemp || sensorFields.hasTds || sensorFields.hasEc);
+    return !!(sensorFields.hasPh || sensorFields.hasTemp || sensorFields.hasEc);
   }
   if (!hydroRow) return false;
   const finiteNonZero = (v) => {
@@ -816,8 +823,6 @@ function hasHydroSensorPayload(hydroRow, sensorFields) {
     finiteNonZero(hydroRow.ph_raw) ||
     finiteNonZero(hydroRow.temperature_raw) ||
     finiteNonZero(hydroRow.ec) ||
-    finiteNonZero(hydroRow.ec_raw) ||
-    finiteNonZero(hydroRow.tds) ||
     finiteNonZero(hydroRow.temperature)
   );
 }
@@ -846,7 +851,7 @@ async function insertHydro(row, sensorFields) {
     return false;
   }
   console.log(
-    `[bridge] INSERT hydro_measurements ${payload.device_id} ph_raw=${payload.ph_raw ?? '-'} ph_disp=${payload.ph_display_clamped ?? payload.ph ?? '-'} ec=${payload.ec ?? '-'} ec_raw=${payload.ec_raw ?? '-'}`
+    `[bridge] INSERT hydro_measurements ${payload.device_id} ph_raw=${payload.ph_raw ?? '-'} ph_disp=${payload.ph_display_clamped ?? payload.ph ?? '-'} ec=${payload.ec ?? '-'}`
   );
   return true;
 }

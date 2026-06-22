@@ -437,14 +437,12 @@ void HydroControl::updateSensors() {
             if (isfinite(ecReading) && ecReading >= MIN_EC && ecReading <= MAX_EC &&
                 isValidEcMicroSiemens(ecReading)) {
                 ec = ecReading;
-                tds = ec / 2.0f;
                 ecValid = true;
                 windowEcValid = true;
                 lastEcValidMs = nowMs;
             } else {
                 ecValid = false;
                 ec = NAN;
-                tds = NAN;
                 sensorsOk = false;
             }
 
@@ -459,7 +457,6 @@ void HydroControl::updateSensors() {
                 }
                 ecValid = false;
                 ec = NAN;
-                tds = NAN;
                 windowEcValid = false;
                 sensorsOk = false;
             }
@@ -487,7 +484,6 @@ void HydroControl::updateSensors() {
     } else {
         ecValid = false;
         ec = NAN;
-        tds = NAN;
         sensorsOk = false;
     }
 
@@ -732,14 +728,12 @@ void HydroControl::checkRelayTimers() {
     }
 }
 
-void HydroControl::updateSensorData(float temp, float humidity, float ph, float tds) {
+void HydroControl::updateSensorData(float temp, float humidity, float ph, float ecUsCm) {
     temperature = temp;
-    // humidity não é armazenada na classe atual, mas poderia ser adicionada se necessário
     pH = ph;
-    this->tds = tds;
-    ec = tds * 2.0f;
+    ec = ecUsCm;
+    ecValid = isfinite(ecUsCm) && isValidEcMicroSiemens(ecUsCm);
     
-    // Atualizar display com os novos dados
     updateDisplay();
 }
 

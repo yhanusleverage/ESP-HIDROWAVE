@@ -601,7 +601,6 @@ String SupabaseClient::buildHydroPayload(const HydroReading& reading) {
     doc["temperature"] = reading.temperature;
     doc["ph"] = reading.ph;
     doc["ec"] = reading.ec;
-    doc["ec_raw"] = reading.ec;
     doc["water_level_ok"] = reading.waterLevelOk;
     doc["level_1"] = reading.level1Wet;
     doc["level_2"] = reading.level2Wet;

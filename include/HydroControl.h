@@ -154,7 +154,7 @@ public:
     void showMessage(String msg);
     void toggleRelay(int relay, int seconds = 0);
     void setRelay(int relay, bool state, int seconds = 0);  // ✅ NOVO: Define estado direto
-    void updateSensorData(float temp, float humidity, float ph, float tds);
+    void updateSensorData(float temp, float humidity, float ph, float ecUsCm);
     void updateRelayTimers();
     bool* getRelayStates() { return relayStates; }
     bool areSensorsWorking() { return sensorsOk; }
@@ -172,8 +172,9 @@ public:
     const float& getTemperature() const { return temperature; }
     float& getpH() { return pH; }
     const float& getpH() const { return pH; }
-    float& getTDS() { return tds; }
-    const float& getTDS() const { return tds; }
+    /** @deprecated Use getEC() — retorna o mesmo µS/cm (alias para regras legacy "tds"). */
+    float& getTDS() { return ec; }
+    const float& getTDS() const { return ec; }
     float& getEC() { return ec; }
     const float& getEC() const { return ec; }
     bool isEcValid() const { return ecValid; }

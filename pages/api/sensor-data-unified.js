@@ -20,6 +20,7 @@ export default async function handler(req, res) {
       // Dados hidropônicos
       water_temperature,
       ph,
+      ec,
       tds,
       water_level_ok,
       timestamp
@@ -53,14 +54,16 @@ export default async function handler(req, res) {
     }
 
     // 🌊 INSERIR DADOS HIDROPÔNICOS (se fornecidos)
-    if (water_temperature !== undefined || ph !== undefined || tds !== undefined || water_level_ok !== undefined) {
+    const ecUsCm = ec !== undefined && ec !== null ? ec : tds
+
+    if (water_temperature !== undefined || ph !== undefined || ecUsCm !== undefined || water_level_ok !== undefined) {
       const { data: hydroData, error: hydroError } = await supabase
         .from('hydro_measurements')
         .insert({
           device_id,
           temperature: water_temperature,
           ph: ph,
-          tds: tds,
+          ec: ecUsCm,
           water_level_ok: water_level_ok,
           created_at: timestamp || new Date().toISOString()
         })
