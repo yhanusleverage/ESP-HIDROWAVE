@@ -84,7 +84,7 @@ struct SensorData {
     float environmentHumidity = 0.0; // Umidade ambiente em %
     float waterTemp = 0.0;          // Temperatura da água em °C
     float ph = 7.0;                 // pH da água (0-14)
-    float tds = 0.0;               // Total de sólidos dissolvidos em ppm
+    float ec = 0.0;                // EC em µS/cm
     bool waterLevelOk = false;     // Status do nível da água
     unsigned long timestamp = 0;    // Timestamp da última leitura
     bool valid = false;            // Indica se os dados são válidos
@@ -95,7 +95,7 @@ struct SensorData {
                environmentHumidity >= MIN_HUMIDITY && environmentHumidity <= MAX_HUMIDITY &&
                waterTemp >= MIN_TEMP && waterTemp <= MAX_TEMP &&
                ph >= MIN_PH && ph <= MAX_PH &&
-               tds >= MIN_TDS && tds <= MAX_TDS;
+               ec >= MIN_EC && ec <= MAX_EC;
     }
 };
 

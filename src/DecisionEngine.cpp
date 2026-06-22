@@ -445,8 +445,7 @@ void DecisionEngine::executeActions(const std::vector<RuleAction>& actions, cons
 // ===== MÉTODOS AUXILIARES =====
 float DecisionEngine::getSensorValue(const String& sensor_name, const SystemState& state) {
     if (sensor_name == "ph") return state.ph;
-    if (sensor_name == "tds") return state.tds;
-    if (sensor_name == "ec") return state.ec;
+    if (sensor_name == "tds" || sensor_name == "ec") return state.ec;
     if (sensor_name == "temp_water") return state.temp_water;
     if (sensor_name == "temp_environment") return state.temp_environment;
     if (sensor_name == "humidity") return state.humidity;

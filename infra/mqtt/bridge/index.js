@@ -1,15 +1,15 @@
-/**
- * HIDROWAVE Bridge — telemetria + heartbeat + presença + Auto EC UX
+﻿/**
+ * HIDROWAVE Bridge â€” telemetria + heartbeat + presenÃ§a + Auto EC UX
  * Subscribe:
- *   hidrowave/+/telemetry     → INSERT hydro_measurements + environment_data
- *   hidrowave/+/heartbeat       → PATCH device_status
- *   hidrowave/+/status          → PATCH device_status.is_online (LWT)
- *   hidrowave/+/ec_operation    → PATCH relay_master.ec_operation_*
- *   hidrowave/+/dose            → INSERT nutrient_dosages
- *   hidrowave/+/ph_operation    → PATCH relay_master.ph_operation_*
- *   hidrowave/+/ph_dose         → INSERT ph_dosages
- *   hidrowave/+/ec_metric       → INSERT ec_controller_metrics
- *   hidrowave/+/ph_metric       → INSERT ph_controller_metrics
+ *   hidrowave/+/telemetry     â†’ INSERT hydro_measurements + environment_data
+ *   hidrowave/+/heartbeat       â†’ PATCH device_status
+ *   hidrowave/+/status          â†’ PATCH device_status.is_online (LWT)
+ *   hidrowave/+/ec_operation    â†’ PATCH relay_master.ec_operation_*
+ *   hidrowave/+/dose            â†’ INSERT nutrient_dosages
+ *   hidrowave/+/ph_operation    â†’ PATCH relay_master.ph_operation_*
+ *   hidrowave/+/ph_dose         â†’ INSERT ph_dosages
+ *   hidrowave/+/ec_metric       â†’ INSERT ec_controller_metrics
+ *   hidrowave/+/ph_metric       â†’ INSERT ph_controller_metrics
  */
 import 'dotenv/config';
 import mqtt from 'mqtt';
@@ -28,6 +28,7 @@ const TOPICS = [
   'hidrowave/+/ph_dose',
   'hidrowave/+/ec_metric',
   'hidrowave/+/ph_metric',
+  'hidrowave/+/ec_dilution',
 ];
 
 const EC_OPERATION_STATES = new Set([
@@ -36,7 +37,11 @@ const EC_OPERATION_STATES = new Set([
   'waiting_nutrient',
   'recirculating',
   'ec_check_pending',
+  'diluting_draining',
+  'diluting_filling',
 ]);
+
+const EC_DILUTION_SOURCES = new Set(['auto', 'manual', 'web']);
 
 const DOSE_SOURCES = new Set(['auto_ec', 'manual', 'web']);
 const WATER_LEVEL_VALUES = new Set(['vazio', 'baixo', 'medio', 'alto']);
@@ -156,11 +161,11 @@ function logEnvironmentValues(deviceId, airTemp, humidity) {
   const humStr = Number.isNaN(humidity) ? 'n/a' : humidity;
   console.log(
     `[bridge] environment_data ${deviceId} temp=${tempStr} hum=${humStr} ` +
-      `(restricões temp ${ENV_TEMP_MIN}-${ENV_TEMP_MAX}, hum ${ENV_HUMIDITY_MIN}-${ENV_HUMIDITY_MAX})`
+      `(restricÃµes temp ${ENV_TEMP_MIN}-${ENV_TEMP_MAX}, hum ${ENV_HUMIDITY_MIN}-${ENV_HUMIDITY_MAX})`
   );
 }
 
-/** ph_controller_metrics.ph_before es numeric(8,3) — clamp PV RS485 basura en banco */
+/** ph_controller_metrics.ph_before es numeric(8,3) â€” clamp PV RS485 basura en banco */
 function clampPhMetricColumn(ph) {
   if (!Number.isFinite(ph)) return 0;
   const MAG = 99.999;
@@ -181,7 +186,7 @@ function sanitizeErrorH(phBefore, phSetpoint, errorH) {
   return h;
 }
 
-/** pH clamp 0–14 para gráficos (ph_display_clamped); ph_raw guarda PV MQTT crudo. */
+/** pH clamp 0â€“14 para grÃ¡ficos (ph_display_clamped); ph_raw guarda PV MQTT crudo. */
 function clampPhDisplay(ph) {
   if (!Number.isFinite(ph)) return null;
   if (ph < 0) return 0;
@@ -202,16 +207,15 @@ function applyHydroRawColumns(hydroRow, { ph, temperature, tds, ec }) {
     hydroRow.temperature_raw = temperature;
     hydroRow.temperature = temperature;
   }
-  if (Number.isFinite(tds)) {
-    hydroRow.tds = tds;
-  }
+  let ecUsCm = null;
   if (Number.isFinite(ec)) {
-    hydroRow.ec_raw = ec;
-    if (!Number.isFinite(tds)) {
-      hydroRow.tds = Math.round((ec / 2) * 100) / 100;
-    }
+    ecUsCm = Math.round(ec * 100) / 100;
   } else if (Number.isFinite(tds)) {
-    hydroRow.ec_raw = Math.round(tds * 2 * 100) / 100;
+    ecUsCm = Math.round(tds * 100) / 100;
+  }
+  if (ecUsCm != null) {
+    hydroRow.ec = ecUsCm;
+    hydroRow.ec_raw = ecUsCm;
   }
 }
 
@@ -422,6 +426,12 @@ function validateEcOperation(deviceId, payload) {
       ec_operation_state: state,
       ec_operation_remaining_sec: Math.floor(remaining),
       ec_next_check_in_sec: Math.floor(nextCheck),
+      ...(Number.isFinite(Number(payload.dilution_target_l))
+        ? { ec_dilution_target_l: Number(payload.dilution_target_l) }
+        : {}),
+      ...(Number.isFinite(Number(payload.dilution_progress_l))
+        ? { ec_dilution_progress_l: Number(payload.dilution_progress_l) }
+        : {}),
     },
   };
 }
@@ -558,7 +568,7 @@ function validatePhMetric(deviceId, payload) {
   errorH = sanitizeErrorH(phBeforeRaw, phSetpoint, errorH);
   if (phBeforeRaw !== phBefore) {
     console.log(
-      `[bridge] ph_metric ${deviceId} ph_before clamped ${phBeforeRaw} → ${phBefore} (numeric(8,3))`
+      `[bridge] ph_metric ${deviceId} ph_before clamped ${phBeforeRaw} â†’ ${phBefore} (numeric(8,3))`
     );
   }
   if (!Number.isFinite(doseRealMl) || doseRealMl < 0) {
@@ -570,7 +580,7 @@ function validatePhMetric(deviceId, payload) {
   const dosageTimeDb = clampDbNumeric(dosageTimeSeconds, 99999999.99, 2);
   if (doseIdealMl !== doseIdealDb || doseRealMl !== doseRealDb) {
     console.log(
-      `[bridge] ph_metric ${deviceId} dose clamped ideal=${doseIdealMl}→${doseIdealDb} real=${doseRealMl}→${doseRealDb}`
+      `[bridge] ph_metric ${deviceId} dose clamped ideal=${doseIdealMl}â†’${doseIdealDb} real=${doseRealMl}â†’${doseRealDb}`
     );
   }
 
@@ -777,7 +787,7 @@ const HYDRO_INSERT_COLUMNS = new Set([
   'ph',
   'ph_raw',
   'ph_display_clamped',
-  'tds',
+  'ec',
   'ec_raw',
 ]);
 
@@ -805,14 +815,15 @@ function hasHydroSensorPayload(hydroRow, sensorFields) {
   return (
     finiteNonZero(hydroRow.ph_raw) ||
     finiteNonZero(hydroRow.temperature_raw) ||
-    finiteNonZero(hydroRow.tds) ||
+    finiteNonZero(hydroRow.ec) ||
     finiteNonZero(hydroRow.ec_raw) ||
+    finiteNonZero(hydroRow.tds) ||
     finiteNonZero(hydroRow.temperature)
   );
 }
 
-/** Legacy NOT NULL en Supabase — solo rellena columnas que faltan cuando hay PV real */
-function applyLegacyHydroNotNullDefaults(row) {
+/** Legacy NOT NULL en Supabase â€” solo rellena columnas que faltan cuando hay PV real */
+function applyLegacyHydroNotNullDefaults(row, sensorFields) {
   const out = { ...row };
   if (out.ph == null && out.ph_display_clamped != null) {
     out.ph = out.ph_display_clamped;
@@ -820,24 +831,22 @@ function applyLegacyHydroNotNullDefaults(row) {
     const clamped = clampPhDisplay(out.ph_raw);
     if (clamped != null) out.ph = clamped;
   }
-  if (out.temperature == null && out.temperature_raw == null) {
+  const hasTemp = sensorFields?.hasTemp;
+  if (out.temperature == null && out.temperature_raw == null && hasTemp) {
     out.temperature = 0;
-  }
-  if (out.tds == null) {
-    out.tds = 0;
   }
   return out;
 }
 
-async function insertHydro(row) {
-  const payload = pickHydroInsertRow(applyLegacyHydroNotNullDefaults(row));
+async function insertHydro(row, sensorFields) {
+  const payload = pickHydroInsertRow(applyLegacyHydroNotNullDefaults(row, sensorFields));
   const { error } = await supabase.from('hydro_measurements').insert(payload);
   if (error) {
     console.error(`[bridge] Supabase insert failed (${payload.device_id}):`, error.message);
     return false;
   }
   console.log(
-    `[bridge] INSERT hydro_measurements ${payload.device_id} ph_raw=${payload.ph_raw ?? '-'} ph_disp=${payload.ph_display_clamped ?? payload.ph ?? '-'} tds=${payload.tds ?? '-'} ec_raw=${payload.ec_raw ?? '-'}`
+    `[bridge] INSERT hydro_measurements ${payload.device_id} ph_raw=${payload.ph_raw ?? '-'} ph_disp=${payload.ph_display_clamped ?? payload.ph ?? '-'} ec=${payload.ec ?? '-'} ec_raw=${payload.ec_raw ?? '-'}`
   );
   return true;
 }
@@ -916,7 +925,7 @@ async function ensureRelayMasterRow(deviceId) {
   }
   if (!ds) {
     console.warn(
-      `[bridge] relay_master row missing — device_status not found for ${deviceId} (register device first)`
+      `[bridge] relay_master row missing â€” device_status not found for ${deviceId} (register device first)`
     );
     return false;
   }
@@ -966,6 +975,12 @@ async function patchEcOperation(row) {
     ec_operation_remaining_sec: row.ec_operation_remaining_sec,
     ec_next_check_in_sec: row.ec_next_check_in_sec,
   };
+  if (row.ec_dilution_target_l != null) {
+    patch.ec_dilution_target_l = row.ec_dilution_target_l;
+  }
+  if (row.ec_dilution_progress_l != null) {
+    patch.ec_dilution_progress_l = row.ec_dilution_progress_l;
+  }
 
   const ok = await patchRelayMasterOperation(row.device_id, patch, 'ec_operation');
   if (!ok) return false;
@@ -1100,9 +1115,9 @@ async function handleTelemetry(topic, message) {
   }
 
   if (hasHydroSensorPayload(validated.hydroRow, validated.sensorFields)) {
-    await insertHydro(validated.hydroRow);
+    await insertHydro(validated.hydroRow, validated.sensorFields);
   } else {
-    console.log(`[bridge] telemetry ${deviceId} levels-only — skip hydro_measurements INSERT`);
+    console.log(`[bridge] telemetry ${deviceId} levels-only â€” skip hydro_measurements INSERT`);
   }
   if (validated.deviceStatusPatch) {
     await patchDeviceLevel(deviceId, validated.deviceStatusPatch);
@@ -1173,6 +1188,102 @@ async function handleEcOperation(topic, message) {
   if (ok) {
     rememberEcOperation(deviceId, validated.row);
   }
+}
+
+function validateEcDilution(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const sequenceId = String(payload.sequence_id || '').trim();
+  const source = String(payload.source || 'auto');
+  const volumeTarget = Number(payload.volume_target_l);
+  const volumeMeasured = Number(payload.volume_measured_l);
+
+  if (!sequenceId) {
+    return { ok: false, reason: 'sequence_id required' };
+  }
+  if (!EC_DILUTION_SOURCES.has(source)) {
+    return { ok: false, reason: `invalid source: ${source}` };
+  }
+  if (!Number.isFinite(volumeTarget) || volumeTarget < 0) {
+    return { ok: false, reason: 'volume_target_l invalid' };
+  }
+  if (!Number.isFinite(volumeMeasured) || volumeMeasured < 0) {
+    return { ok: false, reason: 'volume_measured_l invalid' };
+  }
+
+  return {
+    ok: true,
+    row: {
+      device_id: deviceId,
+      sequence_id: sequenceId,
+      source,
+      ec_before: payload.ec_before != null ? Number(payload.ec_before) : null,
+      ec_setpoint: payload.ec_setpoint != null ? Number(payload.ec_setpoint) : null,
+      volume_target_l: Math.round(volumeTarget * 1000) / 1000,
+      volume_measured_l: Math.round(volumeMeasured * 1000) / 1000,
+      drain_duration_s:
+        payload.drain_duration_s != null ? Number(payload.drain_duration_s) : null,
+      fill_duration_s:
+        payload.fill_duration_s != null ? Number(payload.fill_duration_s) : null,
+    },
+  };
+}
+
+async function insertEcDilution(row) {
+  const payload = {
+    device_id: row.device_id,
+    sequence_id: row.sequence_id,
+    source: row.source,
+    volume_target_l: row.volume_target_l,
+    volume_measured_l: row.volume_measured_l,
+  };
+  if (row.ec_before != null && Number.isFinite(row.ec_before)) {
+    payload.ec_before = row.ec_before;
+  }
+  if (row.ec_setpoint != null && Number.isFinite(row.ec_setpoint)) {
+    payload.ec_setpoint = row.ec_setpoint;
+  }
+  if (row.drain_duration_s != null && Number.isFinite(row.drain_duration_s)) {
+    payload.drain_duration_s = row.drain_duration_s;
+  }
+  if (row.fill_duration_s != null && Number.isFinite(row.fill_duration_s)) {
+    payload.fill_duration_s = row.fill_duration_s;
+  }
+
+  const { error } = await supabase.from('ec_dilution_events').insert(payload);
+  if (error) {
+    console.error(`[bridge] ec_dilution_events insert failed (${row.device_id}):`, error.message);
+    return false;
+  }
+  console.log(
+    `[bridge] INSERT ec_dilution_events ${row.device_id} vol=${row.volume_measured_l}L src=${row.source}`
+  );
+  return true;
+}
+
+async function handleEcDilution(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'ec_dilution');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateEcDilution(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await insertEcDilution(validated.row);
 }
 
 async function handleDose(topic, message) {
@@ -1313,7 +1424,7 @@ async function markStaleDevicesOffline() {
   const now = Date.now();
   for (const [deviceId, lastAt] of lastHeartbeatAtByDevice.entries()) {
     if (now - lastAt >= heartbeatStaleMs) {
-      console.warn(`[bridge] Stale heartbeat ${deviceId} — marking offline`);
+      console.warn(`[bridge] Stale heartbeat ${deviceId} â€” marking offline`);
       await patchOnline(deviceId, false);
     }
   }
@@ -1360,6 +1471,8 @@ client.on('message', (topic, message) => {
       await handleEcMetric(topic, message);
     } else if (suffix === 'ph_metric') {
       await handlePhMetric(topic, message);
+    } else if (suffix === 'ec_dilution') {
+      await handleEcDilution(topic, message);
     }
   };
   run().catch((e) => {

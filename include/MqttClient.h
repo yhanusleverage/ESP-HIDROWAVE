@@ -7,7 +7,7 @@
 struct MqttTelemetryReading {
     float temperature;   // água (hydro_measurements)
     float ph;
-    float tds;
+    float ec;            // µS/cm (canónico)
     bool waterLevelOk;
     bool level1Wet;
     bool level2Wet;
@@ -16,6 +16,9 @@ struct MqttTelemetryReading {
     const char* waterLevel;  // vazio|baixo|medio|alto
     float airTemperature;  // ambiente (environment_data)
     float humidity;
+    bool phValid;      // lectura fresca y plausible (no caché stale)
+    bool ecValid;
+    bool tempValid;
 };
 
 struct MqttHeartbeatReading {
@@ -31,6 +34,21 @@ struct MqttEcOperationReading {
     const char* state;
     int operationRemainingSec;
     int nextCheckInSec;
+    float dilutionTargetL;
+    float dilutionProgressL;
+    float ecOvershootUs;
+    bool hasDilutionProgress;
+};
+
+struct MqttEcDilutionReading {
+    const char* sequenceId;
+    float ecBefore;
+    float ecSetpoint;
+    float volumeTargetL;
+    float volumeMeasuredL;
+    float drainDurationSec;
+    float fillDurationSec;
+    const char* source;
 };
 
 struct MqttDoseReading {
@@ -115,6 +133,7 @@ public:
     bool publishTelemetry(const MqttTelemetryReading& reading);
     bool publishHeartbeat(const MqttHeartbeatReading& reading);
     bool publishEcOperation(const MqttEcOperationReading& reading);
+    bool publishEcDilution(const MqttEcDilutionReading& reading);
     bool publishDose(const MqttDoseReading& reading);
     bool publishPhOperation(const MqttPhOperationReading& reading);
     bool publishPhDose(const MqttPhDoseReading& reading);
@@ -137,6 +156,7 @@ private:
     String phDoseTopic;
     String ecMetricTopic;
     String phMetricTopic;
+    String ecDilutionTopic;
     char lwtPayload[128];
     unsigned long lastReconnectAttempt;
     unsigned long reconnectIntervalMs;
@@ -161,6 +181,7 @@ public:
     bool publishTelemetry(const MqttTelemetryReading&) { return false; }
     bool publishHeartbeat(const MqttHeartbeatReading&) { return false; }
     bool publishEcOperation(const MqttEcOperationReading&) { return false; }
+    bool publishEcDilution(const MqttEcDilutionReading&) { return false; }
     bool publishDose(const MqttDoseReading&) { return false; }
     bool publishPhOperation(const MqttPhOperationReading&) { return false; }
     bool publishPhDose(const MqttPhDoseReading&) { return false; }

@@ -72,7 +72,7 @@ function fmtPh(v) {
 function summarize(suffix, data) {
   switch (suffix) {
     case 'telemetry':
-      return `ph=${fmtPh(data.ph)} ec=${data.ec ?? '--'} temp=${data.temperature ?? '--'} tds=${data.tds ?? '--'}`;
+      return `ph=${fmtPh(data.ph)} ec=${data.ec ?? '--'} temp=${data.temperature ?? '--'}`;
     case 'heartbeat':
       return `online=${data.online ?? true} uptime=${data.uptime_sec ?? data.uptime ?? '--'}s`;
     case 'status':

@@ -13,15 +13,16 @@ topic read hidrowave/+/ph_operation
 topic read hidrowave/+/ph_dose
 topic read hidrowave/+/ec_metric
 topic read hidrowave/+/ph_metric
+topic read hidrowave/+/ec_dilution
 topic read hidrowave/+/relay/state
+
+# --- UI / Railway publish (Fase 3 comandos — NÃO é bridge_internal) ---
+user hidrowave
 topic write hidrowave/+/command
+topic read hidrowave/+/#
 
 # --- Um ESP (substituir XXXXXX pelo sufixo MAC) ---
 user mqtt_ESP32_HIDRO_XXXXXX
 topic read hidrowave/ESP32_HIDRO_XXXXXX/command
 topic write hidrowave/ESP32_HIDRO_XXXXXX/#
 
-# --- Dev temporário (remover em produção se usar user por device) ---
-# user hidrowave
-# topic read hidrowave/ESP32_HIDRO_269844/command
-# topic write hidrowave/ESP32_HIDRO_269844/#

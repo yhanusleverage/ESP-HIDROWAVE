@@ -428,7 +428,7 @@ bool SupabaseClient::sendHydroData(const HydroReading& reading) {
     Serial.printf("🔍 [HYDRO] Device ID: %s\n", getDeviceID().c_str());
     Serial.printf("   Temp: %.2f°C (min: %.1f, max: %.1f)\n", reading.temperature, MIN_TEMP, MAX_TEMP);
     Serial.printf("   pH: %.2f (min: %.1f, max: %.1f)\n", reading.ph, MIN_PH, MAX_PH);
-    Serial.printf("   TDS: %.2f ppm (min: %.1f, max: %.1f)\n", reading.tds, MIN_TDS, MAX_TDS);
+    Serial.printf("   EC: %.2f µS/cm (min: %.1f, max: %.1f)\n", reading.ec, MIN_EC, MAX_EC);
     Serial.printf("   Water Level OK: %s\n", reading.waterLevelOk ? "SIM" : "NÃO");
     
     // ✅ VALIDAÇÃO ANTES DE ENVIAR: Verificar valores válidos
@@ -457,13 +457,9 @@ bool SupabaseClient::sendHydroData(const HydroReading& reading) {
         return false;
     }
     
-    if (std::isnan(reading.tds) || std::isinf(reading.tds)) {
-        Serial.printf("❌ [HYDRO] TDS é NaN ou Inf: %.2f (ignorando envio)\n", reading.tds);
-        return false;
-    }
-    if (reading.tds < MIN_TDS || reading.tds > MAX_TDS) {
-        Serial.printf("❌ [HYDRO] TDS fora do intervalo: %.2f (min: %.1f, max: %.1f)\n", 
-            reading.tds, MIN_TDS, MAX_TDS);
+    if (!isfinite(reading.ec) || reading.ec < MIN_EC || reading.ec > MAX_EC) {
+        Serial.printf("❌ [HYDRO] EC fora do intervalo: %.2f (min: %.1f, max: %.1f)\n",
+            reading.ec, MIN_EC, MAX_EC);
         return false;
     }
     
@@ -478,12 +474,12 @@ bool SupabaseClient::sendHydroData(const HydroReading& reading) {
     if (result) {
         Serial.println("✅ [HYDRO] Dados hidropônicos enviados com sucesso!");
         Serial.printf("   ✅ Device ID: %s\n", getDeviceID().c_str());
-        Serial.printf("   ✅ TDS: %.2f ppm\n", reading.tds);
+        Serial.printf("   ✅ EC: %.2f µS/cm\n", reading.ec);
         Serial.println("╚════════════════════════════════════════════════════╝\n");
     } else {
         Serial.println("❌ [HYDRO] Falha ao enviar dados hidropônicos");
         Serial.printf("   ❌ Device ID: %s\n", getDeviceID().c_str());
-        Serial.printf("   ❌ TDS: %.2f ppm\n", reading.tds);
+        Serial.printf("   ❌ EC: %.2f µS/cm\n", reading.ec);
         Serial.printf("   ❌ Erro: %s\n", getLastError().c_str());
         Serial.println("╚════════════════════════════════════════════════════╝\n");
     }
@@ -604,7 +600,8 @@ String SupabaseClient::buildHydroPayload(const HydroReading& reading) {
     doc["device_id"] = deviceId;
     doc["temperature"] = reading.temperature;
     doc["ph"] = reading.ph;
-    doc["tds"] = reading.tds;
+    doc["ec"] = reading.ec;
+    doc["ec_raw"] = reading.ec;
     doc["water_level_ok"] = reading.waterLevelOk;
     doc["level_1"] = reading.level1Wet;
     doc["level_2"] = reading.level2Wet;
@@ -3513,6 +3510,12 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     config.auto_enabled = configObj["auto_enabled"] | false;
     config.intervalo_auto_ec = configObj["intervalo_auto_ec"] | 300;
     config.tempo_recirculacao = configObj["tempo_recirculacao"] | 60;
+    config.dilution_auto_enabled = configObj["dilution_auto_enabled"] | false;
+    config.dilution_drain_relay = configObj["dilution_drain_relay"] | -1;
+    config.dilution_fill_relay = configObj["dilution_fill_relay"] | -1;
+    config.dilution_max_volume_l = configObj["dilution_max_volume_l"] | 50.0;
+    config.flowmeter_pulses_per_liter = configObj["flowmeter_pulses_per_liter"] | 450.0;
+    config.dilution_fill_flow_lps = configObj["dilution_fill_flow_lps"] | 0.5;
     
     // ✅ Nutrients array (não salvo em NVS, mas usado para cálculo local)
     if (configObj.containsKey("nutrients") && configObj["nutrients"].is<JsonArray>()) {
@@ -3614,8 +3617,39 @@ bool SupabaseClient::insertNutrientDosage(const String& deviceId, const String& 
     return insert("nutrient_dosages", payload);
 }
 
+bool SupabaseClient::insertEcDilutionEvent(const String& deviceId, const String& sequenceId,
+                                            float ecBefore, float ecSetpoint,
+                                            float volumeTargetL, float volumeMeasuredL,
+                                            float drainDurationSec, float fillDurationSec,
+                                            const String& source) {
+    if (!isReady()) {
+        setError("Supabase não está pronto para insertEcDilutionEvent");
+        return false;
+    }
+
+    DynamicJsonDocument doc(512);
+    doc["device_id"] = deviceId;
+    doc["sequence_id"] = sequenceId;
+    doc["ec_before"] = round(ecBefore * 100.0) / 100.0;
+    doc["ec_setpoint"] = round(ecSetpoint * 100.0) / 100.0;
+    doc["volume_target_l"] = round(volumeTargetL * 1000.0) / 1000.0;
+    doc["volume_measured_l"] = round(volumeMeasuredL * 1000.0) / 1000.0;
+    doc["drain_duration_s"] = round(drainDurationSec * 100.0) / 100.0;
+    doc["fill_duration_s"] = round(fillDurationSec * 100.0) / 100.0;
+    doc["source"] = source;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Serial.printf("💾 [DILUTION] INSERT ec_dilution_events: %.2f L (medido %.2f L)\n",
+                  volumeTargetL, volumeMeasuredL);
+
+    return insert("ec_dilution_events", payload);
+}
+
 bool SupabaseClient::updateEcOperationState(const String& deviceId, const String& state,
-                                            int operationRemainingSec, int nextCheckInSec) {
+                                            int operationRemainingSec, int nextCheckInSec,
+                                            float dilutionTargetL, float dilutionProgressL) {
     if (!isReady()) {
         return false;
     }
@@ -3630,6 +3664,12 @@ bool SupabaseClient::updateEcOperationState(const String& deviceId, const String
     doc["ec_operation_state"] = state;
     doc["ec_operation_remaining_sec"] = operationRemainingSec > 0 ? operationRemainingSec : 0;
     doc["ec_next_check_in_sec"] = nextCheckInSec > 0 ? nextCheckInSec : 0;
+    if (dilutionTargetL >= 0.0f) {
+        doc["ec_dilution_target_l"] = round(dilutionTargetL * 100.0) / 100.0;
+    }
+    if (dilutionProgressL >= 0.0f) {
+        doc["ec_dilution_progress_l"] = round(dilutionProgressL * 100.0) / 100.0;
+    }
 
     String payload;
     serializeJson(doc, payload);

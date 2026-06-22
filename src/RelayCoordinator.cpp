@@ -12,6 +12,7 @@ const char* relayOwnerName(RelayOwner owner) {
     switch (owner) {
         case RelayOwner::AutoEcRecirc: return "AutoEcRecirc";
         case RelayOwner::AutoPhRecirc: return "AutoPhRecirc";
+        case RelayOwner::AutoEcDilution: return "AutoEcDilution";
         case RelayOwner::ScheduleP4: return "ScheduleP4";
         case RelayOwner::TankScriptP1: return "TankScriptP1";
         case RelayOwner::Manual: return "Manual";

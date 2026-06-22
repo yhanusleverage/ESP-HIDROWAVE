@@ -198,7 +198,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
         doc["temperature"] = this->hydroControl ? this->hydroControl->getTemperature() : 0.0;
         doc["humidity"] = 65.0; // Simulated - implementar DHT22 se necessário
         doc["ph"] = this->hydroControl ? this->hydroControl->getpH() : 0.0;
-        doc["tds"] = this->hydroControl ? this->hydroControl->getTDS() : 0.0;
+        doc["ec"] = this->hydroControl ? this->hydroControl->getEC() : 0.0;
         doc["water_level_ok"] = this->hydroControl ? this->hydroControl->isWaterLevelOk() : false;
         doc["temp_water"] = this->hydroControl ? this->hydroControl->getTemperature() : 0.0; // Mesmo sensor por enquanto
         doc["timestamp"] = millis();

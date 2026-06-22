@@ -19,7 +19,7 @@ struct EnvironmentReading {
 struct HydroReading {
     float temperature;
     float ph;
-    float tds;
+    float ec;  // µS/cm canónico
     bool waterLevelOk;
     bool level1Wet;
     bool level2Wet;
@@ -82,6 +82,12 @@ struct ECConfig {
     int intervalo_auto_ec;
     unsigned long tempo_recirculacao;  // Em segundos
     String nutrientsJson;  // JSON string de nutrientes (não salvo em NVS, usado para cálculo local)
+    bool dilution_auto_enabled;
+    int dilution_drain_relay;
+    int dilution_fill_relay;
+    double dilution_max_volume_l;
+    double flowmeter_pulses_per_liter;
+    double dilution_fill_flow_lps;
     
     bool isValid;
 };
@@ -195,9 +201,17 @@ public:
                               float ecBefore, float ecSetpoint,
                               const String& source = "auto_ec");
 
+    bool insertEcDilutionEvent(const String& deviceId, const String& sequenceId,
+                               float ecBefore, float ecSetpoint,
+                               float volumeTargetL, float volumeMeasuredL,
+                               float drainDurationSec, float fillDurationSec,
+                               const String& source = "auto");
+
     /** Publica estado operacional Auto EC em relay_master. */
     bool updateEcOperationState(const String& deviceId, const String& state,
-                                int operationRemainingSec, int nextCheckInSec);
+                                int operationRemainingSec, int nextCheckInSec,
+                                float dilutionTargetL = -1.0f,
+                                float dilutionProgressL = -1.0f);
 
     bool updatePhOperationState(const String& deviceId, const String& state,
                                 int operationRemainingSec, int nextCheckInSec);

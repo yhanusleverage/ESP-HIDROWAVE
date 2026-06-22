@@ -10,6 +10,7 @@ enum class RelayOwner : uint8_t {
     None = 0,
     AutoEcRecirc,
     AutoPhRecirc,
+    AutoEcDilution,
     ScheduleP4,
     TankScriptP1,
     Manual,

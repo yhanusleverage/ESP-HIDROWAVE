@@ -75,7 +75,7 @@ void DiagWebServer::setupAPIEndpoints() {
         doc["environment"]["humidity"] = sensorData->environmentHumidity;
         doc["water"]["temperature"] = sensorData->waterTemp;
         doc["water"]["ph"] = sensorData->ph;
-        doc["water"]["tds"] = sensorData->tds;
+        doc["water"]["ec"] = sensorData->ec;
         doc["water"]["level"] = sensorData->waterLevelOk;
         doc["timestamp"] = sensorData->timestamp;
         doc["valid"] = sensorData->valid;

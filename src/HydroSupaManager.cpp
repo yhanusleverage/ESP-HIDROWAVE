@@ -143,7 +143,7 @@ void HydroSupaManager::sendHttpData() {
     HydroReading hydroData = {
         .temperature = 22.8,
         .ph = 6.5,
-        .tds = 850.0,
+        .ec = 850.0,
         .waterLevelOk = true,
         .level1Wet = false,
         .level2Wet = false,

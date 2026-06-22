@@ -396,6 +396,14 @@ void HydroStateManager::handleSerialCommand(const String& command) {
         // Comando ESP-NOW disponível em todos os estados
         printESPNowStatus();
     }
+    else if (hydroCore && (command.startsWith("EC ") || command == "EC CAL 1413")) {
+        if (currentState == HYDRO_ACTIVE_MODE || currentState == ADMIN_PANEL_MODE) {
+            if (hydroCore->getHydroControl().processEcSerialCommand(command)) {
+                return;
+            }
+        }
+        Serial.println("❓ Comando EC no disponible en estado: " + getStateString());
+    }
     else {
         // ✅ CORREÇÃO: Ignorar comandos vazios silenciosamente
         if (command.length() == 0) {

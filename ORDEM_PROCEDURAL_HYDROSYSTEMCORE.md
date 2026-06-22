@@ -83,7 +83,7 @@ Este documento descreve a **ordem procedural obrigatória** de inicialização d
          ├─→ Escanear dispositivos I2C
          ├─→ lcd.begin()  ← LCD
          ├─→ sensors.begin()  ← Sensores DS18B20
-         ├─→ pHSensor = new phSensor()  ← Sensor pH
+         ├─→ phModbusSensor->begin()  ← pH Modbus RS485 (USE_PH_MODBUS_SENSOR=1)
          ├─→ tdsSensor = new TDSReaderSerial()  ← Sensor TDS
          ├─→ tankSensor = new LevelSensor()  ← Sensor de nível
          ├─→ pcf1.begin()  ← PCF8574 #1 (Relés 1-7)
@@ -159,7 +159,7 @@ Este documento descreve a **ordem procedural obrigatória** de inicialização d
    ↓
 5. sensors.begin()  ← Sensores DS18B20
    ↓
-6. pHSensor = new phSensor()  ← Sensor pH
+6. phModbusSensor + EcAnalogSensor (GPIO33 EC, RS485 pH)  ← Sensores
    ↓
 7. tdsSensor = new TDSReaderSerial()  ← Sensor TDS
    ↓
@@ -371,7 +371,7 @@ HydroSystemCore::begin()
 │   ├─→ Wire.begin()
 │   ├─→ lcd.begin()
 │   ├─→ sensors.begin()
-│   ├─→ pHSensor, tdsSensor, tankSensor
+│   ├─→ phModbusSensor, ecSensor, tankSensor (simulado si HIDRO_SIMULATE_WATER_LEVELS)
 │   └─→ pcf1.begin(), pcf2.begin()
 ├─→ SupabaseClient::begin()
 │   ├─→ Conectar Supabase
@@ -403,7 +403,7 @@ HydroSystemCore::begin()
         - [ ] `Wire.begin()`
         - [ ] `lcd.begin()`
         - [ ] `sensors.begin()`
-        - [ ] `pHSensor`, `tdsSensor`, `tankSensor`
+        - [ ] `phModbusSensor`, `ecSensor`, `tankSensor` (ver docs/firmware/PH_MODBUS_INTEGRATION.md)
         - [ ] `pcf1.begin()`, `pcf2.begin()`
     - [ ] 10.2. `SupabaseClient::begin()`
     - [ ] 10.3. `WebServerManager::beginAdminServer()`

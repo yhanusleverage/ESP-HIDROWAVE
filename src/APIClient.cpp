@@ -44,7 +44,7 @@ bool APIClient::sendBatch() {
         sensorObj["envHumidity"] = data.environmentHumidity;
         sensorObj["waterTemp"] = data.waterTemp;
         sensorObj["ph"] = data.ph;
-        sensorObj["tds"] = data.tds;
+        sensorObj["ec"] = data.ec;
         sensorObj["waterLevelOk"] = data.waterLevelOk;
     }
 
@@ -301,8 +301,8 @@ bool APIClient::sendSensorData(const String& deviceId, const SensorData& data) {
     if (!isnan(data.ph)) {
         doc["ph"] = data.ph;
     }
-    if (!isnan(data.tds)) {
-        doc["tds"] = data.tds;
+    if (!isnan(data.ec)) {
+        doc["ec"] = data.ec;
     }
     doc["water_level_ok"] = data.waterLevelOk;
     

@@ -13,4 +13,7 @@ bool parseMqttRelayCommand(
     bool& outIsSlave
 );
 
+/** action=ec_dilution_start, volume_l>0 */
+bool parseMqttEcDilutionCommand(const char* payload, size_t length, float& outVolumeL);
+
 #endif

@@ -25,9 +25,9 @@ inline bool isValidTdsReading(float tds) {
     return isfinite(tds) && tds >= MIN_TDS && tds <= MAX_TDS;
 }
 
-/** EC en µS/cm — 0 suele ser fallo de sensor RS485, no agua real. */
+/** EC en µS/cm — alineado con frontend hydro-ec.ts (100–10000). */
 inline bool isValidEcMicroSiemens(float ecUsCm) {
-    return isfinite(ecUsCm) && ecUsCm > 0.0f && ecUsCm <= 10000.0f;
+    return isfinite(ecUsCm) && ecUsCm >= EC_MIN_PLAUSIBLE && ecUsCm <= EC_MAX_PLAUSIBLE;
 }
 
 inline bool isValidEnvironmentReading(float tempC, float humidity) {

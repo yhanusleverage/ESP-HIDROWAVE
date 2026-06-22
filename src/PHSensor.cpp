@@ -36,10 +36,10 @@ void phSensor::calibrate(float cal_ph7, float cal_ph4, float cal_ph10, bool use_
     Serial.println("Calibração concluída!");
 }
 
-// Calcula a média das leituras, descartando valores extremos
+// Calcula a média das leituras, descartando valores extremos (mV calibrados ESP32)
 float phSensor::getAverage(uint8_t pin) {
     for (int i = 0; i < 10; i++) {
-        buf[i] = analogRead(pin);
+        buf[i] = static_cast<int>(analogReadMilliVolts(pin));
         delay(10);
     }
 
@@ -54,14 +54,15 @@ float phSensor::getAverage(uint8_t pin) {
         }
     }
 
-    // Calcular o valor médio das leituras centrais
+    // Calcular o valor médio das leituras centrais (mV)
     int valorMedio = 0;
     for (int i = 2; i < 8; i++) {
         valorMedio += buf[i];
     }
+    valorMedio /= 6;
 
-    // Converter o valor médio para voltagem
-    return (valorMedio * 3.3) / 4095.0 / 6;
+    // mV no pino após divisor 1:6 do módulo pH
+    return (static_cast<float>(valorMedio) / 1000.0f) / 6.0f;
 }
 
 // Converte voltagem para valor de pH usando equação da reta

@@ -167,8 +167,8 @@ void DecisionEngineIntegration::updateSystemStateFromSensors() {
     
     // Dados dos sensores
     state.ph = hydroControl->getpH();
-    state.tds = hydroControl->getTDS();
     state.ec = hydroControl->getEC();
+    state.tds = state.ec;
     state.temp_water = hydroControl->getWaterTemp();
     state.temp_environment = hydroControl->getTemperature();
     state.water_level_ok = hydroControl->isWaterLevelOk();
@@ -448,7 +448,6 @@ void DecisionEngineIntegration::sendTelemetryToSupabase() {
     // Dados dos sensores
     if (hydroControl) {
         doc["ph"] = hydroControl->getpH();
-        doc["tds"] = hydroControl->getTDS();
         doc["ec"] = hydroControl->getEC();
         doc["water_temp"] = hydroControl->getWaterTemp();
         doc["env_temp"] = hydroControl->getTemperature();

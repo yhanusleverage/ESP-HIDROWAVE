@@ -8,11 +8,17 @@
 #include <DallasTemperature.h>
 #include <PCF8574.h>
 #include "Config.h"
+#if USE_PH_MODBUS_SENSOR
+#include "PhModbusSensor.h"
+#else
 #include "PHSensor.h"
-#include "TDSReaderSerial.h"
+#endif
+#include "EcAnalogSensor.h"
 #include "LevelSensor.h"
 #include "DiscreteLevelBank.h"
 #include "Controller.h"  // ✅ Controller KP para controle automático de EC
+#include "EcDilutionController.h"
+#include "FlowmeterSensor.h"
 #include "AdaptivePHController.h"
 #include <ArduinoJson.h>  // ✅ Para JsonArray en executeWebDosage
 #include "PreferencesManager.h"  // ✅ Para persistência em NVS
@@ -26,6 +32,13 @@ enum SequentialState {
     DOSING,         // Dosando nutriente atual
     WAITING,        // Pausa curta entre nutrientes (~3s) — publicado como "dosing" na UI
     RECIRCULATING   // Aguardando tempo_recirculacao após secuencia completa
+};
+
+enum DilutionState {
+    DILUTION_IDLE,
+    DILUTION_DRAINING,
+    DILUTION_FILLING,
+    DILUTION_RECIRCULATING
 };
 
 struct SimpleNutrient {
@@ -111,6 +124,20 @@ struct PhControllerMetricEvent {
 typedef void (*EcMetricCallback)(const EcControllerMetricEvent* event, void* userData);
 typedef void (*PhMetricCallback)(const PhControllerMetricEvent* event, void* userData);
 
+/** Evento ao completar diluição EC (dreno + reposição). */
+struct EcDilutionEvent {
+    char sequenceId[24];
+    float ecBefore;
+    float ecSetpoint;
+    float volumeTargetL;
+    float volumeMeasuredL;
+    float drainDurationSec;
+    float fillDurationSec;
+    const char* source;
+};
+
+typedef void (*EcDilutionCallback)(const EcDilutionEvent* event, void* userData);
+
 class HydroControl {
 public:
     #ifndef NUM_RELAYS
@@ -149,6 +176,10 @@ public:
     const float& getTDS() const { return tds; }
     float& getEC() { return ec; }
     const float& getEC() const { return ec; }
+    bool isEcValid() const { return ecValid; }
+    bool isPhValidForTelemetry() const;
+    bool isEcValidForTelemetry() const;
+    bool isTempValidForTelemetry() const;
     String getTankStatus();
     float getWaterTemp();
     
@@ -175,6 +206,19 @@ public:
     const char* getEcOperationStateName() const;
     int getEcOperationRemainingSec() const;
     int getEcNextCheckInSec() const;
+    float getEcDilutionTargetL() const { return dilutionTargetL; }
+    float getEcDilutionProgressL() const { return dilutionProgressL; }
+    bool isDilutionActive() const { return dilutionState != DILUTION_IDLE; }
+
+    void setDilutionAutoEnabled(bool enabled, bool saveToNVS = true);
+    bool isDilutionAutoEnabled() const { return dilutionAutoEnabled; }
+    void setDilutionRelays(int drainRelay, int fillRelay);
+    void setDilutionMaxVolumeL(float maxL);
+    void setDilutionFillFlowLps(float lps);
+    void setFlowmeterPulsesPerLiter(float ppl);
+    bool startEcDilution(float volumeLiters, const char* source);
+    void setEcDilutionCallback(EcDilutionCallback cb, void* userData);
+    EcDilutionController& getEcDilutionController() { return ecDilutionController; }
 
     // ✅ Auto pH adaptativo
     AdaptivePHController& getAdaptivePHController() { return adaptivePhController; }
@@ -216,7 +260,8 @@ public:
     void setTDSVRef(float vref);  // Atualizar tensão de referência
     float getTDSCalibrationFactor() const;  // Obter fator de calibração atual
     float getTDSVRef() const;  // Obter tensão de referência atual
-    void saveTDSCalibration();  // Salvar calibração TDS no NVS
+    void saveTDSCalibration();  // Salvar calibração EC no NVS
+    bool processEcSerialCommand(const String& command);
     
     // ✅ Sistema Sequencial de Dosagem
     void startSimpleSequentialDosage(float totalML, float ecSetpoint, float ecActual);
@@ -234,8 +279,12 @@ private:
     OneWire oneWire;
     DallasTemperature sensors;
     PCF8574 pcf1, pcf2;
+#if USE_PH_MODBUS_SENSOR
+    PhModbusSensor* phModbusSensor;
+#else
     phSensor* pHSensor;
-    TDSReaderSerial* tdsSensor;
+#endif
+    EcAnalogSensor* ecSensor;
     LevelSensor* tankSensor;
     DiscreteLevelBank levelBank;
     
@@ -252,7 +301,12 @@ private:
     float pH;
     float tds;
     float ec;
-    bool ecValid; // ✅ Flag para indicar se EC é confiável (buffer TDS cheio)
+    bool ecValid;
+    bool phValid;
+    bool tempValid;
+    unsigned long lastPhValidMs;
+    unsigned long lastEcValidMs;
+    unsigned long lastTempValidMs;
     
     // Estado dos relés
     bool relayStates[NUM_RELAYS];
@@ -261,6 +315,8 @@ private:
     
     // ✅ Controller KP e controle automático de EC
     ECController ecController;
+    EcDilutionController ecDilutionController;
+    FlowmeterSensor* flowmeterSensor;
     float ecSetpoint;
     float ecTolerance;
     bool autoECEnabled;
@@ -322,6 +378,28 @@ private:
     void* phMetricCallbackUserData;
     PhGainLearnedCallback phGainLearnedCallback;
     void* phGainLearnedCallbackUserData;
+
+    // Diluição EC modo A
+    DilutionState dilutionState;
+    bool dilutionAutoEnabled;
+    int dilutionDrainRelay;
+    int dilutionFillRelay;
+    float dilutionMaxVolumeL;
+    float dilutionFillFlowLps;
+    float dilutionTargetL;
+    float dilutionProgressL;
+    float dilutionDrainMeasuredL;
+    unsigned long dilutionStateStartMs;
+    unsigned long dilutionDrainStartMs;
+    unsigned long dilutionFillStartMs;
+    unsigned long dilutionFillDurationMs;
+    unsigned long dilutionLastPulseMs;
+    uint32_t dilutionLastPulseCount;
+    String dilutionSequenceId;
+    const char* dilutionSource;
+    float dilutionEcBefore;
+    EcDilutionCallback ecDilutionCallback;
+    void* ecDilutionCallbackUserData;
     
     // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
     unsigned long lastDosageCompleteTime;  // Timestamp da última dosagem completa
@@ -359,10 +437,15 @@ private:
     void updateSensors();
     void updateDisplay();
     void checkRelayTimers();
-    void checkAutoEC();  // ✅ Verificar e ajustar EC automaticamente
+    void checkAutoEC();
     void checkAutoPH();  // ✅ Verificar e ajustar pH automaticamente
     void processPhAutoState();
     void processSimpleSequential();  // ✅ Máquina de estados para dosagem sequencial
+    void processDilution();
+    void setDilutionRelay(int relayIndex, bool on);
+    void finishDilutionDrainPhase();
+    void finishDilutionSequence(bool success);
+    void emitEcDilutionEvent();
     void emitNutrientDoseEvent(const SimpleNutrient& nutrient);
     void notifyEcOperationChanged();
     void notifyPhOperationChanged();
@@ -384,6 +467,8 @@ private:
     void loadECControllerConfig();  // Carregar configuração do Controller ao iniciar
     void loadPHControllerConfig();  // Carregar SP/auto/interval pH do NVS ao iniciar
     void loadNutrientProportions();  // Carregar proporções nutricionais ao iniciar
+    void loadEcCalibrationFromNVS();
+    void saveEcCalibrationToNVS();
 };
 
 #endif

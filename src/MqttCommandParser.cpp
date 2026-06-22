@@ -1,6 +1,7 @@
 #include "MqttCommandParser.h"
 
 #include <cstring>
+#include <math.h>
 
 static bool isValidMacString(const String& mac) {
     if (mac.length() != 17) {
@@ -123,5 +124,36 @@ bool parseMqttRelayCommand(
         out.rule_name = doc["rule_name"].as<String>();
     }
 
+    return true;
+}
+
+bool parseMqttEcDilutionCommand(const char* payload, size_t length, float& outVolumeL) {
+    outVolumeL = 0.0f;
+    if (!payload || length == 0 || length > 480) {
+        return false;
+    }
+
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+        return false;
+    }
+
+    if ((doc["v"] | 0) != 1) {
+        return false;
+    }
+
+    const char* action = doc["action"] | "";
+    if (strcmp(action, "ec_dilution_start") != 0) {
+        return false;
+    }
+
+    outVolumeL = doc["volume_l"] | 0.0f;
+    if (!isfinite(outVolumeL) || outVolumeL < 0.1f) {
+        Serial.println("[MQTT CMD] ec_dilution_start volume_l inválido");
+        return false;
+    }
+
+    Serial.printf("[MQTT CMD] ec_dilution_start %.2f L\n", outVolumeL);
     return true;
 }

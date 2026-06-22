@@ -16,7 +16,7 @@ const payload = JSON.stringify({
   device_id: deviceId,
   ph: 6.2,
   temperature: 24.5,
-  tds: 850,
+  ec: 850,
   water_level_ok: true,
 });
 

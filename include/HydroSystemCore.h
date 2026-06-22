@@ -248,6 +248,7 @@ private:
     void syncEcOperationStateToSupabase();
     void syncPhOperationStateToSupabase();
     void handleNutrientDoseEvent(const NutrientDoseEvent* event);
+    void handleEcDilutionEvent(const EcDilutionEvent* event);
     void handlePhDoseEvent(const PhDoseEvent* event);
     void handleEcMetricEvent(const EcControllerMetricEvent* event);
     void handlePhMetricEvent(const PhControllerMetricEvent* event);
@@ -262,6 +263,7 @@ private:
     void handlePhGainLearned();
     static void onPhGainLearnedStatic(void* userData);
     static void onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData);
+    static void onEcDilutionStatic(const EcDilutionEvent* event, void* userData);
     static void onPhDoseStatic(const PhDoseEvent* event, void* userData);
     static void onEcMetricStatic(const EcControllerMetricEvent* event, void* userData);
     static void onPhMetricStatic(const PhControllerMetricEvent* event, void* userData);

@@ -32,7 +32,12 @@ bool isAutoDoseCycleBusy(const HydroControl& hc) {
     if (hc.isDosageActive()) {
         return true;
     }
-    if (ecState && strcmp(ecState, "recirculating") == 0) {
+    if (ecState && (strcmp(ecState, "recirculating") == 0 ||
+                    strcmp(ecState, "diluting_draining") == 0 ||
+                    strcmp(ecState, "diluting_filling") == 0)) {
+        return true;
+    }
+    if (hc.isDilutionActive()) {
         return true;
     }
     if (phState && (strcmp(phState, "dosing") == 0 || strcmp(phState, "recirculating") == 0)) {
@@ -190,6 +195,7 @@ bool HydroSystemCore::begin() {
     Serial.println("✅ HydroControl inicializado");
 
     hydroControl.setNutrientDoseCallback(&HydroSystemCore::onNutrientDoseStatic, this);
+    hydroControl.setEcDilutionCallback(&HydroSystemCore::onEcDilutionStatic, this);
     hydroControl.setPhDoseCallback(&HydroSystemCore::onPhDoseStatic, this);
     hydroControl.setEcMetricCallback(&HydroSystemCore::onEcMetricStatic, this);
     hydroControl.setPhMetricCallback(&HydroSystemCore::onPhMetricStatic, this);
@@ -357,7 +363,10 @@ void HydroSystemCore::loop() {
 
         const char* opState = hydroControl.getEcOperationStateName();
         const bool cycleActive = hydroControl.isDosageActive() ||
+            hydroControl.isDilutionActive() ||
             strcmp(opState, "recirculating") == 0 ||
+            strcmp(opState, "diluting_draining") == 0 ||
+            strcmp(opState, "diluting_filling") == 0 ||
             strcmp(opState, "ec_check_pending") == 0;
 
         if (cycleActive && now - lastEcOperationSync >= EC_OPERATION_SYNC_INTERVAL) {
@@ -656,7 +665,10 @@ void HydroSystemCore::printSensorReadings() {
     MqttTelemetryReading reading;
     reading.temperature = hydroControl.getTemperature();
     reading.ph = hydroControl.getpH();
-    reading.tds = hydroControl.getTDS();
+    reading.ec = hydroControl.getEC();
+    reading.phValid = hydroControl.isPhValidForTelemetry();
+    reading.ecValid = hydroControl.isEcValidForTelemetry();
+    reading.tempValid = hydroControl.isTempValidForTelemetry();
     reading.waterLevelOk = hydroControl.isWaterLevelOk();
     reading.level1Wet = hydroControl.isLevelWet(1);
     reading.level2Wet = hydroControl.isLevelWet(2);
@@ -836,6 +848,11 @@ void HydroSystemCore::checkECConfigFromSupabase() {
             }
             hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);
             hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
+            hydroControl.setDilutionAutoEnabled(config.dilution_auto_enabled, false);
+            hydroControl.setDilutionRelays(config.dilution_drain_relay, config.dilution_fill_relay);
+            hydroControl.setDilutionMaxVolumeL((float)config.dilution_max_volume_l);
+            hydroControl.setFlowmeterPulsesPerLiter((float)config.flowmeter_pulses_per_liter);
+            hydroControl.setDilutionFillFlowLps((float)config.dilution_fill_flow_lps);
             
             // ✅ PASSAR NUTRIENTES PARA HYDROCONTROL (alimento para automação)
             if (config.nutrientsJson.length() > 0 && config.nutrientsJson != "[]") {
@@ -1125,7 +1142,10 @@ void HydroSystemCore::publishMqttTelemetry() {
     MqttTelemetryReading reading;
     reading.temperature = hydroControl.getTemperature();
     reading.ph = hydroControl.getpH();
-    reading.tds = hydroControl.getTDS();
+    reading.ec = hydroControl.getEC();
+    reading.phValid = hydroControl.isPhValidForTelemetry();
+    reading.ecValid = hydroControl.isEcValidForTelemetry();
+    reading.tempValid = hydroControl.isTempValidForTelemetry();
     reading.waterLevelOk = hydroControl.isWaterLevelOk();
     reading.level1Wet = hydroControl.isLevelWet(1);
     reading.level2Wet = hydroControl.isLevelWet(2);
@@ -1187,7 +1207,7 @@ void HydroSystemCore::sendSensorDataToSupabase() {
     HydroReading hydroData;
     hydroData.temperature = hydroControl.getTemperature();
     hydroData.ph = hydroControl.getpH();
-    hydroData.tds = hydroControl.getTDS();
+    hydroData.ec = hydroControl.getEC();
     hydroData.waterLevelOk = hydroControl.isWaterLevelOk();
     hydroData.level1Wet = hydroControl.isLevelWet(1);
     hydroData.level2Wet = hydroControl.isLevelWet(2);
@@ -1198,7 +1218,7 @@ void HydroSystemCore::sendSensorDataToSupabase() {
     
     // ✅ DEBUG: Mostrar valores antes de enviar
     Serial.printf("📊 [SENSORES] Valores: Temp=%.2f°C, pH=%.2f, TDS=%.2f ppm\n", 
-        hydroData.temperature, hydroData.ph, hydroData.tds);
+        hydroData.temperature, hydroData.ph, hydroData.ec);
 
     // Enviar dados
     bool envSuccess = true;
@@ -1279,6 +1299,12 @@ void HydroSystemCore::sendDeviceStatusToSupabase() {
 void HydroSystemCore::onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData) {
     if (userData && event) {
         static_cast<HydroSystemCore*>(userData)->handleNutrientDoseEvent(event);
+    }
+}
+
+void HydroSystemCore::onEcDilutionStatic(const EcDilutionEvent* event, void* userData) {
+    if (userData && event) {
+        static_cast<HydroSystemCore*>(userData)->handleEcDilutionEvent(event);
     }
 }
 
@@ -1657,6 +1683,40 @@ void HydroSystemCore::handleNutrientDoseEvent(const NutrientDoseEvent* event) {
     syncEcOperationStateToSupabase();
 }
 
+void HydroSystemCore::handleEcDilutionEvent(const EcDilutionEvent* event) {
+    if (!event) {
+        return;
+    }
+
+    bool exported = false;
+    if (mqttClient.isConnected()) {
+        MqttEcDilutionReading reading = {};
+        reading.sequenceId = event->sequenceId;
+        reading.ecBefore = event->ecBefore;
+        reading.ecSetpoint = event->ecSetpoint;
+        reading.volumeTargetL = event->volumeTargetL;
+        reading.volumeMeasuredL = event->volumeMeasuredL;
+        reading.drainDurationSec = event->drainDurationSec;
+        reading.fillDurationSec = event->fillDurationSec;
+        reading.source = event->source ? event->source : "manual";
+        exported = mqttClient.publishEcDilution(reading);
+    }
+
+    if (!exported && supabaseConnected) {
+        const String deviceId = getDeviceID();
+        const String seqId = String(event->sequenceId);
+        const String source = String(event->source ? event->source : "manual");
+        supabase.insertEcDilutionEvent(
+            deviceId, seqId,
+            event->ecBefore, event->ecSetpoint,
+            event->volumeTargetL, event->volumeMeasuredL,
+            event->drainDurationSec, event->fillDurationSec,
+            source);
+    }
+
+    syncEcOperationStateToSupabase();
+}
+
 void HydroSystemCore::handleEcMetricEvent(const EcControllerMetricEvent* event) {
     if (!event) {
         return;
@@ -1743,12 +1803,23 @@ void HydroSystemCore::syncEcOperationStateToSupabase() {
     const char* stateName = hydroControl.getEcOperationStateName();
     const int remainingSec = hydroControl.getEcOperationRemainingSec();
     const int nextCheckSec = hydroControl.getEcNextCheckInSec();
+    const bool diluting = hydroControl.isDilutionActive();
+    const float dilTarget = diluting ? hydroControl.getEcDilutionTargetL() : -1.0f;
+    const float dilProgress = diluting ? hydroControl.getEcDilutionProgressL() : -1.0f;
 
     if (mqttClient.isConnected()) {
         MqttEcOperationReading reading = {};
         reading.state = stateName;
         reading.operationRemainingSec = remainingSec;
         reading.nextCheckInSec = nextCheckSec;
+        if (diluting) {
+            reading.hasDilutionProgress = true;
+            reading.dilutionTargetL = dilTarget;
+            reading.dilutionProgressL = dilProgress;
+            if (isfinite(hydroControl.getEC()) && isfinite(hydroControl.getECSetpoint())) {
+                reading.ecOvershootUs = hydroControl.getEC() - hydroControl.getECSetpoint();
+            }
+        }
         if (mqttClient.publishEcOperation(reading)) {
             return;
         }
@@ -1762,7 +1833,9 @@ void HydroSystemCore::syncEcOperationStateToSupabase() {
         getDeviceID(),
         String(stateName),
         remainingSec,
-        nextCheckSec
+        nextCheckSec,
+        dilTarget,
+        dilProgress
     );
 }
 
@@ -2463,6 +2536,14 @@ void HydroSystemCore::mqttCommandReceived(const char* payload, size_t length, vo
 }
 
 void HydroSystemCore::handleMqttCommandPayload(const char* payload, size_t length) {
+    float dilutionVolumeL = 0.0f;
+    if (parseMqttEcDilutionCommand(payload, length, dilutionVolumeL)) {
+        if (hydroControl.startEcDilution(dilutionVolumeL, "manual")) {
+            syncEcOperationStateToSupabase();
+        }
+        return;
+    }
+
     RelayCommand cmd;
     bool isSlave = false;
     if (!parseMqttRelayCommand(payload, length, cmd, isSlave)) {

@@ -124,13 +124,25 @@
 // Sensores
 #define DHT_PIN 15                     // Sensor DHT22
 #define DHT_TYPE DHT22                 // Tipo do sensor DHT
-#define PH_PIN 35                      // Sensor de pH
-#define TDS_PIN 34                     // Sensor TDS (Analógico)
-#define TDS_RX_PIN 36                  // Sensor TDS (RX) - CORRIGIDO: pino ADC válido
-#define TDS_TX_PIN 17                  // Sensor TDS (TX)
-#define TEMP_PIN 4                     // Sensor de temperatura DS18B20
-#define TANK_LOW_PIN 32                // Sensor de nível baixo (legacy GPIO)
-#define TANK_HIGH_PIN 33               // Sensor de nível alto (legacy GPIO)
+#define PH_PIN 35                      // legado: pH analógico ADC; con Modbus no se usa
+#define TDS_PIN 33                     // EC analógico (GPIO 33 — validado ESP-SENSORS)
+#define EC_SENSOR_ANALOG_PIN TDS_PIN
+#define PH_RS485_RX_PIN 34             // RO del módulo TTL-RS485
+#define PH_RS485_TX_PIN 23             // DI del módulo TTL-RS485
+#define PH_RS485_DE_RE_PIN 32          // DE+RE unidos (LOW = escuchar)
+#define PH_MODBUS_BAUD 9600
+#define PH_MODBUS_ADDR 1
+#define PH_MODBUS_TEMP_REG 0x0000
+#define PH_MODBUS_TEMP_SCALE 10.0f     // reg0 / 10 = temperatura °C
+#define PH_MODBUS_REG 0x0001           // reg1: pH (reg0 = temperatura)
+#define PH_MODBUS_SCALE 10.0f          // pH x10 (0.1 pH)
+// UART EC legado — no usado por EcAnalogSensor
+// #define TDS_RX_PIN 36
+// #define TDS_TX_PIN 17
+#define TEMP_PIN 4                     // DS18B20 fallback si Modbus temp falla
+// Legacy GPIO nivel — NO usar con RS485 (32=DE/RE, 33=EC); niveles vía PCF8574 P0-P3
+#define TANK_LOW_PIN 32
+#define TANK_HIGH_PIN 33
 
 // ===== 4 SONDAS NPN VIA PCF8574 #1 (P0-P3) =====
 #define LEVEL_DEBOUNCE_MS 300
@@ -170,6 +182,9 @@
 // ===== LIMITES DE SENSORES =====
 #define MIN_PH 0.0
 #define MAX_PH 14.0
+#ifndef SENSOR_READING_STALE_MS
+#define SENSOR_READING_STALE_MS 12000UL
+#endif
 
 // Auto pH: 1 = prototipo (relaja guards G4/G5/G9-G11/G14); 0 = producción
 #ifndef PH_PROTOTYPE_RELAX_GUARDS
@@ -179,6 +194,44 @@
 // Banco/dev: 1 = sin interlocks por sensor (métricas + telemetría parcial); 0 = producción
 #ifndef HIDRO_DEV_RELAX_SENSORS
 #define HIDRO_DEV_RELAX_SENSORS 1
+#endif
+
+#ifndef USE_PH_MODBUS_SENSOR
+#define USE_PH_MODBUS_SENSOR 1
+#endif
+
+#ifndef HIDRO_SIMULATE_WATER_LEVELS
+#define HIDRO_SIMULATE_WATER_LEVELS 1  // hasta instalar L1-L4 en PCF8574
+#endif
+
+// 1 = sin pH Modbus válido → EC analógica también inválida (bus 12 V común)
+#ifndef HIDRO_EC_REQUIRES_PH_MODBUS
+#define HIDRO_EC_REQUIRES_PH_MODBUS 1
+#endif
+
+// Diluição EC modo A — fluxómetro na saída do dreno
+#ifndef FLOWMETER_PULSE_PIN
+#define FLOWMETER_PULSE_PIN 26
+#endif
+#ifndef FLOWMETER_PULSES_PER_LITER
+#define FLOWMETER_PULSES_PER_LITER 450.0f
+// Calibrar no banco: drenar volume conhecido, medir pulsos, ppl = pulsos/L.
+// Ver HIDROWAVE-main/scripts/ADD_EC_DILUTION.sql § calibração.
+#endif
+#ifndef DILUTION_FILL_FLOW_LPS
+#define DILUTION_FILL_FLOW_LPS 0.5f
+#endif
+#ifndef DILUTION_FLOWMETER_STALL_MS
+#define DILUTION_FLOWMETER_STALL_MS 30000UL
+#endif
+#ifndef DILUTION_DRAIN_RELAY_DEFAULT
+#define DILUTION_DRAIN_RELAY_DEFAULT -1
+#endif
+#ifndef DILUTION_FILL_RELAY_DEFAULT
+#define DILUTION_FILL_RELAY_DEFAULT -1
+#endif
+#ifndef DILUTION_MAX_VOLUME_L_DEFAULT
+#define DILUTION_MAX_VOLUME_L_DEFAULT 50.0f
 #endif
 
 // Grow cycle P1: pausar Auto EC/pH mientras script tanque (priority >= umbral)
@@ -192,15 +245,34 @@
 #endif
 #define MIN_TDS 0.0
 #define MAX_TDS 5000.0
+#define EC_MIN_PLAUSIBLE 100.0f
+#define EC_MAX_PLAUSIBLE 10000.0f
+#define MIN_EC 0.0f
+#define MAX_EC (EC_SENSOR_RANGE_US_CM * 1.1f)
 #define MIN_TEMP 0.0
 #define MAX_TEMP 50.0
 #define MIN_HUMIDITY 0.0
 #define MAX_HUMIDITY 100.0
 
 // ===== CONFIGURAÇÕES DOS SENSORES =====
-// TDS
-#define TDS_VREF 5.0
-#define TDS_CALIBRATION_FACTOR 1.0
+// EC analógico (EcAnalogSensor)
+#define ESP32_ADC_MAX_VOLTS 3.3f
+#if defined(ESP32) || defined(CONFIG_IDF_TARGET_ESP32)
+#define ESP32_ADC_CONFIGURE_PIN(pin)          \
+    do {                                      \
+        analogSetPinAttenuation((pin), ADC_11db); \
+        analogReadResolution(12);             \
+    } while (0)
+#else
+#define ESP32_ADC_CONFIGURE_PIN(pin) ((void)(pin))
+#endif
+#define EC_SENSOR_RANGE_US_CM 4400.0f
+#define EC_SENSOR_VMAX_PIN_V ESP32_ADC_MAX_VOLTS
+#define EC_SAMPLE_INTERVAL_MS 200UL
+#define EC_SAMPLES_PER_WINDOW 30
+#define EC_BATCH_PERIOD_MS (EC_SAMPLE_INTERVAL_MS * EC_SAMPLES_PER_WINDOW)
+#define TDS_VREF EC_SENSOR_VMAX_PIN_V
+#define TDS_CALIBRATION_FACTOR 1.0f
 
 // pH
 #define PH_VREF 3.3

@@ -1322,6 +1322,9 @@ void handleMasterSerialCommands() {
                 //         Serial.println("❌ RelayBridge não inicializado");
                 //     }
                 // }
+                else if (command.startsWith("EC ") || command == "EC CAL 1413") {
+                    stateManager.handleSerialCommand(command);
+                }
                 else {
                     Serial.println("❓ Comando desconhecido: " + command);
                     Serial.println("💡 Digite 'help' para ajuda");
