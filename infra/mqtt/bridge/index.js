@@ -17,6 +17,7 @@ import ws from 'ws';
 import { createClient } from '@supabase/supabase-js';
 
 const DEVICE_ID_RE = /^ESP32_HIDRO_[0-9A-F]{6}$/;
+const SLAVE_MAC_RE = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
 const TOPICS = [
   'hidrowave/+/telemetry',
@@ -29,6 +30,8 @@ const TOPICS = [
   'hidrowave/+/ec_metric',
   'hidrowave/+/ph_metric',
   'hidrowave/+/ec_dilution',
+  'hidrowave/+/command_ack',
+  'hidrowave/+/relay/state',
 ];
 
 const EC_OPERATION_STATES = new Set([
@@ -61,6 +64,11 @@ const heartbeatThrottleMs = parseInt(process.env.HEARTBEAT_THROTTLE_MS || '55000
 const heartbeatStaleMs = parseInt(process.env.HEARTBEAT_STALE_MS || '120000', 10);
 const ecOperationThrottleMs = parseInt(process.env.EC_OPERATION_THROTTLE_MS || '2000', 10);
 const phOperationThrottleMs = parseInt(process.env.PH_OPERATION_THROTTLE_MS || '2000', 10);
+const relayStateThrottleMs = parseInt(process.env.RELAY_STATE_THROTTLE_MS || '1000', 10);
+const relayStateCoalesceMs = parseInt(process.env.RELAY_STATE_COALESCE_MS || '300', 10);
+const relayHeartbeatThrottleMs = parseInt(process.env.RELAY_HEARTBEAT_THROTTLE_MS || '45000', 10);
+
+const COMMAND_ACK_STATUSES = new Set(['completed', 'failed']);
 
 // Alinhado com CHECK Supabase: environment_data_temperature_check / environment_data_humidity_check
 const ENV_TEMP_MIN = 0;
@@ -73,6 +81,10 @@ const lastHeartbeatUpsertByDevice = new Map();
 const lastHeartbeatAtByDevice = new Map();
 const lastEcOperationSnapshotByDevice = new Map();
 const lastPhOperationSnapshotByDevice = new Map();
+const lastRelayStatePatchByDevice = new Map();
+const lastRelayHeartbeatPatchByDevice = new Map();
+const pendingRelayStatePatches = new Map();
+const completedCommandAckIds = new Map();
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -1404,6 +1416,354 @@ async function handlePhMetric(topic, message) {
   await insertPhMetric(validated.row);
 }
 
+function slaveDeviceIdFromMac(mac) {
+  return `ESP32_SLAVE_${String(mac).replace(/:/g, '_')}`;
+}
+
+function validateCommandAck(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const commandId = Number(payload.id);
+  const relayIndex = Number(payload.relay_index);
+  const status = String(payload.status || 'completed');
+  if (!Number.isInteger(commandId) || commandId <= 0) {
+    return { ok: false, reason: 'id must be positive integer (relay_commands.id)' };
+  }
+  if (!COMMAND_ACK_STATUSES.has(status)) {
+    return { ok: false, reason: `status must be one of ${[...COMMAND_ACK_STATUSES].join(', ')}` };
+  }
+  if (!Number.isInteger(relayIndex) || relayIndex < 0 || relayIndex > 15) {
+    return { ok: false, reason: 'relay_index out of range' };
+  }
+  if (typeof payload.current_state !== 'boolean') {
+    return { ok: false, reason: 'current_state must be boolean' };
+  }
+
+  let slaveMac = null;
+  let relayStates = null;
+  const macRaw = payload.slave_mac_address || payload.target_device_id;
+  if (macRaw) {
+    slaveMac = String(macRaw).toUpperCase();
+    if (!SLAVE_MAC_RE.test(slaveMac)) {
+      return { ok: false, reason: `invalid slave_mac_address: ${slaveMac}` };
+    }
+    if (Array.isArray(payload.relay_states)) {
+      relayStates = payload.relay_states.map((v) => Boolean(v));
+      if (relayStates.length < 1 || relayStates.length > 8) {
+        return { ok: false, reason: 'relay_states must have 1-8 booleans' };
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    row: {
+      deviceId,
+      commandId,
+      status,
+      relayIndex,
+      currentState: payload.current_state,
+      slaveMac,
+      relayStates,
+    },
+  };
+}
+
+async function rpcCompleteRelayCommand(row) {
+  const dedupeKey = `${row.deviceId}:${row.commandId}`;
+  const lastAt = completedCommandAckIds.get(dedupeKey);
+  if (lastAt && Date.now() - lastAt < 5000) {
+    console.log(`[bridge] command_ack dedup ${dedupeKey}`);
+    return true;
+  }
+
+  const args = {
+    p_command_id: row.commandId,
+    p_device_id: row.deviceId,
+    p_current_state: row.currentState,
+  };
+  if (row.slaveMac && row.relayStates) {
+    args.p_slave_mac = row.slaveMac;
+    args.p_relay_states = row.relayStates;
+  }
+
+  const { data, error } = await supabase.rpc('complete_relay_command', args);
+  if (error) {
+    console.error(`[bridge] complete_relay_command id=${row.commandId}:`, error.message);
+    return false;
+  }
+
+  if (!data || data.length === 0) {
+    const { data: existing, error: selErr } = await supabase
+      .from('relay_commands')
+      .select('id, status')
+      .eq('id', row.commandId)
+      .eq('device_id', row.deviceId)
+      .maybeSingle();
+    if (selErr) {
+      console.error(`[bridge] command_ack verify id=${row.commandId}:`, selErr.message);
+      return false;
+    }
+    if (existing?.status === 'completed') {
+      completedCommandAckIds.set(dedupeKey, Date.now());
+      console.log(`[bridge] command_ack id=${row.commandId} already completed`);
+      return true;
+    }
+    console.warn(`[bridge] command_ack id=${row.commandId} RPC returned 0 rows`);
+    return false;
+  }
+
+  completedCommandAckIds.set(dedupeKey, Date.now());
+  console.log(
+    `[bridge] RPC complete_relay_command id=${row.commandId} relay=${row.relayIndex} state=${row.currentState}`
+  );
+  return true;
+}
+
+function validateRelayState(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const hasMaster = Array.isArray(payload.master) && payload.master.length > 0;
+  const slaveMacRaw = payload.slave_mac_address;
+  const isHeartbeat = payload.heartbeat === true;
+  const hasRelayStates =
+    Array.isArray(payload.relay_states) && payload.relay_states.length > 0;
+  const hasSlaveLink = Boolean(slaveMacRaw) && (hasRelayStates || isHeartbeat);
+
+  if (!hasMaster && !hasSlaveLink) {
+    return { ok: false, reason: 'need master[] or slave_mac_address + (relay_states[] or heartbeat)' };
+  }
+
+  let slaveMac = null;
+  let relayStates = null;
+  let relayHasTimers = null;
+  let relayRemainingTimes = null;
+
+  if (slaveMacRaw) {
+    slaveMac = String(slaveMacRaw).toUpperCase();
+    if (!SLAVE_MAC_RE.test(slaveMac)) {
+      return { ok: false, reason: `invalid slave_mac_address: ${slaveMac}` };
+    }
+    if (hasRelayStates) {
+      relayStates = payload.relay_states.map((v) => Boolean(v));
+      if (relayStates.length > 8) {
+        return { ok: false, reason: 'relay_states max 8' };
+      }
+      if (Array.isArray(payload.relay_has_timers)) {
+        relayHasTimers = payload.relay_has_timers.map((v) => Boolean(v));
+      }
+      if (Array.isArray(payload.relay_remaining_times)) {
+        relayRemainingTimes = payload.relay_remaining_times.map((v) => Number(v) || 0);
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    row: {
+      deviceId,
+      master: hasMaster ? payload.master.map((v) => Boolean(v)) : null,
+      slaveMac,
+      relayStates,
+      relayHasTimers,
+      relayRemainingTimes,
+      linkOnline: typeof payload.link_online === 'boolean' ? payload.link_online : null,
+      heartbeat: payload.heartbeat === true,
+    },
+  };
+}
+
+async function fetchDeviceUserEmail(deviceId) {
+  const { data, error } = await supabase
+    .from('device_status')
+    .select('user_email, mac_address')
+    .eq('device_id', deviceId)
+    .maybeSingle();
+  if (error) {
+    console.error(`[bridge] device_status user_email ${deviceId}:`, error.message);
+    return null;
+  }
+  return data;
+}
+
+async function patchRelaySlaveFromMqtt(row) {
+  const dev = await fetchDeviceUserEmail(row.deviceId);
+  if (!dev?.user_email) {
+    console.warn(`[bridge] relay/state slave skip — no user_email for ${row.deviceId}`);
+    return false;
+  }
+
+  const slaveDeviceId = slaveDeviceIdFromMac(row.slaveMac);
+  const nowIso = new Date().toISOString();
+  const linkOnly = row.heartbeat && !row.relayStates;
+
+  if (linkOnly) {
+    const { error } = await supabase
+      .from('relay_slaves')
+      .update({ last_update: nowIso, updated_at: nowIso })
+      .eq('device_id', slaveDeviceId);
+    if (error) {
+      console.error(`[bridge] relay_slaves link heartbeat ${slaveDeviceId}:`, error.message);
+      return false;
+    }
+    console.log(`[bridge] PATCH relay_slaves link-only ${slaveDeviceId} via MQTT`);
+    return true;
+  }
+
+  const patch = {
+    device_id: slaveDeviceId,
+    user_email: dev.user_email,
+    master_device_id: row.deviceId,
+    master_mac_address: dev.mac_address || '',
+    slave_mac_address: row.slaveMac,
+    relay_states: row.relayStates,
+    last_update: nowIso,
+    updated_at: nowIso,
+  };
+  if (row.relayHasTimers) patch.relay_has_timers = row.relayHasTimers;
+  if (row.relayRemainingTimes) patch.relay_remaining_times = row.relayRemainingTimes;
+
+  const { error } = await supabase.from('relay_slaves').upsert(patch, { onConflict: 'device_id' });
+  if (error) {
+    console.error(`[bridge] relay_slaves upsert ${slaveDeviceId}:`, error.message);
+    return false;
+  }
+  console.log(`[bridge] PATCH relay_slaves ${slaveDeviceId} via MQTT`);
+  return true;
+}
+
+function relayStatePatchKey(deviceId, slaveMac) {
+  return `${deviceId}:${slaveMac || 'master'}`;
+}
+
+function mergeRelayStateRows(prev, next) {
+  if (!prev) return next;
+  return {
+    deviceId: next.deviceId,
+    slaveMac: next.slaveMac,
+    master: next.master ?? prev.master,
+    relayStates: next.relayStates ?? prev.relayStates,
+    relayHasTimers: next.relayHasTimers ?? prev.relayHasTimers,
+    relayRemainingTimes: next.relayRemainingTimes ?? prev.relayRemainingTimes,
+    linkOnline: next.linkOnline ?? prev.linkOnline,
+    heartbeat: next.heartbeat ?? prev.heartbeat,
+  };
+}
+
+async function flushRelayStatePatch(key) {
+  const entry = pendingRelayStatePatches.get(key);
+  if (!entry) return;
+  pendingRelayStatePatches.delete(key);
+  clearTimeout(entry.timer);
+  const ok = await patchRelaySlaveFromMqtt(entry.row);
+  if (ok) {
+    lastRelayStatePatchByDevice.set(key, Date.now());
+  }
+}
+
+function scheduleRelayStatePatch(row) {
+  const key = relayStatePatchKey(row.deviceId, row.slaveMac);
+  const existing = pendingRelayStatePatches.get(key);
+  if (existing?.timer) {
+    clearTimeout(existing.timer);
+  }
+  const merged = mergeRelayStateRows(existing?.row, row);
+  const timer = setTimeout(() => {
+    flushRelayStatePatch(key).catch((err) => {
+      console.error(`[bridge] relay/state flush ${key}:`, err.message || err);
+    });
+  }, relayStateCoalesceMs);
+  pendingRelayStatePatches.set(key, { row: merged, timer });
+}
+
+function shouldThrottleRelayHeartbeat(deviceId, slaveMac) {
+  const key = relayStatePatchKey(deviceId, slaveMac);
+  const last = lastRelayHeartbeatPatchByDevice.get(key) || 0;
+  if (Date.now() - last < relayHeartbeatThrottleMs) return true;
+  lastRelayHeartbeatPatchByDevice.set(key, Date.now());
+  return false;
+}
+
+async function handleCommandAck(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'command_ack');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateCommandAck(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await rpcCompleteRelayCommand(validated.row);
+}
+
+async function handleRelayState(topic, message) {
+  const parts = topic.split('/');
+  if (parts.length !== 4 || parts[0] !== 'hidrowave' || parts[2] !== 'relay' || parts[3] !== 'state') {
+    return;
+  }
+  const deviceId = parts[1];
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateRelayState(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  if (validated.row.slaveMac) {
+    const gapKey = relayStatePatchKey(deviceId, validated.row.slaveMac);
+    const last = lastRelayStatePatchByDevice.get(gapKey) || 0;
+    if (last > 0 && Date.now() - last > 90000) {
+      console.log(
+        `[bridge] slave_link_gap device=${deviceId} mac=${validated.row.slaveMac} gap_s=${Math.round((Date.now() - last) / 1000)}`
+      );
+    }
+  }
+
+  if (validated.row.slaveMac) {
+    const linkOnly = validated.row.heartbeat && !validated.row.relayStates;
+    if (linkOnly) {
+      if (shouldThrottleRelayHeartbeat(deviceId, validated.row.slaveMac)) {
+        console.log(`[bridge] Throttled relay/state link heartbeat ${deviceId}`);
+        return;
+      }
+      await patchRelaySlaveFromMqtt(validated.row);
+      lastRelayStatePatchByDevice.set(
+        relayStatePatchKey(deviceId, validated.row.slaveMac),
+        Date.now()
+      );
+      return;
+    }
+    if (validated.row.relayStates) {
+      scheduleRelayStatePatch(validated.row);
+    }
+  }
+}
+
 async function handleStatus(topic, message) {
   const deviceId = parseDeviceIdFromTopic(topic, 'status');
   if (!deviceId) return;
@@ -1478,6 +1838,10 @@ client.on('message', (topic, message) => {
       await handlePhMetric(topic, message);
     } else if (suffix === 'ec_dilution') {
       await handleEcDilution(topic, message);
+    } else if (suffix === 'command_ack') {
+      await handleCommandAck(topic, message);
+    } else if (topic.endsWith('/relay/state')) {
+      await handleRelayState(topic, message);
     }
   };
   run().catch((e) => {

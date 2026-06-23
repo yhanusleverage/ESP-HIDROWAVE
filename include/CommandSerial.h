@@ -10,4 +10,14 @@ void printRelayCommandSerialLine(
     const char* via
 );
 
+/** Resultado de cierre en Supabase tras ACK hardware */
+void logCmdCloudAckResult(
+    const char* via,
+    int supabaseId,
+    uint32_t espnowId,
+    int relayNumber,
+    bool stateOn,
+    bool cloudClosed
+);
+
 #endif

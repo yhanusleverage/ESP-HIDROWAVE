@@ -28,6 +28,11 @@ RelayCommandBox::RelayCommandBox(uint8_t pcf8574Address, const String& deviceNam
         relayStates[i].timerSeconds = 0;
         relayStates[i].hasTimer = false;
         relayStates[i].name = "";
+        cycleStates[i].active = false;
+        cycleStates[i].onSeconds = 0;
+        cycleStates[i].offSeconds = 0;
+        cycleStates[i].phaseStartMs = 0;
+        cycleStates[i].phaseOn = false;
     }
     
     // Inicializar nomes padrão
@@ -73,6 +78,7 @@ bool RelayCommandBox::begin() {
 void RelayCommandBox::update() {
     if (!pcfInitialized) return;
     checkTimers();
+    checkCycles();
 }
 
 bool RelayCommandBox::setRelay(int relayNumber, bool state) {
@@ -86,7 +92,8 @@ bool RelayCommandBox::setRelay(int relayNumber, bool state) {
         return false;
     }
     
-    // Cancelar timer se existir
+    // Cancelar timer e ciclo se existir
+    stopCycle(relayNumber);
     relayStates[relayNumber].hasTimer = false;
     relayStates[relayNumber].timerSeconds = 0;
     
@@ -129,6 +136,8 @@ bool RelayCommandBox::setRelayWithTimer(int relayNumber, bool state, int seconds
     if (seconds <= 0) {
         return setRelay(relayNumber, state);
     }
+
+    stopCycle(relayNumber);
     
     // Validar duração máxima
     if (seconds > DEFAULT_MAX_DURATION) {
@@ -173,7 +182,8 @@ bool RelayCommandBox::toggleRelay(int relayNumber) {
     return setRelay(relayNumber, !currentState);
 }
 
-bool RelayCommandBox::processCommand(int relayNumber, String action, int duration) {
+bool RelayCommandBox::processCommand(int relayNumber, String action, int duration,
+                                     const String& mode, int cycleOffSeconds) {
     if (!isValidRelayNumber(relayNumber)) {
         Serial.println("❌ Comando inválido - Relé: " + String(relayNumber));
         return false;
@@ -181,10 +191,74 @@ bool RelayCommandBox::processCommand(int relayNumber, String action, int duratio
     
     action.toLowerCase();
     action.trim();
+
+    String effectiveMode = mode;
+    effectiveMode.toLowerCase();
+    effectiveMode.trim();
+    if (effectiveMode.length() == 0) {
+        if (action == "timed_on" || action == "timed_off" || action == "cycle" || action == "cycle_stop") {
+            effectiveMode = action;
+        } else {
+            effectiveMode = "instant";
+        }
+    }
     
     // Chamar callback de comando se definido
     if (commandCallback) {
         commandCallback(relayNumber, action, duration);
+    }
+
+    if (effectiveMode == "cycle") {
+        if (duration < 1 || cycleOffSeconds < 1) {
+            Serial.println("❌ cycle: on/off seconds inválidos");
+            return false;
+        }
+        bool success = startCycle(relayNumber, duration, cycleOffSeconds);
+        if (success) {
+            savePersistentStates();
+        }
+        return success;
+    }
+
+    if (effectiveMode == "cycle_stop") {
+        bool success = stopCycle(relayNumber);
+        if (success) {
+            savePersistentStates();
+        }
+        return success;
+    }
+
+    if (effectiveMode == "timed_on") {
+        if (duration < 1) {
+            Serial.println("❌ timed_on: duration inválida");
+            return false;
+        }
+        bool success = setRelayWithTimer(relayNumber, true, duration);
+        if (success) {
+            savePersistentStates();
+        }
+        return success;
+    }
+
+    if (effectiveMode == "timed_off") {
+        if (duration < 1) {
+            Serial.println("❌ timed_off: duration inválida");
+            return false;
+        }
+        if (!getRelayState(relayNumber)) {
+            Serial.println("❌ timed_off: relé não está ON");
+            return false;
+        }
+        stopCycle(relayNumber);
+        relayStates[relayNumber].hasTimer = true;
+        relayStates[relayNumber].startTime = millis();
+        relayStates[relayNumber].timerSeconds = duration;
+        Serial.println("⏰ timed_off: desligar em " + String(duration) + "s");
+        if (stateChangeCallback) {
+            stateChangeCallback(relayNumber, true, duration);
+        }
+        savePersistentStates();
+        return true;
     }
     
     if (action == "on") {
@@ -211,7 +285,11 @@ bool RelayCommandBox::processCommand(int relayNumber, String action, int duratio
         return success;
     } 
     else if (action == "toggle") {
-        return toggleRelay(relayNumber);
+        bool success = toggleRelay(relayNumber);
+        if (success) {
+            savePersistentStates();
+        }
+        return success;
     }
     else if (action == "status") {
         // Comando de status - apenas retorna informação
@@ -247,8 +325,20 @@ bool RelayCommandBox::getRelayState(int relayNumber) {
     return relayStates[relayNumber].isOn;
 }
 
-int RelayCommandBox::getRemainingTime(int relayNumber) {
-    if (!isValidRelayNumber(relayNumber) || !relayStates[relayNumber].hasTimer) {
+int RelayCommandBox::getRemainingTime(int relayNumber) const {
+    if (!isValidRelayNumber(relayNumber)) {
+        return 0;
+    }
+
+    if (cycleStates[relayNumber].active) {
+        const RelayCycleState& c = cycleStates[relayNumber];
+        unsigned long elapsed = (millis() - c.phaseStartMs) / 1000;
+        uint16_t phaseDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
+        int remaining = (int)phaseDuration - (int)elapsed;
+        return remaining > 0 ? remaining : 0;
+    }
+
+    if (!relayStates[relayNumber].hasTimer) {
         return 0;
     }
     
@@ -375,6 +465,9 @@ bool RelayCommandBox::writeToRelay(int relayNumber, bool state) {
 
 void RelayCommandBox::checkTimers() {
     for (int i = 0; i < MAX_RELAYS; i++) {
+        if (cycleStates[i].active) {
+            continue;
+        }
         if (relayStates[i].hasTimer && relayStates[i].isOn) {
             unsigned long elapsed = (millis() - relayStates[i].startTime) / 1000;
             
@@ -398,7 +491,101 @@ void RelayCommandBox::checkTimers() {
     }
 }
 
-bool RelayCommandBox::isValidRelayNumber(int relayNumber) {
+bool RelayCommandBox::startCycle(int relayNumber, int onSeconds, int offSeconds) {
+    if (!isValidRelayNumber(relayNumber) || !pcfInitialized) {
+        return false;
+    }
+    if (onSeconds < 1 || offSeconds < 1) {
+        return false;
+    }
+    if (onSeconds > DEFAULT_MAX_DURATION) {
+        onSeconds = DEFAULT_MAX_DURATION;
+    }
+    if (offSeconds > DEFAULT_MAX_DURATION) {
+        offSeconds = DEFAULT_MAX_DURATION;
+    }
+
+    stopCycle(relayNumber);
+
+    cycleStates[relayNumber].active = true;
+    cycleStates[relayNumber].onSeconds = (uint16_t)onSeconds;
+    cycleStates[relayNumber].offSeconds = (uint16_t)offSeconds;
+    cycleStates[relayNumber].phaseOn = true;
+    cycleStates[relayNumber].phaseStartMs = millis();
+
+    relayStates[relayNumber].isOn = true;
+    relayStates[relayNumber].hasTimer = true;
+    relayStates[relayNumber].startTime = millis();
+    relayStates[relayNumber].timerSeconds = onSeconds;
+
+    bool success = writeToRelay(relayNumber, true);
+    if (success) {
+        String relayName = getRelayName(relayNumber);
+        Serial.println("🔄 Ciclo iniciado " + relayName + " ON " + String(onSeconds) +
+                       "s / OFF " + String(offSeconds) + "s");
+        if (stateChangeCallback) {
+            stateChangeCallback(relayNumber, true, onSeconds);
+        }
+    }
+    return success;
+}
+
+bool RelayCommandBox::stopCycle(int relayNumber) {
+    if (!isValidRelayNumber(relayNumber)) {
+        return false;
+    }
+    if (!cycleStates[relayNumber].active) {
+        return true;
+    }
+    cycleStates[relayNumber].active = false;
+    relayStates[relayNumber].hasTimer = false;
+    relayStates[relayNumber].timerSeconds = 0;
+    Serial.println("🛑 Ciclo parado relé " + String(relayNumber) +
+                   " (estado mantido: " + String(relayStates[relayNumber].isOn ? "ON" : "OFF") + ")");
+    return true;
+}
+
+void RelayCommandBox::checkCycles() {
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        if (!cycleStates[i].active) {
+            continue;
+        }
+
+        RelayCycleState& c = cycleStates[i];
+        unsigned long elapsed = (millis() - c.phaseStartMs) / 1000;
+        uint16_t phaseDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
+
+        relayStates[i].hasTimer = true;
+        relayStates[i].startTime = c.phaseStartMs;
+        relayStates[i].timerSeconds = phaseDuration;
+
+        if (elapsed < phaseDuration) {
+            continue;
+        }
+
+        c.phaseOn = !c.phaseOn;
+        c.phaseStartMs = millis();
+        bool newState = c.phaseOn;
+        uint16_t nextDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
+
+        relayStates[i].isOn = newState;
+        relayStates[i].hasTimer = true;
+        relayStates[i].startTime = c.phaseStartMs;
+        relayStates[i].timerSeconds = nextDuration;
+
+        writeToRelay(i, newState);
+
+        String relayName = getRelayName(i);
+        Serial.println("🔄 Ciclo " + relayName + " → " + String(newState ? "ON" : "OFF") +
+                       " (" + String(nextDuration) + "s)");
+
+        if (stateChangeCallback) {
+            stateChangeCallback(i, newState, nextDuration);
+        }
+    }
+}
+
+bool RelayCommandBox::isValidRelayNumber(int relayNumber) const {
     return relayNumber >= 0 && relayNumber < MAX_RELAYS;
 }
 
@@ -551,6 +738,23 @@ bool RelayCommandBox::applyPersistentStates(const PersistentRelayStateData& stat
     }
     
     return applied;
+}
+
+void RelayCommandBox::fillAllRelaysStatus(SingleRelayState out[8]) const {
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        out[i].state = relayStates[i].isOn ? 1 : 0;
+        const bool hasActiveTimer = relayStates[i].hasTimer || cycleStates[i].active;
+        out[i].hasTimer = hasActiveTimer ? 1 : 0;
+        out[i].remainingTime = static_cast<uint16_t>(
+            hasActiveTimer ? getRemainingTime(i) : 0);
+    }
+}
+
+bool RelayCommandBox::applyAndSavePersistentStates(const PersistentRelayStateData& states) {
+    if (!applyPersistentStates(states)) {
+        return false;
+    }
+    return savePersistentStates();
 }
 
 bool RelayCommandBox::getPersistentStates(PersistentRelayStateData& states) {

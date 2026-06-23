@@ -19,6 +19,73 @@ static bool isValidMacString(const String& mac) {
     return true;
 }
 
+static void logPayloadSnippet(const char* payload, size_t length) {
+    const size_t maxLen = 200;
+    const size_t n = length < maxLen ? length : maxLen;
+    Serial.printf("[MQTT CMD] payload (%uB): ", (unsigned)length);
+    for (size_t i = 0; i < n; i++) {
+        Serial.write(payload[i]);
+    }
+    if (length > maxLen) {
+        Serial.print("...");
+    }
+    Serial.println();
+}
+
+static int parseJsonIntField(JsonVariantConst field) {
+    if (field.isNull()) {
+        return -1;
+    }
+    if (field.is<int>() || field.is<long>()) {
+        return field.as<int>();
+    }
+    if (field.is<const char*>()) {
+        const char* s = field.as<const char*>();
+        if (s && s[0] != '\0') {
+            return atoi(s);
+        }
+    }
+    return -1;
+}
+
+static int parseRelayIndexFromDoc(JsonObjectConst doc) {
+    if (doc.containsKey("relay_index")) {
+        int v = parseJsonIntField(doc["relay_index"]);
+        if (v >= 0) {
+            return v;
+        }
+    }
+    if (doc.containsKey("relay_number")) {
+        int v = parseJsonIntField(doc["relay_number"]);
+        if (v >= 0) {
+            return v;
+        }
+    }
+    if (doc.containsKey("relay_numbers") && doc["relay_numbers"].is<JsonArrayConst>()) {
+        JsonArrayConst arr = doc["relay_numbers"].as<JsonArrayConst>();
+        if (arr.size() > 0) {
+            int v = parseJsonIntField(arr[0]);
+            if (v >= 0) {
+                return v;
+            }
+        }
+    }
+    return -1;
+}
+
+static String parseActionFromDoc(JsonObjectConst doc) {
+    if (doc.containsKey("action") && !doc["action"].isNull()) {
+        return doc["action"].as<String>();
+    }
+    if (doc.containsKey("actions") && doc["actions"].is<JsonArrayConst>()) {
+        JsonArrayConst arr = doc["actions"].as<JsonArrayConst>();
+        if (arr.size() > 0 && !arr[0].isNull()) {
+            return arr[0].as<String>();
+        }
+    }
+    return "";
+}
+
 bool parseMqttRelayCommand(
     const char* payload,
     size_t length,
@@ -33,51 +100,78 @@ bool parseMqttRelayCommand(
     DeserializationError err = deserializeJson(doc, payload, length);
     if (err) {
         Serial.printf("[MQTT CMD] JSON inválido: %s\n", err.c_str());
+        logPayloadSnippet(payload, length);
         return false;
     }
 
     int schemaVersion = doc["v"] | 0;
     if (schemaVersion != 1) {
         Serial.printf("[MQTT CMD] rejeitado: v=%d (suportado: 1)\n", schemaVersion);
+        logPayloadSnippet(payload, length);
         return false;
     }
 
     if (!doc.containsKey("id")) {
         Serial.println("[MQTT CMD] rejeitado: sem id");
+        logPayloadSnippet(payload, length);
         return false;
     }
 
     const char* cmdType = doc["cmd"] | "relay";
     if (strcmp(cmdType, "relay") != 0) {
         Serial.printf("[MQTT CMD] cmd não suportado: %s\n", cmdType);
+        logPayloadSnippet(payload, length);
         return false;
     }
 
     out.id = doc["id"].as<int>();
     if (out.id <= 0) {
         Serial.println("[MQTT CMD] rejeitado: id inválido");
+        logPayloadSnippet(payload, length);
         return false;
     }
 
-    out.relayNumber = doc["relay_index"] | doc["relay_number"] | -1;
+    out.relayNumber = parseRelayIndexFromDoc(doc.as<JsonObjectConst>());
     if (out.relayNumber < 0) {
         Serial.println("[MQTT CMD] rejeitado: relay_index ausente");
+        logPayloadSnippet(payload, length);
         return false;
     }
 
-    if (!doc.containsKey("action")) {
+    out.action = parseActionFromDoc(doc.as<JsonObjectConst>());
+    if (out.action.length() == 0) {
         Serial.println("[MQTT CMD] rejeitado: action ausente");
+        logPayloadSnippet(payload, length);
         return false;
     }
-    out.action = doc["action"].as<String>();
     if (out.action != "on" && out.action != "off") {
         Serial.printf("[MQTT CMD] rejeitado: action inválida '%s'\n", out.action.c_str());
+        logPayloadSnippet(payload, length);
         return false;
     }
 
     out.durationSeconds = doc["duration_s"] | doc["duration_seconds"] | 0;
     if (out.durationSeconds < 0) {
         out.durationSeconds = 0;
+    }
+    if (out.durationSeconds == 0 && doc.containsKey("duration_seconds") &&
+        doc["duration_seconds"].is<JsonArrayConst>()) {
+        JsonArrayConst darr = doc["duration_seconds"].as<JsonArrayConst>();
+        if (darr.size() > 0) {
+            out.durationSeconds = darr[0] | 0;
+        }
+    }
+
+    if (doc.containsKey("mode") && !doc["mode"].isNull()) {
+        out.commandMode = doc["mode"].as<String>();
+    } else {
+        out.commandMode = "instant";
+    }
+    out.commandMode.toLowerCase();
+
+    out.cycleOffSeconds = doc["cycle_off_s"] | doc["cycle_off_seconds"] | 0;
+    if (out.cycleOffSeconds < 0) {
+        out.cycleOffSeconds = 0;
     }
 
     out.command_type = doc["command_type"] | "manual";
@@ -93,7 +187,7 @@ bool parseMqttRelayCommand(
 
     if (doc.containsKey("target_device_id") && !doc["target_device_id"].isNull()) {
         out.target_device_id = doc["target_device_id"].as<String>();
-    } else if (doc.containsKey("slave_mac_address")) {
+    } else if (doc.containsKey("slave_mac_address") && !doc["slave_mac_address"].isNull()) {
         out.target_device_id = doc["slave_mac_address"].as<String>();
     } else {
         out.target_device_id = "";
@@ -106,14 +200,17 @@ bool parseMqttRelayCommand(
     if (outIsSlave) {
         if (!isValidMacString(out.target_device_id)) {
             Serial.printf("[MQTT CMD] rejeitado: MAC inválido '%s'\n", out.target_device_id.c_str());
+            logPayloadSnippet(payload, length);
             return false;
         }
         if (out.relayNumber > 7) {
             Serial.printf("[MQTT CMD] rejeitado: relay_index slave %d (máx 7)\n", out.relayNumber);
+            logPayloadSnippet(payload, length);
             return false;
         }
     } else if (out.relayNumber > 15) {
         Serial.printf("[MQTT CMD] rejeitado: relay_index master %d (máx 15)\n", out.relayNumber);
+        logPayloadSnippet(payload, length);
         return false;
     }
 

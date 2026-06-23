@@ -183,7 +183,7 @@ bool DecisionEngine::saveRulesToFile(const String& filename) {
     
     for (const auto& rule : rules) {
         JsonObject rule_json = rules_array.createNestedObject();
-        ruleToJSON(rule, doc); // Implementar este método
+        ruleToJSON(rule, rule_json, doc);
     }
     
     File file = LittleFS.open(filename, "w");
@@ -623,6 +623,383 @@ bool DecisionEngine::validateRule(const DecisionRule& rule, String& error_messag
     }
     
     return true;
+}
+
+// ===== SERIALIZAÇÃO JSON =====
+namespace {
+
+const char* conditionTypeToString(ConditionType type) {
+    switch (type) {
+        case SENSOR_COMPARE: return "SENSOR_COMPARE";
+        case TIME_WINDOW: return "TIME_WINDOW";
+        case RELAY_STATE: return "RELAY_STATE";
+        case SYSTEM_STATUS: return "SYSTEM_STATUS";
+        case COMPOSITE: return "COMPOSITE";
+        default: return "SENSOR_COMPARE";
+    }
+}
+
+ConditionType parseConditionType(const JsonVariant& value) {
+    if (value.is<int>()) {
+        const int v = value.as<int>();
+        if (v >= SENSOR_COMPARE && v <= COMPOSITE) {
+            return static_cast<ConditionType>(v);
+        }
+    }
+    const char* s = value.as<const char*>();
+    if (!s) return SENSOR_COMPARE;
+    if (strcasecmp(s, "SENSOR_COMPARE") == 0 || strcasecmp(s, "sensor_compare") == 0) return SENSOR_COMPARE;
+    if (strcasecmp(s, "TIME_WINDOW") == 0 || strcasecmp(s, "time_window") == 0) return TIME_WINDOW;
+    if (strcasecmp(s, "RELAY_STATE") == 0 || strcasecmp(s, "relay_state") == 0) return RELAY_STATE;
+    if (strcasecmp(s, "SYSTEM_STATUS") == 0 || strcasecmp(s, "system_status") == 0) return SYSTEM_STATUS;
+    if (strcasecmp(s, "COMPOSITE") == 0 || strcasecmp(s, "composite") == 0) return COMPOSITE;
+    return SENSOR_COMPARE;
+}
+
+const char* compareOperatorToString(CompareOperator op) {
+    switch (op) {
+        case OP_LESS_THAN: return "OP_LESS_THAN";
+        case OP_LESS_EQUAL: return "OP_LESS_EQUAL";
+        case OP_GREATER_THAN: return "OP_GREATER_THAN";
+        case OP_GREATER_EQUAL: return "OP_GREATER_EQUAL";
+        case OP_EQUAL: return "OP_EQUAL";
+        case OP_NOT_EQUAL: return "OP_NOT_EQUAL";
+        case OP_BETWEEN: return "OP_BETWEEN";
+        case OP_OUTSIDE: return "OP_OUTSIDE";
+        default: return "OP_GREATER_THAN";
+    }
+}
+
+CompareOperator parseCompareOperator(const JsonVariant& value) {
+    if (value.is<int>()) {
+        const int v = value.as<int>();
+        if (v >= OP_LESS_THAN && v <= OP_OUTSIDE) {
+            return static_cast<CompareOperator>(v);
+        }
+    }
+    const char* s = value.as<const char*>();
+    if (!s) return OP_GREATER_THAN;
+    if (strcmp(s, "<") == 0 || strcasecmp(s, "OP_LESS_THAN") == 0 || strcasecmp(s, "less_than") == 0) return OP_LESS_THAN;
+    if (strcmp(s, "<=") == 0 || strcasecmp(s, "OP_LESS_EQUAL") == 0 || strcasecmp(s, "less_equal") == 0) return OP_LESS_EQUAL;
+    if (strcmp(s, ">") == 0 || strcasecmp(s, "OP_GREATER_THAN") == 0 || strcasecmp(s, "greater_than") == 0) return OP_GREATER_THAN;
+    if (strcmp(s, ">=") == 0 || strcasecmp(s, "OP_GREATER_EQUAL") == 0 || strcasecmp(s, "greater_equal") == 0) return OP_GREATER_EQUAL;
+    if (strcmp(s, "==") == 0 || strcasecmp(s, "OP_EQUAL") == 0 || strcasecmp(s, "equal") == 0) return OP_EQUAL;
+    if (strcmp(s, "!=") == 0 || strcasecmp(s, "OP_NOT_EQUAL") == 0 || strcasecmp(s, "not_equal") == 0) return OP_NOT_EQUAL;
+    if (strcasecmp(s, "OP_BETWEEN") == 0 || strcasecmp(s, "between") == 0) return OP_BETWEEN;
+    if (strcasecmp(s, "OP_OUTSIDE") == 0 || strcasecmp(s, "outside") == 0) return OP_OUTSIDE;
+    return OP_GREATER_THAN;
+}
+
+const char* actionTypeToString(ActionType type) {
+    switch (type) {
+        case RELAY_ON: return "RELAY_ON";
+        case RELAY_OFF: return "RELAY_OFF";
+        case RELAY_PULSE: return "RELAY_PULSE";
+        case RELAY_PWM: return "RELAY_PWM";
+        case SYSTEM_ALERT: return "SYSTEM_ALERT";
+        case LOG_EVENT: return "LOG_EVENT";
+        case SUPABASE_UPDATE: return "SUPABASE_UPDATE";
+        default: return "RELAY_ON";
+    }
+}
+
+ActionType parseActionType(const JsonVariant& value) {
+    if (value.is<int>()) {
+        const int v = value.as<int>();
+        if (v >= RELAY_ON && v <= SUPABASE_UPDATE) {
+            return static_cast<ActionType>(v);
+        }
+    }
+    const char* s = value.as<const char*>();
+    if (!s) return RELAY_ON;
+    if (strcasecmp(s, "RELAY_ON") == 0 || strcasecmp(s, "relay_on") == 0) return RELAY_ON;
+    if (strcasecmp(s, "RELAY_OFF") == 0 || strcasecmp(s, "relay_off") == 0) return RELAY_OFF;
+    if (strcasecmp(s, "RELAY_PULSE") == 0 || strcasecmp(s, "relay_pulse") == 0) return RELAY_PULSE;
+    if (strcasecmp(s, "RELAY_PWM") == 0 || strcasecmp(s, "relay_pwm") == 0) return RELAY_PWM;
+    if (strcasecmp(s, "SYSTEM_ALERT") == 0 || strcasecmp(s, "system_alert") == 0) return SYSTEM_ALERT;
+    if (strcasecmp(s, "LOG_EVENT") == 0 || strcasecmp(s, "log_event") == 0) return LOG_EVENT;
+    if (strcasecmp(s, "SUPABASE_UPDATE") == 0 || strcasecmp(s, "supabase_update") == 0) return SUPABASE_UPDATE;
+    return RELAY_ON;
+}
+
+}  // namespace
+
+bool DecisionEngine::parseConditionFromJSON(const JsonObject& json_cond, RuleCondition& condition) {
+    if (json_cond.isNull()) return false;
+
+    if (json_cond.containsKey("type")) {
+        condition.type = parseConditionType(json_cond["type"]);
+    }
+    if (json_cond.containsKey("sensor_name")) {
+        condition.sensor_name = json_cond["sensor_name"].as<String>();
+    } else if (json_cond.containsKey("sensor")) {
+        condition.sensor_name = json_cond["sensor"].as<String>();
+    }
+    if (json_cond.containsKey("op")) {
+        condition.op = parseCompareOperator(json_cond["op"]);
+    } else if (json_cond.containsKey("operator")) {
+        condition.op = parseCompareOperator(json_cond["operator"]);
+    }
+    if (json_cond.containsKey("value_min")) {
+        condition.value_min = json_cond["value_min"];
+    } else if (json_cond.containsKey("value")) {
+        condition.value_min = json_cond["value"];
+    }
+    if (json_cond.containsKey("value_max")) {
+        condition.value_max = json_cond["value_max"];
+    }
+    if (json_cond.containsKey("string_value")) {
+        condition.string_value = json_cond["string_value"].as<String>();
+    }
+    if (json_cond.containsKey("negate")) {
+        condition.negate = json_cond["negate"];
+    }
+    if (json_cond.containsKey("logic_operator")) {
+        condition.logic_operator = json_cond["logic_operator"].as<String>();
+    }
+
+    condition.sub_conditions.clear();
+    if (json_cond.containsKey("sub_conditions")) {
+        for (JsonObject sub_json : json_cond["sub_conditions"].as<JsonArray>()) {
+            RuleCondition sub;
+            if (parseConditionFromJSON(sub_json, sub)) {
+                condition.sub_conditions.push_back(sub);
+            }
+        }
+    }
+
+    return !condition.sensor_name.isEmpty() || condition.type == COMPOSITE || condition.type == TIME_WINDOW;
+}
+
+void DecisionEngine::conditionToJSON(const RuleCondition& condition, JsonObject& out, JsonDocument& doc) {
+    out["type"] = conditionTypeToString(condition.type);
+    out["sensor_name"] = condition.sensor_name;
+    out["op"] = compareOperatorToString(condition.op);
+    out["value_min"] = condition.value_min;
+    out["value_max"] = condition.value_max;
+    out["string_value"] = condition.string_value;
+    out["negate"] = condition.negate;
+    out["logic_operator"] = condition.logic_operator;
+
+    JsonArray sub_array = out.createNestedArray("sub_conditions");
+    for (const auto& sub : condition.sub_conditions) {
+        JsonObject sub_json = sub_array.createNestedObject();
+        conditionToJSON(sub, sub_json, doc);
+    }
+}
+
+bool DecisionEngine::parseActionFromJSON(const JsonObject& json_action, RuleAction& action) {
+    if (json_action.isNull()) return false;
+
+    if (json_action.containsKey("type")) {
+        action.type = parseActionType(json_action["type"]);
+    }
+    if (json_action.containsKey("target_relay")) {
+        action.target_relay = json_action["target_relay"];
+    } else if (json_action.containsKey("relay_number")) {
+        action.target_relay = json_action["relay_number"];
+    } else if (json_action.containsKey("relay_ids")) {
+        JsonArray relay_ids = json_action["relay_ids"].as<JsonArray>();
+        if (!relay_ids.isNull() && relay_ids.size() > 0) {
+            action.target_relay = relay_ids[0];
+        }
+    }
+    if (json_action.containsKey("target_device_id")) {
+        action.target_device_id = json_action["target_device_id"].as<String>();
+    }
+    if (json_action.containsKey("duration_ms")) {
+        action.duration_ms = json_action["duration_ms"];
+    } else if (json_action.containsKey("duration")) {
+        action.duration_ms = static_cast<unsigned long>(json_action["duration"].as<unsigned long>()) * 1000UL;
+    } else if (json_action.containsKey("duration_seconds")) {
+        action.duration_ms = static_cast<unsigned long>(json_action["duration_seconds"].as<unsigned long>()) * 1000UL;
+    }
+    if (json_action.containsKey("value")) {
+        action.value = json_action["value"];
+    }
+    if (json_action.containsKey("message")) {
+        action.message = json_action["message"].as<String>();
+    }
+    if (json_action.containsKey("repeat")) {
+        action.repeat = json_action["repeat"];
+    }
+    if (json_action.containsKey("repeat_interval_ms")) {
+        action.repeat_interval_ms = json_action["repeat_interval_ms"];
+    }
+
+    return true;
+}
+
+void DecisionEngine::actionToJSON(const RuleAction& action, JsonObject& out, JsonDocument& doc) {
+    (void)doc;
+    out["type"] = actionTypeToString(action.type);
+    out["target_relay"] = action.target_relay;
+    out["target_device_id"] = action.target_device_id;
+    out["duration_ms"] = action.duration_ms;
+    out["value"] = action.value;
+    out["message"] = action.message;
+    out["repeat"] = action.repeat;
+    out["repeat_interval_ms"] = action.repeat_interval_ms;
+}
+
+bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule& rule) {
+    if (json_rule.isNull()) return false;
+
+    if (json_rule.containsKey("id")) {
+        rule.id = json_rule["id"].as<String>();
+    } else if (json_rule.containsKey("rule_id")) {
+        rule.id = json_rule["rule_id"].as<String>();
+    }
+    if (json_rule.containsKey("name")) {
+        rule.name = json_rule["name"].as<String>();
+    } else if (json_rule.containsKey("rule_name")) {
+        rule.name = json_rule["rule_name"].as<String>();
+    }
+    if (json_rule.containsKey("description")) {
+        rule.description = json_rule["description"].as<String>();
+    } else if (json_rule.containsKey("rule_description")) {
+        rule.description = json_rule["rule_description"].as<String>();
+    }
+    if (json_rule.containsKey("enabled")) {
+        rule.enabled = json_rule["enabled"];
+    }
+    if (json_rule.containsKey("priority")) {
+        rule.priority = json_rule["priority"];
+    }
+    if (json_rule.containsKey("trigger_type")) {
+        rule.trigger_type = json_rule["trigger_type"].as<String>();
+    }
+    if (json_rule.containsKey("trigger_interval_ms")) {
+        rule.trigger_interval_ms = json_rule["trigger_interval_ms"];
+    }
+    if (json_rule.containsKey("cooldown_ms")) {
+        rule.cooldown_ms = json_rule["cooldown_ms"];
+    }
+    if (json_rule.containsKey("max_executions_per_hour")) {
+        rule.max_executions_per_hour = json_rule["max_executions_per_hour"];
+    }
+
+    rule.actions.clear();
+    rule.safety_checks.clear();
+
+    JsonObject rule_body = json_rule;
+    if (json_rule.containsKey("rule_json")) {
+        rule_body = json_rule["rule_json"].as<JsonObject>();
+    }
+
+    if (rule_body.containsKey("condition")) {
+        if (!parseConditionFromJSON(rule_body["condition"].as<JsonObject>(), rule.condition)) {
+            return false;
+        }
+    } else if (rule_body.containsKey("conditions")) {
+        JsonVariant conditions = rule_body["conditions"];
+        if (conditions.is<JsonArray>()) {
+            JsonArray cond_array = conditions.as<JsonArray>();
+            if (cond_array.size() == 0) return false;
+            if (cond_array.size() == 1) {
+                if (!parseConditionFromJSON(cond_array[0].as<JsonObject>(), rule.condition)) {
+                    return false;
+                }
+            } else {
+                rule.condition.type = COMPOSITE;
+                rule.condition.logic_operator = "AND";
+                for (JsonObject cond_json : cond_array) {
+                    RuleCondition sub;
+                    if (parseConditionFromJSON(cond_json, sub)) {
+                        rule.condition.sub_conditions.push_back(sub);
+                    }
+                }
+            }
+        } else if (conditions.is<JsonObject>()) {
+            if (!parseConditionFromJSON(conditions.as<JsonObject>(), rule.condition)) {
+                return false;
+            }
+        }
+    } else if (json_rule.containsKey("condition")) {
+        if (!parseConditionFromJSON(json_rule["condition"].as<JsonObject>(), rule.condition)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    JsonArray actions_array;
+    if (rule_body.containsKey("actions")) {
+        actions_array = rule_body["actions"].as<JsonArray>();
+    } else if (json_rule.containsKey("actions")) {
+        actions_array = json_rule["actions"].as<JsonArray>();
+    }
+
+    if (!actions_array.isNull()) {
+        for (JsonObject action_json : actions_array) {
+            RuleAction action;
+            if (parseActionFromJSON(action_json, action)) {
+                rule.actions.push_back(action);
+            }
+        }
+    }
+
+    JsonArray safety_array;
+    if (rule_body.containsKey("safety_checks")) {
+        safety_array = rule_body["safety_checks"].as<JsonArray>();
+    } else if (json_rule.containsKey("safety_checks")) {
+        safety_array = json_rule["safety_checks"].as<JsonArray>();
+    }
+
+    if (!safety_array.isNull()) {
+        for (JsonObject safety_json : safety_array) {
+            SafetyCheck safety;
+            safety.name = safety_json["name"] | "";
+            safety.error_message = safety_json["error_message"] | "";
+            safety.is_critical = safety_json["is_critical"] | false;
+            if (safety_json.containsKey("condition")) {
+                parseConditionFromJSON(safety_json["condition"].as<JsonObject>(), safety.condition);
+            }
+            rule.safety_checks.push_back(safety);
+        }
+    }
+
+    if (rule_body.containsKey("interval_between_executions")) {
+        rule.cooldown_ms = static_cast<unsigned long>(rule_body["interval_between_executions"].as<unsigned long>()) * 1000UL;
+    }
+    if (rule_body.containsKey("priority") && !json_rule.containsKey("priority")) {
+        rule.priority = rule_body["priority"];
+    }
+
+    return !rule.id.isEmpty() && !rule.actions.empty();
+}
+
+void DecisionEngine::ruleToJSON(const DecisionRule& rule, JsonObject& out, JsonDocument& doc) {
+    out["id"] = rule.id;
+    out["name"] = rule.name;
+    out["description"] = rule.description;
+    out["enabled"] = rule.enabled;
+    out["priority"] = rule.priority;
+    out["trigger_type"] = rule.trigger_type;
+    out["trigger_interval_ms"] = rule.trigger_interval_ms;
+    out["cooldown_ms"] = rule.cooldown_ms;
+    out["max_executions_per_hour"] = rule.max_executions_per_hour;
+
+    JsonObject condition_json = out.createNestedObject("condition");
+    conditionToJSON(rule.condition, condition_json, doc);
+
+    JsonArray actions_array = out.createNestedArray("actions");
+    for (const auto& action : rule.actions) {
+        JsonObject action_json = actions_array.createNestedObject();
+        actionToJSON(action, action_json, doc);
+    }
+
+    if (!rule.safety_checks.empty()) {
+        JsonArray safety_array = out.createNestedArray("safety_checks");
+        for (const auto& safety : rule.safety_checks) {
+            JsonObject safety_json = safety_array.createNestedObject();
+            safety_json["name"] = safety.name;
+            safety_json["error_message"] = safety.error_message;
+            safety_json["is_critical"] = safety.is_critical;
+            JsonObject safety_cond = safety_json.createNestedObject("condition");
+            conditionToJSON(safety.condition, safety_cond, doc);
+        }
+    }
 }
 
 // ===== ESTATÍSTICAS =====

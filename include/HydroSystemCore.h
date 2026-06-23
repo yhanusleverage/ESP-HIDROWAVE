@@ -17,35 +17,10 @@
 #include "MqttClient.h"
 #include "MqttCommandDedup.h"
 #include "RelayCoordinator.h"
-
-// ===== 🎯 CACHE NVS DE ESTADOS DE MASTER RELAYS (LOCAL, NÃO ESP-NOW) =====
-/**
- * @brief Estado cacheado de um relé master (guardado em NVS LOCAL)
- * ✅ SEGREGADO: Master relays são do corpo físico do master, não têm nada a ver com ESP-NOW
- */
-struct CachedMasterRelayState {
-    uint8_t relayNumber;         // Número do relé (0-15)
-    uint8_t state;               // 0=OFF, 1=ON
-    uint8_t hasTimer;            // 1=tem timer, 0=sem timer
-    uint16_t remainingTime;      // Tempo restante em segundos
-    uint32_t timestamp;          // Timestamp da última atualização (millis)
-    uint8_t relayType;           // 0=doser (0-7), 1=level (8-11), 2=reserved (12-15)
-    uint8_t padding[2];          // Padding para alinhamento
-} __attribute__((packed));
-
-/**
- * @brief Cache de estados de TODOS os relés master (16 relés)
- * ✅ SEGREGADO: Guardado em NVS LOCAL (não misturado com ESP-NOW)
- * ✅ EVENT-DRIVEN: NVS → POST Supabase
- */
-struct MasterRelayStatesCache {
-    uint32_t timestamp;              // Timestamp da última atualização
-    uint8_t version;                 // Versão do formato (1 = inicial)
-    uint8_t numRelays;               // Número de relés (16)
-    uint8_t padding[2];              // Padding para alinhamento
-    CachedMasterRelayState states[16]; // Estados dos 16 relés master
-    uint8_t checksum;                // Checksum para validação
-} __attribute__((packed));
+#include "DecisionEngine.h"
+#include "DecisionEngineIntegration.h"
+#include "StateCacheTypes.h"
+#include "StatePersistenceManager.h"
 
 // Forward declarations para evitar dependencias circulares
 class WebServerTask;
@@ -83,12 +58,18 @@ private:
     unsigned long lastMemoryProtection;
     unsigned long lastMqttTelemetrySend;
     unsigned long lastMqttHeartbeatSend;
+    unsigned long lastMqttCloudLastSeen;
     unsigned long lastEcOperationSync;
     unsigned long lastEcOperationIdleSync;
     unsigned long lastPhOperationSync;
     unsigned long lastPhOperationIdleSync;
     unsigned long commandPollIntervalMs;
     MqttCommandDedup mqttCommandDedup;
+
+    DecisionEngine decisionEngine;
+    DecisionEngineIntegration decisionIntegration;
+    bool bootOperationInterrupted;
+    bool decisionEngineReady;
 
     /** Cola de respaldo HTTPS para dose EC (evita pérdida silenciosa quando MQTT OK mas bridge falha). */
     struct PendingNutrientDoseExport {
@@ -124,11 +105,30 @@ private:
     uint8_t pendingPhDoseHead;
     uint8_t pendingPhDoseCount;
     static const uint8_t PENDING_DOSE_MAX_ATTEMPTS = 30;
+
+    /** Cola de cierre cloud cuando ACK hardware OK pero SSL/RPC falló */
+    struct PendingCloudAck {
+        int supabaseCommandId;
+        uint32_t espNowCommandId;
+        uint8_t slaveMac[6];
+        int relayNumber;
+        bool currentState;
+        uint8_t attempts;
+    };
+    static const size_t PENDING_CLOUD_ACK_CAP = 8;
+    static const uint8_t PENDING_CLOUD_ACK_MAX_ATTEMPTS = 20;
+    PendingCloudAck pendingCloudAckQueue[PENDING_CLOUD_ACK_CAP];
+    uint8_t pendingCloudAckHead;
+    uint8_t pendingCloudAckCount;
     
     // Intervalos otimizados para resposta mais rápida
     static const unsigned long SENSOR_SEND_INTERVAL = 30000;      // 30s
     static const unsigned long STATUS_SEND_INTERVAL = 60000;      // 1 min (mantido para device_status)
-    static const unsigned long RELAY_STATES_SYNC_INTERVAL = 10000; // 10s — espelho relay_master/slaves (após comando há update imediato)
+    static const unsigned long RELAY_STATES_SYNC_INTERVAL = 30000; // 30s — espelho relay_master/slaves
+    static const unsigned long RELAY_STATES_SYNC_FORCE_RF_MS = 60000; // backup ALL_RELAYS RF a cada 60s
+    static const unsigned long SLAVE_RELAY_HEARTBEAT_INTERVAL = 45000; // relay/state periódico p/ cloud
+    unsigned long lastSlaveRelayHeartbeat;
+    static const unsigned long MQTT_CLOUD_LAST_SEEN_INTERVAL = 240000UL; // 4 min — margem sob UI 5 min
     static const unsigned long EC_OPERATION_SYNC_INTERVAL = 12000; // 12s — remaining_sec fresco durante dosing/recirc
     static const unsigned long EC_OPERATION_IDLE_SYNC_INTERVAL = 30000; // 30s — limpa ec_operation huérfano em Supabase
     static const unsigned long PH_OPERATION_SYNC_INTERVAL = 12000;
@@ -161,6 +161,44 @@ private:
     void addCommandMapping(uint32_t espNowCommandId, int supabaseCommandId);
     int findSupabaseCommandId(uint32_t espNowCommandId);
     void cleanupExpiredMappings();
+
+    /** Espera de ACK slave (fallback via ALL_RELAYS_STATUS) */
+    struct PendingSlaveCommandAck {
+        int supabaseCommandId;
+        uint32_t espNowCommandId;
+        uint8_t slaveMac[6];
+        int relayNumber;
+        bool expectedOn;
+        unsigned long sentAt;
+    };
+    static const unsigned long PENDING_SLAVE_ACK_TTL_MS = 60000;
+    std::vector<PendingSlaveCommandAck> pendingSlaveCommandAcks;
+    SemaphoreHandle_t pendingAckMutex;
+
+    void registerPendingSlaveAck(int supabaseCommandId, uint32_t espNowCommandId,
+                                 const uint8_t* slaveMac, int relayNumber, const String& action);
+    void reconcilePendingSlaveAcks(const uint8_t* slaveMac, const bool relayStates[8], uint8_t numRelays);
+    void cleanupExpiredPendingSlaveAcks();
+    void completeSlaveCommand(int supabaseCommandId, uint32_t espNowCommandId,
+                              const uint8_t* slaveMac, int relayNumber, bool currentState,
+                              const char* via);
+    bool tryCloseCloudRelayCommand(int supabaseCommandId, const uint8_t* slaveMac,
+                                   int relayNumber, bool currentState,
+                                   uint32_t espNowCommandId = 0);
+    void enqueuePendingCloudAck(int supabaseCommandId, uint32_t espNowCommandId,
+                                const uint8_t* slaveMac, int relayNumber, bool currentState);
+    void flushPendingCloudAcks();
+    bool hasPendingCloudAcks() const { return pendingCloudAckCount > 0; }
+    bool hasPendingSlaveAcks();
+    bool isSslHotPathBusy();
+#if ENABLE_MQTT
+    unsigned long mqttConnectedSinceMs;
+    bool isMqttCommandPathStable() const;
+    bool tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
+                                   const uint8_t* slaveMac, int relayNumber, bool currentState);
+    void publishSlaveRelayStateMqtt(const uint8_t* slaveMac, int fallbackRelay = -1,
+                                    bool fallbackState = false, bool heartbeat = false);
+#endif
     
 public:
     /**
@@ -220,7 +258,9 @@ public:
 private:
     // Operações principais
     void checkSupabaseCommands();
-    void checkSupabaseRules();  // ✅ NOVO: Verificar regras de automação (decision_rules)
+    void applyBootPolicies();
+    void initDecisionEngine();
+    void checkSupabaseRules();  // sync config only (decision_rules → LittleFS)
     void checkECConfigFromSupabase();  // ✅ NOVO: Buscar EC config do Supabase via RPC activate_auto_ec
     void checkPHConfigFromSupabase();  // GET ph_config_view (read-only poll)
     void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "https");

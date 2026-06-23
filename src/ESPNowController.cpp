@@ -4,6 +4,7 @@
 #ifndef CONFIG_H
     #include "Config.h"
 #endif
+#include "MASTER_CONFIG.h"
 
 // Incluir WiFiCredentialsManager para estrutura WiFiCredentials
 #include "WiFiCredentialsManager.h"
@@ -27,11 +28,24 @@ class MasterSlaveManager;
 #include "MasterSlaveManager.h"
 
 // Instância estática para callbacks
+static void formatAllRelaysMask(const AllRelaysStatus& status, char* buf) {
+    for (uint8_t i = 0; i < 8; i++) {
+        if (i < status.numRelays) {
+            buf[i] = status.relays[i].state ? 'T' : 'F';
+        } else {
+            buf[i] = 'F';
+        }
+    }
+    buf[8] = '\0';
+}
+
 ESPNowController* ESPNowController::instance = nullptr;
 
 ESPNowController::ESPNowController(const String& deviceName, uint8_t channel) 
     : deviceName(deviceName), wifiChannel(channel), initialized(false), messageCounter(0),
-      messagesSent(0), messagesReceived(0), messagesLost(0), lastMessageId(0) {
+      messagesSent(0), messagesReceived(0), messagesLost(0), lastMessageId(0),
+      recentSenderCount(0), lastMasterContactMs(0), masterContactEstablished(false) {
+    memset(recentSenders, 0, sizeof(recentSenders));
     instance = this;
 }
 
@@ -76,23 +90,11 @@ bool ESPNowController::begin() {
             Serial.println("   Actualizando wifiChannel de " + String(oldChannel) + " a " + String(actualChannel));
         }
     } else {
-        // WiFi no conectado - usar canal del constructor o detectar canal actual
-        wifi_second_chan_t secondChan;
-        uint8_t currentChannel;
-        esp_wifi_get_channel(&currentChannel, &secondChan);
-        
-        if (currentChannel > 0 && currentChannel <= 13) {
-            // Si ya hay un canal configurado (por ejemplo, por main.cpp), usarlo
-            uint8_t oldChannel = wifiChannel; // Guardar valor anterior
-            actualChannel = currentChannel;
-            wifiChannel = actualChannel;
-            Serial.println("🔍 Canal WiFi actual detectado: " + String(actualChannel));
-            Serial.println("   Actualizando wifiChannel de " + String(oldChannel) + " a " + String(actualChannel));
-        } else {
-            // Usar canal del constructor
-            actualChannel = wifiChannel;
-            Serial.println("📶 Usando canal del constructor: " + String(actualChannel));
-        }
+        // Sem WiFi STA: usar canal configurado (evita canal stale de sessão anterior)
+        actualChannel = ESPNOW_CHANNEL;
+        wifiChannel = actualChannel;
+        esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE);
+        Serial.println("📶 Sem WiFi STA — canal ESP-NOW forçado para: " + String(actualChannel));
     }
     
     // Configurar canal WiFi con el canal REAL detectado
@@ -154,6 +156,12 @@ bool ESPNowController::begin() {
     
     // Enviar broadcast de descoberta
     sendDiscoveryBroadcast();
+
+#ifdef SLAVE_MODE
+    if (!WiFi.isConnected()) {
+        scanAndSyncToMasterChannel();
+    }
+#endif
     
     return true;
 }
@@ -168,15 +176,25 @@ void ESPNowController::update() {
         lastCleanup = millis();
     }
     
-    // ✅ PADRÃO MASTER-TASK: Discovery periódico (a cada 30s)
-    // Nota: En MASTER-TASK, ESPNowController::update() envia 1 broadcast cada 30s
-    // Los 3 broadcasts espaciados se envían en rediscoverSlaves() del MasterSlaveManager
+    // Discovery periódico — MASTER: só espNowTask/rediscoverSlaves (evita triple broadcast)
+#ifndef MASTER_MODE
     static unsigned long lastDiscovery = 0;
-    if (millis() - lastDiscovery > 30000) {  // 30 segundos
-        Serial.println("🔍 Auto-discovery: Procurando novos dispositivos...");
+    if (millis() - lastDiscovery > DISCOVERY_INTERVAL_MS) {
+        LOG_ESPNOW_INFO("Auto-discovery broadcast");
         sendDiscoveryBroadcast();
         lastDiscovery = millis();
     }
+#endif
+
+#ifdef SLAVE_MODE
+    // Re-anunciar a cada 10s enquanto Master não respondeu
+    static unsigned long lastSlaveAnnounce = 0;
+    if (!masterContactEstablished && millis() - lastSlaveAnnounce > 10000) {
+        Serial.println("📡 [SLAVE] Re-anunciando presença (Master ainda não contactou)...");
+        sendDiscoveryBroadcast();
+        lastSlaveAnnounce = millis();
+    }
+#endif
 }
 
 void ESPNowController::end() {
@@ -187,7 +205,9 @@ void ESPNowController::end() {
     }
 }
 
-bool ESPNowController::sendRelayCommand(const uint8_t* targetMac, int relayNumber, const String& action, int duration) {
+bool ESPNowController::sendRelayCommand(const uint8_t* targetMac, int relayNumber, const String& action,
+                                      int duration, uint32_t commandId, int cycleOffDuration,
+                                      const String& mode) {
     if (!initialized) {
         Serial.println("❌ ESP-NOW não inicializado");
         return false;
@@ -204,7 +224,12 @@ bool ESPNowController::sendRelayCommand(const uint8_t* targetMac, int relayNumbe
     cmdData.relayNumber = relayNumber;
     cmdData.state = (action == "on");
     cmdData.duration = duration;
+    cmdData.commandId = commandId;
+    cmdData.cycleOffDuration = cycleOffDuration;
     strncpy(cmdData.action, action.c_str(), sizeof(cmdData.action) - 1);
+    if (mode.length() > 0) {
+        strncpy(cmdData.mode, mode.c_str(), sizeof(cmdData.mode) - 1);
+    }
     
     message.dataSize = sizeof(RelayCommandData);
     memcpy(message.data, &cmdData, sizeof(RelayCommandData));
@@ -214,10 +239,49 @@ bool ESPNowController::sendRelayCommand(const uint8_t* targetMac, int relayNumbe
     
     if (success) {
         Serial.println("📤 Comando enviado: Relé " + String(relayNumber) + " -> " + action + 
-                      " para " + macToString(targetMac));
+                      " para " + macToString(targetMac) +
+                      (mode.length() > 0 ? " mode=" + mode : "") +
+                      (cycleOffDuration > 0 ? " off=" + String(cycleOffDuration) + "s" : ""));
     }
     
     return success;
+}
+
+bool ESPNowController::sendRelayCommandAck(const uint8_t* targetMac, const RelayCommandAck& ack) {
+    if (!initialized || !targetMac) {
+        return false;
+    }
+
+    TaskESPNowMessage taskMsg = {};
+    taskMsg.type = TASK_MSG_RELAY_ACK;
+    WiFi.macAddress(taskMsg.senderMac);
+    memcpy(taskMsg.targetMac, targetMac, 6);
+    taskMsg.timestamp = millis();
+    taskMsg.dataSize = sizeof(RelayCommandAck);
+
+    RelayCommandAck ackCopy = ack;
+    uint8_t checksum = 0;
+    uint8_t* data = reinterpret_cast<uint8_t*>(&ackCopy);
+    for (size_t i = 0; i < sizeof(RelayCommandAck) - 1; i++) {
+        checksum ^= data[i];
+    }
+    ackCopy.checksum = checksum;
+    memcpy(taskMsg.data, &ackCopy, sizeof(RelayCommandAck));
+
+    uint8_t msgChecksum = 0;
+    uint8_t* msgData = reinterpret_cast<uint8_t*>(&taskMsg);
+    for (size_t i = 0; i < sizeof(TaskESPNowMessage) - 1; i++) {
+        msgChecksum ^= msgData[i];
+    }
+    taskMsg.checksum = msgChecksum;
+
+    esp_err_t result = esp_now_send(targetMac, reinterpret_cast<uint8_t*>(&taskMsg), sizeof(TaskESPNowMessage));
+    if (result == ESP_OK) {
+        messagesSent++;
+        return true;
+    }
+    messagesLost++;
+    return false;
 }
 
 bool ESPNowController::sendRelayStatus(const uint8_t* targetMac, int relayNumber, bool state, bool hasTimer, int remainingTime, const String& name) {
@@ -407,7 +471,23 @@ bool ESPNowController::sendDiscoveryBroadcast() {
     Serial.println("📢 Enviando broadcast de descoberta...");
     
     uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    return sendDeviceInfo(nullptr, "RelayCommandBox", 8, true, millis(), ESP.getFreeHeap());
+
+    // BROADCAST real — Slaves respondem automaticamente com DEVICE_INFO
+    ESPNowMessage message = {};
+    message.type = MessageType::BROADCAST;
+    getLocalMac(message.senderId);
+    memcpy(message.targetId, broadcastMac, 6);
+    message.messageId = ++messageCounter;
+    message.timestamp = millis();
+    message.dataSize = 0;
+    message.checksum = calculateChecksum(message);
+    sendMessage(message, broadcastMac);
+
+#ifdef MASTER_MODE
+    return sendDeviceInfo(nullptr, "MasterController", 8, true, millis(), ESP.getFreeHeap());
+#else
+    return sendDeviceInfo(broadcastMac, "RelayBox", 8, true, millis(), ESP.getFreeHeap());
+#endif
 }
 
 bool ESPNowController::sendWiFiCredentialsBroadcast(const String& ssid, const String& password, uint8_t channel) {
@@ -543,27 +623,49 @@ bool ESPNowController::addPeer(const uint8_t* macAddress, const String& deviceNa
 
 bool ESPNowController::addPeerWithChannel(const uint8_t* macAddress, uint8_t peerChannel, const String& deviceName) {
     if (!initialized) {
-        Serial.println("❌ ESP-NOW não inicializado");
+        LOG_ESPNOW_ERROR("ESP-NOW não inicializado");
         return false;
     }
-    
-    Serial.println("\n🔧 === ADD PEER WITH CHANNEL ===");
-    Serial.println("📍 MAC: " + macToString(macAddress));
-    Serial.println("📶 Canal do Peer: " + String(peerChannel));
-    Serial.println("📝 Nome: " + (deviceName.isEmpty() ? "Unknown" : deviceName));
-    
-    // Validar canal
+
     if (peerChannel < 1 || peerChannel > 13) {
-        Serial.println("❌ Canal inválido: " + String(peerChannel));
+        LOG_ESPNOW_ERROR("Canal inválido: " + String(peerChannel));
         return false;
     }
-    
-    // Se peer já existe, remover para atualizar
+
+    uint8_t currentChannel;
+    wifi_second_chan_t secondChan;
+    esp_wifi_get_channel(&currentChannel, &secondChan);
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+    if (peerChannel != currentChannel && wifiConnected) {
+        peerChannel = currentChannel;
+    }
+
+    // Debounce: skip re-add se peer já existe no mesmo canal
     if (esp_now_is_peer_exist(macAddress)) {
-        Serial.println("⚠️ Peer já existe - removendo para atualizar...");
+        esp_now_peer_info_t existingPeer = {};
+        if (esp_now_get_peer(macAddress, &existingPeer) == ESP_OK &&
+            existingPeer.channel == peerChannel) {
+            updatePeerInfo(macAddress, deviceName, "");
+            LOG_ESPNOW_DEBUG("Peer inalterado (canal " + String(peerChannel) + "): " + macToString(macAddress));
+            return true;
+        }
+    }
+
+    LOG_ESPNOW_DEBUG("\n🔧 ADD PEER: " + macToString(macAddress) + " canal " + String(peerChannel));
+    
+    // Configurar peer com CANAL CORRETO
+    wifi_mode_t wifiMode = WiFi.getMode();
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, macAddress, 6);
+    peerInfo.channel = peerChannel;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+    (void)wifiMode;
+    
+    // Se canal mudou, remover peer antigo antes de re-adicionar
+    if (esp_now_is_peer_exist(macAddress)) {
         esp_now_del_peer(macAddress);
-        
-        // Remover da lista local também
         for (auto it = knownPeers.begin(); it != knownPeers.end(); ++it) {
             if (memcmp(it->macAddress, macAddress, 6) == 0) {
                 knownPeers.erase(it);
@@ -571,48 +673,8 @@ bool ESPNowController::addPeerWithChannel(const uint8_t* macAddress, uint8_t pee
             }
         }
     }
-    
-    // 🔍 DEBUG: Verificar modo WiFi antes de adicionar peer
-    wifi_mode_t wifiMode = WiFi.getMode();
-    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
-    uint8_t currentChannel;
-    wifi_second_chan_t secondChan;
-    esp_wifi_get_channel(&currentChannel, &secondChan);
-    
-    Serial.println("🔍 [DEBUG] Estado WiFi antes de adicionar peer:");
-    Serial.println("   📶 Modo WiFi: " + String(wifiMode == WIFI_AP_STA ? "AP+STA" : wifiMode == WIFI_STA ? "STA" : wifiMode == WIFI_AP ? "AP" : "OFF"));
-    Serial.println("   📡 WiFi conectado: " + String(wifiConnected ? "SIM ✅" : "NÃO ❌"));
-    Serial.println("   📶 Canal Master atual: " + String(currentChannel));
-    Serial.println("   📶 Canal Peer (Slave): " + String(peerChannel));
-    
-    // ⚠️ AVISO: Se canais diferentes e WiFi conectado
-    if (peerChannel != currentChannel && wifiConnected) {
-        Serial.println("   ⚠️ AVISO: Canais diferentes e WiFi conectado!");
-        Serial.println("   💡 Peer será adicionado no canal " + String(peerChannel) + " mas Master está no " + String(currentChannel));
-        Serial.println("   💡 Comunicação pode falhar se canais não sincronizarem");
-    }
-    
-    // Configurar peer com CANAL CORRETO
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, macAddress, 6);
-    peerInfo.channel = peerChannel;  // ✅ Canal do PEER, não local!
-    peerInfo.encrypt = false;
-    
-    // 🔍 DEBUG: Escolher interface correta baseado no modo WiFi
-    if (wifiMode == WIFI_AP_STA) {
-        // Se está em AP+STA, usar STA para comunicação ESP-NOW
-        peerInfo.ifidx = WIFI_IF_STA;
-        Serial.println("   📡 Interface: WIFI_IF_STA (modo AP+STA)");
-    } else if (wifiMode == WIFI_STA) {
-        peerInfo.ifidx = WIFI_IF_STA;
-        Serial.println("   📡 Interface: WIFI_IF_STA (modo STA)");
-    } else {
-        // Fallback para STA
-        peerInfo.ifidx = WIFI_IF_STA;
-        Serial.println("   📡 Interface: WIFI_IF_STA (fallback)");
-    }
-    
-    Serial.println("🔗 Adicionando peer no canal " + String(peerChannel) + "...");
+
+    LOG_ESPNOW_DEBUG("🔗 Adicionando peer no canal " + String(peerChannel) + "...");
     
     // Adicionar peer
     esp_err_t result = esp_now_add_peer(&peerInfo);
@@ -629,27 +691,11 @@ bool ESPNowController::addPeerWithChannel(const uint8_t* macAddress, uint8_t pee
         
         knownPeers.push_back(newPeer);
         
-        Serial.println("✅ Peer adicionado com sucesso no canal " + String(peerChannel) + "!");
-        Serial.println("==================================\n");
+        LOG_ESPNOW_INFO("✅ Peer adicionado canal " + String(peerChannel) + ": " + macToString(macAddress));
         return true;
         
     } else {
-        Serial.println("❌ ERRO ao adicionar peer!");
-        Serial.println("💡 Código de erro: " + String(result) + " (0x" + String(result, HEX) + ")");
-        
-        // Detalhar erros comuns
-        if (result == ESP_ERR_ESPNOW_EXIST) {
-            Serial.println("⚠️ Erro: Peer já existe (0x306B)");
-        } else if (result == ESP_ERR_ESPNOW_FULL) {
-            Serial.println("⚠️ Erro: Lista de peers cheia");
-        } else if (result == ESP_ERR_ESPNOW_ARG) {
-            Serial.println("⚠️ Erro: Argumento inválido");
-        } else if (result == 0x306A) {
-            Serial.println("⚠️ Erro: ESP_ERR_ESPNOW_CHAN - Canal incorreto!");
-            Serial.println("💡 Verifique se dispositivos estão no mesmo canal");
-        }
-        
-        Serial.println("==================================\n");
+        LOG_ESPNOW_ERROR("Erro ao adicionar peer " + macToString(macAddress) + " código " + String(result));
         return false;
     }
 }
@@ -768,8 +814,14 @@ int ESPNowController::getPeerCount() {
     return peerNum.total_num;
 }
 
-void ESPNowController::setRelayCommandCallback(std::function<void(const uint8_t* senderMac, int relayNumber, const String& action, int duration)> callback) {
+void ESPNowController::setRelayCommandCallback(
+    std::function<void(const uint8_t* senderMac, uint32_t commandId, int relayNumber, const String& action,
+                       int duration, const String& mode, int cycleOffDuration)> callback) {
     this->relayCommandCallback = callback;
+}
+
+void ESPNowController::setPersistentStateCallback(std::function<void(const uint8_t* senderMac, const PersistentRelayStateData& states)> callback) {
+    this->persistentStateCallback = callback;
 }
 
 void ESPNowController::setRelayStatusCallback(std::function<void(const uint8_t* senderMac, int relayNumber, bool state, bool hasTimer, int remainingTime, const String& name)> callback) {
@@ -782,6 +834,10 @@ void ESPNowController::setDeviceInfoCallback(std::function<void(const uint8_t* s
 
 void ESPNowController::setPingCallback(void (*callback)(const uint8_t* senderMac)) {
     this->pingCallback = callback;
+}
+
+void ESPNowController::setPongCallback(void (*callback)(const uint8_t* senderMac)) {
+    this->pongCallback = callback;
 }
 
 void ESPNowController::setWiFiCredentialsCallback(void (*callback)(const String& ssid, const String& password, uint8_t channel)) {
@@ -999,9 +1055,16 @@ bool ESPNowController::sendMessage(const ESPNowMessage& message, const uint8_t* 
 }
 
 void ESPNowController::processReceivedMessage(const ESPNowMessage& message, const uint8_t* senderMac) {
-    if (!validateMessage(message)) {
+    if (!validateMessage(message, senderMac)) {
         Serial.println("❌ Mensagem inválida recebida de: " + macToString(senderMac));
         return;
+    }
+
+    // Contacto com Master (Slave) — mensagem unicast válida de outro dispositivo
+    static const uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    if (senderMac && memcmp(senderMac, broadcastMac, 6) != 0) {
+        lastMasterContactMs = millis();
+        masterContactEstablished = true;
     }
     
     // 🔧 AUTO-ADD PEER: Adicionar remetente automaticamente usando método seguro
@@ -1025,14 +1088,22 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
     
     switch (message.type) {
         case MessageType::RELAY_COMMAND: {
-            if (relayCommandCallback && message.dataSize >= sizeof(RelayCommandData)) {
-                RelayCommandData cmdData;
-                memcpy(&cmdData, message.data, sizeof(RelayCommandData));
+            if (relayCommandCallback && message.dataSize >= 24) {
+                RelayCommandData cmdData = {};
+                size_t copySize = message.dataSize < sizeof(RelayCommandData)
+                                      ? message.dataSize
+                                      : sizeof(RelayCommandData);
+                memcpy(&cmdData, message.data, copySize);
                 
+                String modeStr = cmdData.mode[0] != '\0' ? String(cmdData.mode) : "";
                 Serial.println("📥 Comando recebido de " + macToString(senderMac) + 
-                              ": Relé " + String(cmdData.relayNumber) + " -> " + String(cmdData.action));
+                              ": Relé " + String(cmdData.relayNumber) + " -> " + String(cmdData.action) +
+                              (modeStr.length() > 0 ? " mode=" + modeStr : "") +
+                              " (cmdId=" + String(cmdData.commandId) + ")");
                 
-                relayCommandCallback(senderMac, cmdData.relayNumber, String(cmdData.action), cmdData.duration);
+                relayCommandCallback(senderMac, cmdData.commandId, cmdData.relayNumber,
+                                     String(cmdData.action), cmdData.duration, modeStr,
+                                     cmdData.cycleOffDuration);
             }
             break;
         }
@@ -1052,58 +1123,37 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
         }
         
         case MessageType::DEVICE_INFO: {
-            // 🔍 DEBUG: Verificar se callback está configurado
-            Serial.println("\n🔍 [DEBUG] DEVICE_INFO recebido!");
-            Serial.println("   📏 Tamanho do mensagem: " + String(message.dataSize) + " bytes");
-            Serial.println("   📏 Tamanho esperado: " + String(sizeof(DeviceInfoData)) + " bytes");
-            Serial.println("   🔔 deviceInfoCallback é nullptr? " + String(deviceInfoCallback == nullptr ? "SIM ❌" : "NÃO ✅"));
-            
-            // 🔍 DEBUG: Estado WiFi e Canal
-            wifi_mode_t wifiMode = WiFi.getMode();
-            bool wifiConnected = (WiFi.status() == WL_CONNECTED);
-            uint8_t currentChannel;
-            wifi_second_chan_t secondChan;
-            esp_wifi_get_channel(&currentChannel, &secondChan);
-            Serial.println("   📶 Modo WiFi: " + String(wifiMode == WIFI_AP_STA ? "AP+STA" : wifiMode == WIFI_STA ? "STA" : wifiMode == WIFI_AP ? "AP" : "OFF"));
-            Serial.println("   📡 WiFi conectado: " + String(wifiConnected ? "SIM ✅" : "NÃO ❌"));
-            Serial.println("   📶 Canal WiFi atual: " + String(currentChannel));
-            Serial.println("   📶 Canal ESP-NOW configurado: " + String(wifiChannel));
+            LOG_ESPNOW_DEBUG("\n🔍 DEVICE_INFO de " + macToString(senderMac));
             
             if (deviceInfoCallback && message.dataSize >= sizeof(DeviceInfoData)) {
                 DeviceInfoData infoData;
                 memcpy(&infoData, message.data, sizeof(DeviceInfoData));
                 
-                Serial.println("📥 Info recebida de " + macToString(senderMac) + 
-                              ": " + String(infoData.deviceName) + " (" + String(infoData.deviceType) + ")");
-                Serial.println("📶 Canal do dispositivo remoto: " + String(infoData.wifiChannel));
+                LOG_ESPNOW_INFO("📥 DEVICE_INFO: " + String(infoData.deviceName) +
+                               " canal " + String(infoData.wifiChannel));
                 
                 // ✅ SINCRONIZAÇÃO DE CANAL - CRÍTICO!
-                // ⚠️ CORREÇÃO: NÃO mudar canal se WiFi Station está conectado
+                // ESPNOW_LOCK_WIFI_CHANNEL: manter canal do WiFi STA (não saltar de canal)
                 if (infoData.wifiChannel > 0 && infoData.wifiChannel != wifiChannel) {
-                    // Verificar se WiFi Station está conectado
                     bool stationConnected = (WiFi.status() == WL_CONNECTED);
-                    
-                    if (stationConnected) {
-                        // WiFi conectado - NÃO podemos mudar de canal
+
+                    if (stationConnected || ESPNOW_LOCK_WIFI_CHANNEL) {
                         Serial.println("\n⚠️ === CONFLITO DE CANAL DETECTADO ===");
                         Serial.println("⚠️ Dispositivo remoto está no canal " + String(infoData.wifiChannel));
-                        Serial.println("⚠️ Nós estamos no canal " + String(wifiChannel) + " (WiFi Station conectado)");
-                        Serial.println("💡 WiFi Station impede mudança de canal");
-                        Serial.println("🔄 O dispositivo remoto deve sincronizar para nosso canal");
+                        Serial.println("⚠️ Nós estamos no canal " + String(wifiChannel) +
+                                         (stationConnected ? " (WiFi Station conectado)" : " (canal fixo)"));
+                        Serial.println("💡 Mantendo canal local — peer deve sincronizar");
                         Serial.println("=======================================\n");
-                        // NÃO mudar canal - manter o atual
                     } else {
-                        // WiFi NÃO conectado - podemos mudar de canal
                         Serial.println("\n🔧 === SINCRONIZAÇÃO DE CANAL DETECTADA ===");
                         Serial.println("⚠️ Dispositivo remoto está no canal " + String(infoData.wifiChannel));
                         Serial.println("⚠️ Nós estamos no canal " + String(wifiChannel));
                         Serial.println("🔄 Atualizando para canal " + String(infoData.wifiChannel) + "...");
-                        
-                        // Atualizar canal local
+
                         esp_wifi_set_channel(infoData.wifiChannel, WIFI_SECOND_CHAN_NONE);
                         wifiChannel = infoData.wifiChannel;
-                        delay(100); // Aguardar estabilização
-                        
+                        delay(100);
+
                         Serial.println("✅ Canal local atualizado para " + String(wifiChannel));
                         Serial.println("=======================================\n");
                     }
@@ -1118,23 +1168,13 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                 // Atualizar informações detalhadas do peer
                 updatePeerInfo(senderMac, String(infoData.deviceName), String(infoData.deviceType));
                 
-                // 🔍 DEBUG: Antes de chamar callback
-                Serial.println("🔍 [DEBUG] Chamando deviceInfoCallback...");
-                Serial.println("   📝 Nome: " + String(infoData.deviceName));
-                Serial.println("   🏷️ Tipo: " + String(infoData.deviceType));
-                Serial.println("   🔌 Relés: " + String(infoData.numRelays));
-                Serial.println("   📶 Canal: " + String(infoData.wifiChannel));
+                LOG_ESPNOW_DEBUG("🔍 deviceInfoCallback: " + String(infoData.deviceName));
                 
-                // Chamar callback
                 deviceInfoCallback(senderMac, String(infoData.deviceName), String(infoData.deviceType), 
                                  infoData.numRelays, infoData.operational, infoData.wifiChannel);
-                
-                // 🔍 DEBUG: Depois de chamar callback
-                Serial.println("🔍 [DEBUG] deviceInfoCallback chamado!");
             } else {
-                // 🔍 DEBUG: Por que não chamou callback?
                 if (!deviceInfoCallback) {
-                    Serial.println("❌ [DEBUG] deviceInfoCallback é nullptr - callback NÃO configurado!");
+                    LOG_ESPNOW_WARN("deviceInfoCallback não configurado");
                 }
                 if (message.dataSize < sizeof(DeviceInfoData)) {
                     Serial.println("❌ [DEBUG] Tamanho insuficiente: " + String(message.dataSize) + " < " + String(sizeof(DeviceInfoData)));
@@ -1144,7 +1184,7 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
         }
         
         case MessageType::PING: {
-            Serial.println("🏓 Ping recebido de: " + macToString(senderMac));
+            LOG_ESPNOW_DEBUG("🏓 Ping de " + macToString(senderMac));
             
             // Responder com PONG
             ESPNowMessage pongMsg = {};
@@ -1166,6 +1206,9 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
         
         case MessageType::PONG: {
             Serial.println("🏓 Pong recebido de: " + macToString(senderMac));
+            if (pongCallback) {
+                pongCallback(senderMac);
+            }
             break;
         }
         
@@ -1174,7 +1217,7 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
             
             // ✅ CORREÇÃO CRÍTICA: Slaves devem responder automaticamente com DEVICE_INFO quando recebem BROADCAST
             // Isso permite que o master descubra slaves rapidamente
-            #ifdef SLAVE_MODE
+            #ifndef MASTER_MODE
             // Modo SLAVE: Responder automaticamente com DEVICE_INFO quando recebe BROADCAST
             Serial.println("\n📤 ========================================");
             Serial.println("📤 [SLAVE] RESPONDENDO AO BROADCAST");
@@ -1190,9 +1233,11 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
             }
             Serial.println("========================================\n");
             #elif defined(MASTER_MODE)
-            // Modo MASTER: Solicitar DEVICE_INFO se é peer novo
             if (MasterSlaveManager::getInstance()) {
                 TrustedSlave* slave = MasterSlaveManager::getInstance()->getTrustedSlave(senderMac);
+                if (slave) {
+                    MasterSlaveManager::getInstance()->touchSlaveLink(senderMac, "broadcast_rx");
+                }
                 bool needsInfo = isNewPeer || !slave || 
                                  slave->deviceName.startsWith("Auto-") || 
                                  slave->deviceName.startsWith("Slave-") || 
@@ -1200,7 +1245,7 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                 
                 if (needsInfo) {
                     Serial.println("📋 Broadcast de slave - solicitando DEVICE_INFO para obtener nombre real...");
-                    delay(100); // Delay para evitar spam
+                    delay(100);
                     MasterSlaveManager::getInstance()->requestSlaveInfo(senderMac);
                 }
             }
@@ -1379,33 +1424,28 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                     }
                     
                     if (masterManager) {
+                        bool relayStates[8] = {false};
+                        const uint8_t n = (allStatus.numRelays < 8) ? allStatus.numRelays : 8;
+                        for (uint8_t i = 0; i < n; i++) {
+                            relayStates[i] = allStatus.relays[i].state == 1;
+                        }
+                        masterManager->notifyAllRelaysStatusReceived(senderMac, relayStates, n);
                         masterManager->setProcessingStatusResponse(false);
                     }
                     break; // Salir sin imprimir
                 }
                 
-                // ✅ VISUALIZAÇÃO COMPLETA: Mostrar estado de todos os relays (solo una vez por mensaje)
-                Serial.println("\n📊 ========================================");
-                Serial.println("📊 ESTADO COMPLETO DE TODOS OS RELAYS");
-                Serial.println("📊 ========================================");
-                Serial.println("📥 De: " + macToString(senderMac));
-                Serial.println("⏰ Timestamp: " + String(allStatus.timestamp));
-                Serial.println("🔌 Total de relays: " + String(allStatus.numRelays));
-                Serial.println("----------------------------------------");
+                char relayMask[9];
+                formatAllRelaysMask(allStatus, relayMask);
+                Serial.printf("[ESPNOW] ALL_RELAYS %s mask=%s\n",
+                              macToString(senderMac).c_str(), relayMask);
+                LOG_ESPNOW_DEBUG("\n📊 ESTADO COMPLETO DE TODOS OS RELAYS");
+                LOG_ESPNOW_DEBUG("📥 De: " + macToString(senderMac));
                 
-                // Mostrar estado de cada relé com emojis
                 for (uint8_t i = 0; i < allStatus.numRelays && i < 8; i++) {
-                    String stateIcon = allStatus.relays[i].state ? "🟢 ON " : "🔴 OFF";
-                    String timerInfo = "";
-                    
-                    if (allStatus.relays[i].hasTimer) {
-                        timerInfo = " ⏱️ " + String(allStatus.relays[i].remainingTime) + "s";
-                    }
-                    
-                    Serial.println("   Relé " + String(i) + ": " + stateIcon + timerInfo);
+                    LOG_ESPNOW_DEBUG("   Relé " + String(i) + ": " +
+                                    (allStatus.relays[i].state ? "ON" : "OFF"));
                 }
-                
-                Serial.println("========================================\n");
                 
                 // ✅ Proteção contra loop infinito: marcar que estamos processando resposta de status
                 MasterSlaveManager* masterManager = MasterSlaveManager::getInstance();
@@ -1430,6 +1470,12 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                 
                 // ✅ Desmarcar flag após processar (sem delay desnecessário)
                 if (masterManager) {
+                    bool relayStates[8] = {false};
+                    const uint8_t n = (allStatus.numRelays < 8) ? allStatus.numRelays : 8;
+                    for (uint8_t i = 0; i < n; i++) {
+                        relayStates[i] = allStatus.relays[i].state == 1;
+                    }
+                    masterManager->notifyAllRelaysStatusReceived(senderMac, relayStates, n);
                     masterManager->setProcessingStatusResponse(false);
                 }
             } else {
@@ -1497,7 +1543,11 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                 }
                 
                 Serial.println("========================================\n");
-                Serial.println("💡 Estados persistentes recebidos - Prontos para guardar em NVS");
+                if (persistentStateCallback) {
+                    persistentStateCallback(senderMac, persistentStates);
+                } else {
+                    Serial.println("💡 Estados persistentes recebidos - Prontos para guardar em NVS");
+                }
             } else {
                 Serial.println("❌ ERRO: PERSISTENT_STATE_SYNC recebido mas tamanho inválido!");
                 Serial.println("   Recebido: " + String(message.dataSize) + " bytes");
@@ -1524,8 +1574,59 @@ uint8_t ESPNowController::calculateChecksum(const ESPNowMessage& message) {
     return checksum;
 }
 
-bool ESPNowController::validateMessage(const ESPNowMessage& message) {
-    // Verificar checksum
+bool ESPNowController::isDuplicateMessage(const ESPNowMessage& message) {
+    const uint8_t* mac = message.senderId;
+    if (message.messageId == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < recentSenderCount; i++) {
+        if (memcmp(recentSenders[i].mac, mac, 6) == 0) {
+            if (recentSenders[i].lastMessageId == message.messageId &&
+                (millis() - recentSenders[i].lastSeenMs) < 60000UL) {
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+void ESPNowController::recordMessageId(const ESPNowMessage& message) {
+    if (message.messageId == 0) {
+        return;
+    }
+
+    const uint8_t* mac = message.senderId;
+    for (size_t i = 0; i < recentSenderCount; i++) {
+        if (memcmp(recentSenders[i].mac, mac, 6) == 0) {
+            recentSenders[i].lastMessageId = message.messageId;
+            recentSenders[i].lastSeenMs = millis();
+            return;
+        }
+    }
+
+    if (recentSenderCount < MAX_RECENT_SENDERS) {
+        memcpy(recentSenders[recentSenderCount].mac, mac, 6);
+        recentSenders[recentSenderCount].lastMessageId = message.messageId;
+        recentSenders[recentSenderCount].lastSeenMs = millis();
+        recentSenderCount++;
+    } else {
+        size_t oldestIdx = 0;
+        unsigned long oldestSeen = recentSenders[0].lastSeenMs;
+        for (size_t i = 1; i < MAX_RECENT_SENDERS; i++) {
+            if (recentSenders[i].lastSeenMs < oldestSeen) {
+                oldestSeen = recentSenders[i].lastSeenMs;
+                oldestIdx = i;
+            }
+        }
+        memcpy(recentSenders[oldestIdx].mac, mac, 6);
+        recentSenders[oldestIdx].lastMessageId = message.messageId;
+        recentSenders[oldestIdx].lastSeenMs = millis();
+    }
+}
+
+bool ESPNowController::validateMessage(const ESPNowMessage& message, const uint8_t* senderMac) {
     ESPNowMessage tempMsg = message;
     tempMsg.checksum = 0;
     uint8_t calculatedChecksum = calculateChecksum(tempMsg);
@@ -1535,20 +1636,89 @@ bool ESPNowController::validateMessage(const ESPNowMessage& message) {
         return false;
     }
     
-    // Verificar tamanho dos dados
     if (message.dataSize > sizeof(message.data)) {
         Serial.println("❌ Tamanho de dados inválido");
         return false;
     }
-    
-    // Verificar se não é uma mensagem muito antiga
-    unsigned long currentTime = millis();
-    if (currentTime > message.timestamp && (currentTime - message.timestamp) > MESSAGE_TIMEOUT_MS) {
-        DEBUG_PRINTLN("❌ Mensagem muito antiga");
+
+    ESPNowMessage dedupMsg = message;
+    if (senderMac) {
+        memcpy(dedupMsg.senderId, senderMac, 6);
+    }
+
+    if (isDuplicateMessage(dedupMsg)) {
+        DEBUG_PRINTLN("❌ Mensagem duplicada (messageId repetido)");
         return false;
     }
-    
+
+    recordMessageId(dedupMsg);
     return true;
+}
+
+bool ESPNowController::setWifiChannel(uint8_t channel) {
+    if (channel < 1 || channel > 13) {
+        return false;
+    }
+
+#if ESPNOW_LOCK_WIFI_CHANNEL
+    if (WiFi.status() == WL_CONNECTED) {
+        channel = WiFi.channel();
+    }
+#endif
+
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    wifiChannel = channel;
+
+    uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    if (esp_now_is_peer_exist(broadcastMac)) {
+        esp_now_del_peer(broadcastMac);
+    }
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastMac, 6);
+    peerInfo.channel = channel;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+    return esp_now_add_peer(&peerInfo) == ESP_OK || esp_now_add_peer(&peerInfo) == ESP_ERR_ESPNOW_EXIST;
+}
+
+bool ESPNowController::scanAndSyncToMasterChannel() {
+    if (!initialized || WiFi.isConnected()) {
+        return true;
+    }
+
+    Serial.println("\n🔍 === SCAN MULTI-CANAL (Slave → Master) ===");
+    const uint8_t scanOrder[] = {1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13};
+    const size_t scanCount = sizeof(scanOrder) / sizeof(scanOrder[0]);
+
+    for (size_t i = 0; i < scanCount; i++) {
+        uint8_t channel = scanOrder[i];
+        Serial.print("   Canal " + String(channel) + ": ");
+
+        masterContactEstablished = false;
+        if (!setWifiChannel(channel)) {
+            Serial.println("❌ falha ao mudar canal");
+            continue;
+        }
+
+        sendDiscoveryBroadcast();
+        delay(450);
+
+        if (masterContactEstablished) {
+            Serial.println("✅ Master detectado!");
+            Serial.println("================================================\n");
+            return true;
+        }
+        Serial.println("⚪ sem resposta");
+    }
+
+    Serial.println("⚠️ Master não encontrado no scan — mantendo canal " + String(wifiChannel));
+    Serial.println("================================================\n");
+    return false;
+}
+
+bool ESPNowController::hasRecentMasterContact() const {
+    return masterContactEstablished && (millis() - lastMasterContactMs) < 120000UL;
 }
 
 void ESPNowController::updatePeerInfo(const uint8_t* macAddress, const String& deviceName, const String& deviceType) {
@@ -1693,6 +1863,9 @@ void ESPNowController::onDataSent(const uint8_t* mac_addr, esp_now_send_status_t
         if (failureCount >= 3) {
             Serial.printf("⚠️ Falha ao enviar para %s (%d tentativas consecutivas)\n", 
                          macToString(mac_addr).c_str(), failureCount);
+            if (MasterSlaveManager::getInstance()) {
+                MasterSlaveManager::getInstance()->notifyEspNowSendFail(mac_addr, failureCount);
+            }
         }
     } else {
         // ✅ Resetear contador en caso de éxito

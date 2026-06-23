@@ -17,7 +17,9 @@ $PackageJson = Join-Path $BridgeDir "package.json"
 $AclDosePatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-dose-topics.sh"
 $AclMetricPatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-metric-topics.sh"
 $AclHidrowavePatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-hidrowave-publish.sh"
+$AlignBrokerSh = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\align-broker-production.sh"
 $SlaveCmdJs = Join-Path $BridgeDir "scripts\test-publish-slave-command.js"
+$CheckRelayRowJs = Join-Path $BridgeDir "scripts\check-relay-slave-row.js"
 
 if (-not (Test-Path $PemPath)) {
   Write-Error "PEM no encontrado: $PemPath"
@@ -44,6 +46,9 @@ if (Test-Path $AclHidrowavePatch) {
 if (Test-Path $SlaveCmdJs) {
   scp -i $PemPath -o StrictHostKeyChecking=accept-new $SlaveCmdJs "${SshHost}:/tmp/test-publish-slave-command.js"
 }
+if (Test-Path $CheckRelayRowJs) {
+  scp -i $PemPath -o StrictHostKeyChecking=accept-new $CheckRelayRowJs "${SshHost}:/tmp/check-relay-slave-row.js"
+}
 scp -i $PemPath -o StrictHostKeyChecking=accept-new $PackageJson "${SshHost}:/tmp/hidrowave-package.json"
 
 Write-Host ">> Instalar y reiniciar hidrowave-bridge"
@@ -55,6 +60,7 @@ sudo cp /tmp/test-publish-ec-dose.js /opt/hidrowave-bridge/scripts/test-publish-
 sudo cp /tmp/test-publish-ec-metric.js /opt/hidrowave-bridge/scripts/test-publish-ec-metric.js &&
 sudo cp /tmp/test-publish-ph-metric.js /opt/hidrowave-bridge/scripts/test-publish-ph-metric.js &&
 if [ -f /tmp/test-publish-slave-command.js ]; then sudo cp /tmp/test-publish-slave-command.js /opt/hidrowave-bridge/scripts/test-publish-slave-command.js; fi &&
+if [ -f /tmp/check-relay-slave-row.js ]; then sudo cp /tmp/check-relay-slave-row.js /opt/hidrowave-bridge/scripts/check-relay-slave-row.js; fi &&
 sudo cp /tmp/hidrowave-package.json /opt/hidrowave-bridge/package.json &&
 sudo chmod 755 /opt/hidrowave-bridge/scripts &&
 if [ -f /tmp/patch-acl-dose-topics.sh ]; then sudo bash /tmp/patch-acl-dose-topics.sh; fi &&
@@ -63,7 +69,7 @@ if [ -f /tmp/patch-acl-hidrowave-publish.sh ]; then sudo bash /tmp/patch-acl-hid
 sudo chown hidrowave:hidrowave /opt/hidrowave-bridge/scripts/*.js &&
 sudo systemctl restart hidrowave-bridge &&
 sleep 2 &&
-sudo journalctl -u hidrowave-bridge -n 20 --no-pager | grep -E 'Subscribed|dose|ph_dose|ec_metric|ph_metric|INSERT|error' || true
+sudo journalctl -u hidrowave-bridge -n 30 --no-pager | grep -E 'Subscribed|relay/state|link-only|Rejected|heartbeat' || true
 "@
 ssh -i $PemPath -o StrictHostKeyChecking=accept-new $SshHost $remoteCmd
 

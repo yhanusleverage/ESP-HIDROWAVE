@@ -348,7 +348,11 @@ private:
     /**
      * @brief Callback para comandos de relé recebidos via ESPNowController
      */
-    void onRelayCommandReceived(const uint8_t* senderMac, int relayNumber, const String& action, int duration);
+    void onRelayCommandReceived(const uint8_t* senderMac, uint32_t commandId, int relayNumber,
+                                const String& action, int duration, const String& mode = "",
+                                int cycleOffDuration = 0);
+
+    void onPersistentStateReceived(const uint8_t* senderMac, const PersistentRelayStateData& states);
     
     /**
      * @brief Callback para status de relé recebido via ESPNowController
@@ -374,10 +378,13 @@ private:
      * @brief Callback para erro do ESPNowController
      */
     void onErrorReceived(const String& error);
+
+    void sendCommandFeedback(const uint8_t* masterMac, uint32_t commandId, int relayNumber, bool success);
+    void publishAllRelaysStatus(const uint8_t* masterMac);
+    static void onStateChangedStatic(int relayNumber, bool state, int remainingTime);
     
-    /**
-     * @brief Callback estático para recebimento de dados (compatibilidade)
-     */
+    uint8_t lastMasterMac[6];
+    bool hasLastMasterMac;
     static void onDataReceived(const uint8_t* mac, const uint8_t* incomingData, int len);
     
     /**

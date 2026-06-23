@@ -158,6 +158,91 @@ Espelhar semântica de `relay_commands`. **Fonte de verdade TypeScript:** `HIDRO
 }
 ```
 
+**Timer ligar 30s** (`timed_on`):
+
+```json
+{
+  "v": 1,
+  "id": 12347,
+  "cmd": "relay",
+  "device_id": "ESP32_HIDRO_269844",
+  "relay_index": 0,
+  "action": "on",
+  "duration_s": 30,
+  "mode": "timed_on",
+  "target_device_id": "AA:BB:CC:DD:EE:FF",
+  "slave_mac_address": "AA:BB:CC:DD:EE:FF",
+  "source": "web",
+  "command_type": "manual",
+  "priority": 10,
+  "triggered_by": "timer_on"
+}
+```
+
+**Timer desligar em 15s** (relé já ON — `timed_off`):
+
+```json
+{
+  "v": 1,
+  "id": 12348,
+  "cmd": "relay",
+  "device_id": "ESP32_HIDRO_269844",
+  "relay_index": 0,
+  "action": "on",
+  "duration_s": 15,
+  "mode": "timed_off",
+  "target_device_id": "AA:BB:CC:DD:EE:FF",
+  "slave_mac_address": "AA:BB:CC:DD:EE:FF",
+  "source": "web",
+  "command_type": "manual",
+  "priority": 10,
+  "triggered_by": "timer_off"
+}
+```
+
+**Ciclo ON/OFF no slave** (`cycle`):
+
+```json
+{
+  "v": 1,
+  "id": 12349,
+  "cmd": "relay",
+  "device_id": "ESP32_HIDRO_269844",
+  "relay_index": 0,
+  "action": "on",
+  "duration_s": 10,
+  "mode": "cycle",
+  "cycle_off_s": 5,
+  "target_device_id": "AA:BB:CC:DD:EE:FF",
+  "slave_mac_address": "AA:BB:CC:DD:EE:FF",
+  "source": "web",
+  "command_type": "manual",
+  "priority": 10,
+  "triggered_by": "cycle"
+}
+```
+
+**Parar ciclo** (`cycle_stop`):
+
+```json
+{
+  "v": 1,
+  "id": 12350,
+  "cmd": "relay",
+  "device_id": "ESP32_HIDRO_269844",
+  "relay_index": 0,
+  "action": "off",
+  "duration_s": 0,
+  "mode": "cycle_stop",
+  "target_device_id": "AA:BB:CC:DD:EE:FF",
+  "slave_mac_address": "AA:BB:CC:DD:EE:FF",
+  "source": "web",
+  "command_type": "manual",
+  "priority": 10,
+  "triggered_by": "cycle_stop"
+}
+```
+
 | Campo | Obrigatório | Descrição |
 |-------|-------------|-----------|
 | `v` | sim | `1` — rejeitar outras versões |
@@ -167,6 +252,8 @@ Espelhar semântica de `relay_commands`. **Fonte de verdade TypeScript:** `HIDRO
 | `relay_index` | sim | Master 0–15, slave 0–7 |
 | `action` | sim | `on` / `off` (não defaultar) |
 | `duration_s` | sim | `0` se sem timer; peristáltica > 0 |
+| `mode` | não | `instant` (default) \| `timed_on` \| `timed_off` \| `cycle` \| `cycle_stop` |
+| `cycle_off_s` | ciclo | Segundos OFF no modo `cycle` (1–3600) |
 | `source` | sim | `web` \| `api` \| `rule` |
 | `command_type` | sim | `manual` \| `rule` \| `peristaltic` |
 | `priority` | sim | 0–100 (default: manual=10, rule=50, peristáltica=80) |

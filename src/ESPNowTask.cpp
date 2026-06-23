@@ -715,6 +715,11 @@ void ESPNowTask::processReceivedMessage(const TaskESPNowMessage& message) {
             Serial.println("🔍 Discovery recebido de: " + macToString(message.senderMac));
             break;
             
+        case TASK_MSG_STATUS_REQUEST:
+            // MessageType::BROADCAST (0x06) quando recebido como TaskESPNowMessage
+            Serial.println("📢 Broadcast/discovery recebido de: " + macToString(message.senderMac));
+            break;
+            
         case TASK_MSG_HEARTBEAT:
             // Heartbeat silencioso
             break;

@@ -41,6 +41,8 @@ struct RelayCommand {
     int relayNumber;           // 0-15
     String action;             // "on" ou "off"
     int durationSeconds;       // duração em segundos (opcional)
+    String commandMode;        // "instant" | "timed_on" | "timed_off" | "cycle" | "cycle_stop"
+    int cycleOffSeconds;       // OFF phase for cycle mode
     String status;             // "pending", "processing", "sent", "completed", "failed", "expired"
     unsigned long timestamp;
     // ✅ INTEGRAÇÃO ESP-NOW: Target device ("" ou "local" = relés locais, "SLAVE-NAME" = ESP-NOW slave)
@@ -124,7 +126,8 @@ private:
     String baseUrl;
     String apiKey;
     bool isConnected;
-    unsigned long lastCommandCheck;
+    unsigned long lastMasterCommandCheck;
+    unsigned long lastSlaveCommandCheck;
     unsigned long commandPollIntervalMs;
     bool commandPollQuiet;
     
@@ -168,6 +171,9 @@ public:
     // ✅ NOVO: Marcar comandos com suporte para Master/Slave
     bool markCommandSent(int commandId, bool isSlave = false);
     bool markCommandCompleted(int commandId, bool currentState = false, bool isSlave = false);
+    bool completeRelayCommand(int commandId, bool currentState,
+                              const String& slaveMac = "",
+                              const bool* relayStates = nullptr, uint8_t numRelays = 0);
     bool markCommandFailed(int commandId, const String& errorMessage, bool isSlave = false);
     
     // ✅ NOVO: Atualizar estados dos relés master (relay_master com arrays segregados)
@@ -179,6 +185,18 @@ public:
                           const String& slaveMacAddress, bool* relayStates, 
                           bool* hasTimers = nullptr, int* remainingTimes = nullptr, 
                           const String* relayNames = nullptr);
+
+    /** Garante registro em device_status antes de INSERT em relay_slaves (FK) */
+    bool ensureDeviceStatusEntry(const String& deviceId, const String& macAddress,
+                                 const String& userEmail, const String& deviceName,
+                                 const String& deviceType = "ESP32_SLAVE");
+
+    /** Heartbeat mínimo em device_status após sync relay_slaves OK */
+    bool patchSlaveDeviceStatusHeartbeat(const String& deviceId, const String& macAddress,
+                                         const String& userEmail);
+
+    /** true se outra operação HTTPS está em curso (mutex ocupado) */
+    bool isRequestInProgress();
     
     // ✅ LEGACY: Método antigo (mantido para compatibilidade)
     bool updateSlaveRelayState(const String& masterDeviceId, const String& slaveMacAddress, 
@@ -211,10 +229,14 @@ public:
     bool updateEcOperationState(const String& deviceId, const String& state,
                                 int operationRemainingSec, int nextCheckInSec,
                                 float dilutionTargetL = -1.0f,
-                                float dilutionProgressL = -1.0f);
+                                float dilutionProgressL = -1.0f,
+                                bool operationInterrupted = false);
 
     bool updatePhOperationState(const String& deviceId, const String& state,
-                                int operationRemainingSec, int nextCheckInSec);
+                                int operationRemainingSec, int nextCheckInSec,
+                                bool operationInterrupted = false);
+
+    bool patchBootInterrupted(const String& deviceId, bool interrupted);
 
     bool insertPhDosage(const String& deviceId, const String& sequenceId,
                         const String& direction, int relayNumber,

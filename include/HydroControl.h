@@ -269,6 +269,7 @@ public:
     void executeWebDosage(JsonArray distribution, int intervalo);
     bool isDosageActive() const { return (currentState != IDLE); }
     void cancelCurrentDosage();
+    bool abortAutoOperationsOnBoot();
     
     // ✅ Proporções Dinâmicas da Tabela Nutricional
     void updateNutrientProportions(JsonArray nutrients);  // Receber do frontend

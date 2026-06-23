@@ -244,12 +244,40 @@ public:
      * @return Ponteiro para TrustedSlave ou nullptr se não encontrado
      */
     TrustedSlave* getTrustedSlave(const uint8_t* macAddress);
+
+    /**
+     * @brief Registra contato radio com slave (atualiza lastSeen + ONLINE)
+     */
+    void touchSlaveLink(const uint8_t* mac, const char* reason);
+
+    /**
+     * @brief Slave alcançavel: ONLINE ou lastSeen recente
+     */
+    bool isSlaveReachable(const TrustedSlave& slave) const;
+
+    /**
+     * @brief Copia snapshot de relés sob mutex (seguro para MQTT publish)
+     */
+    bool readSlaveRelaySnapshot(const uint8_t* macAddress, bool states[8], bool timers[8],
+                                int remaining[8], uint8_t& numRelays, bool& linkOnline,
+                                uint16_t& linkLastSeenS);
+
+    /**
+     * @brief Log de falha consecutiva esp_now_send (chamado de onDataSent)
+     */
+    void notifyEspNowSendFail(const uint8_t* mac, uint8_t consecutiveFails);
     
     /**
      * @brief Obtém lista de todos os Slaves confiáveis
      * @return Vector com todos os Slaves
      */
     std::vector<TrustedSlave> getAllTrustedSlaves();
+
+    /**
+     * @brief Itera slaves confiáveis sob mutex — sem alocar vector (seguro em heap baixo)
+     * @return false se timeout no mutex
+     */
+    bool forEachTrustedSlave(const std::function<void(const TrustedSlave&)>& visitor);
     
     /**
      * @brief Obtém lista de Slaves online
@@ -294,7 +322,9 @@ public:
      * @param updateStatus Se true, atualiza status após comando (default: true). Use false para operações em lote (on_all, off_all)
      * @return commandId do ESP-NOW (0 se falhou). Use > 0 para sucesso (compatível com código antigo que espera bool)
      */
-    uint32_t sendRelayCommandToSlave(const uint8_t* macAddress, int relayNumber, const String& action, int duration = 0, int supabaseCommandId = 0, bool updateStatus = true);
+    uint32_t sendRelayCommandToSlave(const uint8_t* macAddress, int relayNumber, const String& action,
+                                     int duration = 0, int supabaseCommandId = 0, bool updateStatus = true,
+                                     int cycleOffDuration = 0, const String& commandMode = "");
     
     /**
      * @brief Solicita status de todos os relés de um Slave
@@ -321,6 +351,22 @@ public:
      * @param processing true se está processando resposta de status
      */
     void setProcessingStatusResponse(bool processing);
+
+    /** Drena sinal pendente antes de solicitar ALL_RELAYS_STATUS */
+    void drainAllRelaysStatusWait();
+
+    /** Aguarda ALL_RELAYS_STATUS (timeout ms) após requestSlaveStatus */
+    bool waitForAllRelaysStatus(uint32_t timeoutMs);
+
+    /** Sinaliza sync loop — chamado ao completar ALL_RELAYS_STATUS */
+    void notifyAllRelaysStatusReceived(const uint8_t* senderMac = nullptr,
+                                       const bool relayStates[8] = nullptr,
+                                       uint8_t numRelays = 0);
+
+    using AllRelaysSnapshotCallback = std::function<void(const uint8_t* mac, const bool states[8], uint8_t numRelays)>;
+    void setAllRelaysSnapshotCallback(AllRelaysSnapshotCallback callback) {
+        allRelaysSnapshotCallback = callback;
+    }
     
     // ===== ✅ PASSO 1: PROCESSAMENTO DE COMANDOS DO SUPABASE PARA SLAVES =====
     
@@ -433,6 +479,13 @@ public:
      * @param callback Función (supabaseCommandId, success, errorMessage)
      */
     void setSupabaseCommandCallback(std::function<void(int supabaseCommandId, bool success, const String& errorMessage)> callback);
+
+    /**
+     * @brief Fecha comando slave na nuvem (MQTT command_ack ou HTTPS) com contexto completo
+     */
+    void setSlaveCommandResolvedCallback(
+        std::function<void(int supabaseCommandId, uint32_t espNowCommandId, const uint8_t* mac,
+                           int relayNumber, bool currentState)> callback);
     
     /**
      * @brief Define callback para actualizar estados de relés de slaves en Supabase
@@ -448,6 +501,11 @@ public:
      * @param senderMac MAC do Slave que enviou o ACK
      */
     void processRelayCommandAck(const RelayCommandAck& ack, const uint8_t* senderMac);
+
+    void addToRetryQueue(const uint8_t* targetMac, int relayNumber, const String& action, int duration,
+                         uint32_t commandId, int supabaseCommandId = 0, bool waitingForAck = false,
+                         int cycleOffDuration = 0, const String& commandMode = "");
+    void removeFromRetryQueue(uint32_t commandId, bool currentState = false, bool notifySupabase = true);
     
     /**
      * @brief Obtém instância estática do MasterSlaveManager (PÚBLICO para ESPNowController)
@@ -509,6 +567,9 @@ private:
      * @return true se carregado com sucesso
      */
     bool loadSlaveRelayStatesFromNVS();
+
+    bool saveTrustedPeersToNVS();
+    bool loadTrustedPeersFromNVS();
     
     /**
      * @brief Valida estados cacheados comparando com estados reais
@@ -533,9 +594,12 @@ private:
     struct PendingRelayCommand {
         uint8_t targetMac[6];        // MAC do Slave destino
         int relayNumber;             // Número do relé (0-7)
-        String action;               // Ação: "on", "off", "toggle"
+        String action;               // Ação: "on", "off", "toggle", "timed_on", "cycle", ...
         int duration;                // Duração em segundos
-        unsigned long timestamp;     // Quando foi criado o comando
+        int cycleOffDuration;        // OFF phase for cycle mode
+        String commandMode;          // instant, timed_on, cycle, ...
+        unsigned long enqueuedAt;        // Quando foi criado o comando
+        unsigned long ackWaitStartedAt;  // Quando entrou em waitingForAck
         unsigned long nextRetry;     // Quando fazer próximo retry
         uint8_t retryCount;          // Quantas vezes já tentou
         uint32_t commandId;          // ID único do comando
@@ -544,14 +608,28 @@ private:
     };
     std::vector<PendingRelayCommand> pendingRelayCommands;
     
-    // Configurações de retry
-    static constexpr uint8_t MAX_RELAY_RETRIES = 3;      // Máximo de tentativas
-    static constexpr unsigned long RETRY_INTERVAL = 2000; // Intervalo base entre retries (ms)
+    // Configurações de retry e link slave
+    static constexpr uint8_t MAX_RELAY_RETRIES = 3;
+    static constexpr unsigned long RETRY_INTERVAL = 2000;
+    static constexpr unsigned long SLAVE_REACHABLE_MS = 45000;
+    static constexpr unsigned long SLAVE_OFFLINE_TIMEOUT_MS = 60000;
+    static constexpr unsigned long SLAVE_QUEUE_OFFLINE_TIMEOUT_MS = 60000;
+    static constexpr unsigned long ACK_WAIT_TIMEOUT_MS = 30000;
+    static constexpr unsigned long MIN_ESPNOW_SEND_GAP_MS = 500;
+
+    uint8_t lastEspNowSendMac_[6];
+    unsigned long lastEspNowSendAt_;
+
+    void logSlaveLink(const char* event, const uint8_t* mac, long lastSeenDeltaMs = -1);
+    bool hasInFlightForMac(const uint8_t* mac) const;
+    bool canEspNowSendToMac(const uint8_t* mac) const;
+    void markEspNowSendToMac(const uint8_t* mac);
     
     uint32_t commandIdCounter;  // Contador para IDs únicos de comandos
     
     // ✅ Proteção contra loop infinito de callbacks
     bool processingStatusResponse;  // Flag para evitar solicitar status quando já está processando resposta
+    SemaphoreHandle_t allRelaysStatusSem;  // Sinaliza ALL_RELAYS_STATUS recebido (sync loop)
     
     // Estatísticas gerais
     uint32_t totalPingsReceived;
@@ -572,7 +650,10 @@ private:
     std::function<void(const uint8_t* macAddress, const String& error)> errorCallback = nullptr;
     std::function<void(const uint8_t* macAddress, uint32_t commandId, bool success, uint8_t relayNumber, uint8_t currentState)> relayAckCallback = nullptr;  // 🔄 FASE 2
     std::function<void(int supabaseCommandId, bool success, const String& errorMessage)> supabaseCommandCallback = nullptr;  // Callback para Supabase
+    std::function<void(int supabaseCommandId, uint32_t espNowCommandId, const uint8_t* mac,
+                       int relayNumber, bool currentState)> slaveCommandResolvedCallback = nullptr;
     std::function<void(const String& masterDeviceId, const String& slaveMacAddress, const String& slaveDeviceId, int relayNumber, bool state, bool hasTimer, int remainingTime)> supabaseRelayStateCallback = nullptr;  // ✅ Callback para actualizar estados de relés en Supabase
+    AllRelaysSnapshotCallback allRelaysSnapshotCallback = nullptr;
     
     // ===== MÉTODOS PRIVADOS =====
     
@@ -641,41 +722,11 @@ private:
      * @brief Reenvia ACKs pendentes se necessário
      */
     void resendPendingAcks();
-    
-    // ===== 🔄 FASE 1: MÉTODOS DE RETRY =====
-    
-    /**
-     * @brief Processa fila de comandos pendentes de retry
-     * Chamado automaticamente no update()
-     */
+
     void processRetryQueue();
     
-    /**
-     * @brief Adiciona comando à fila de retry
-     * @param targetMac MAC do Slave destino
-     * @param relayNumber Número do relé
-     * @param action Ação a executar
-     * @param duration Duração em segundos
-     * @param commandId ID único do comando
-     */
-    void addToRetryQueue(const uint8_t* targetMac, int relayNumber, const String& action, int duration, uint32_t commandId, int supabaseCommandId = 0);
-    
-    /**
-     * @brief Remove comando da fila de retry quando confirmado
-     * @param commandId ID do comando a remover
-     */
-    void removeFromRetryQueue(uint32_t commandId, bool currentState = false);
-    
-    /**
-     * @brief Envia todos os comandos pendentes para um slave quando ele volta online
-     * @param macAddress MAC do slave que voltou online
-     */
     void sendPendingCommandsToSlave(const uint8_t* macAddress);
     
-    /**
-     * @brief Gera ID único para comandos
-     * @return ID único
-     */
     uint32_t generateCommandId();
     
     /**

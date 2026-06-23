@@ -6,8 +6,10 @@ ESPNowBridge* ESPNowBridge::instance = nullptr;
 
 ESPNowBridge::ESPNowBridge(RelayCommandBox* relayController, int channel) 
     : localRelayController(relayController), wifiChannel(channel), initialized(false), 
-      messageCounter(0), messagesSent(0), messagesReceived(0), messagesLost(0) {
+      messageCounter(0), messagesSent(0), messagesReceived(0), messagesLost(0),
+      hasLastMasterMac(false) {
     instance = this;
+    memset(lastMasterMac, 0, sizeof(lastMasterMac));
     
     // FASE 2: Criar instância do ESPNowController
     espNowController = new ESPNowController("ESP-HIDROWAVE", channel);
@@ -23,9 +25,18 @@ bool ESPNowBridge::begin() {
     }
     
     // Configurar callbacks do ESPNowController usando function pointers estáticos
-    espNowController->setRelayCommandCallback([](const uint8_t* senderMac, int relayNumber, const String& action, int duration) {
+    espNowController->setRelayCommandCallback([](const uint8_t* senderMac, uint32_t commandId, int relayNumber,
+                                                 const String& action, int duration, const String& mode,
+                                                 int cycleOffDuration) {
         if (ESPNowBridge::instance) {
-            ESPNowBridge::instance->onRelayCommandReceived(senderMac, relayNumber, action, duration);
+            ESPNowBridge::instance->onRelayCommandReceived(senderMac, commandId, relayNumber, action, duration,
+                                                           mode, cycleOffDuration);
+        }
+    });
+
+    espNowController->setPersistentStateCallback([](const uint8_t* senderMac, const PersistentRelayStateData& states) {
+        if (ESPNowBridge::instance) {
+            ESPNowBridge::instance->onPersistentStateReceived(senderMac, states);
         }
     });
     
@@ -58,6 +69,10 @@ bool ESPNowBridge::begin() {
             ESPNowBridge::instance->onErrorReceived(error);
         }
     });
+
+    if (localRelayController) {
+        localRelayController->setStateChangeCallback(onStateChangedStatic);
+    }
     
     // Manter callbacks de compatibilidade
     esp_now_register_recv_cb(onDataReceived);
@@ -282,15 +297,82 @@ void ESPNowBridge::setErrorCallback(void (*callback)(const String& error)) {
 
 // ===== CALLBACKS DO ESPNOWCONTROLLER =====
 
-void ESPNowBridge::onRelayCommandReceived(const uint8_t* senderMac, int relayNumber, const String& action, int duration) {
+void ESPNowBridge::onRelayCommandReceived(const uint8_t* senderMac, uint32_t commandId, int relayNumber,
+                                          const String& action, int duration, const String& mode,
+                                          int cycleOffDuration) {
     if (!instance) return;
     Serial.println("📥 Comando recebido de " + macToString(senderMac) + 
-                  ": Relé " + String(relayNumber) + " -> " + action);
+                  ": Relé " + String(relayNumber) + " -> " + action +
+                  (mode.length() > 0 ? " mode=" + mode : ""));
+
+    memcpy(instance->lastMasterMac, senderMac, 6);
+    instance->hasLastMasterMac = true;
+
+    if (action == "status") {
+        instance->publishAllRelaysStatus(senderMac);
+        instance->sendCommandFeedback(senderMac, commandId, relayNumber, true);
+        return;
+    }
     
     // Processar comando no RelayController local
+    bool success = false;
     if (instance->localRelayController) {
-        instance->localRelayController->processCommand(relayNumber, action, duration);
+        success = instance->localRelayController->processCommand(relayNumber, action, duration, mode,
+                                                                 cycleOffDuration);
     }
+
+    instance->sendCommandFeedback(senderMac, commandId, relayNumber, success);
+    if (success) {
+        instance->publishAllRelaysStatus(senderMac);
+    }
+}
+
+void ESPNowBridge::onPersistentStateReceived(const uint8_t* senderMac, const PersistentRelayStateData& states) {
+    if (!instance || !instance->localRelayController) return;
+    Serial.println("💾 Aplicando PERSISTENT_STATE_SYNC de " + macToString(senderMac));
+    if (instance->localRelayController->applyAndSavePersistentStates(states)) {
+        instance->publishAllRelaysStatus(senderMac);
+    }
+}
+
+void ESPNowBridge::sendCommandFeedback(const uint8_t* masterMac, uint32_t commandId, int relayNumber, bool success) {
+    if (!espNowController || !masterMac) return;
+
+    RelayCommandAck ack = {};
+    ack.commandId = commandId > 0 ? commandId : messageCounter;
+    ack.relayNumber = static_cast<uint8_t>(relayNumber);
+    ack.success = success ? 1 : 0;
+    if (localRelayController && relayNumber >= 0 && relayNumber < 8) {
+        ack.currentState = localRelayController->getRelayState(relayNumber) ? 1 : 0;
+    }
+    ack.timestamp = millis();
+
+    bool ackSent = false;
+    for (int attempt = 0; attempt < 3 && !ackSent; attempt++) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        ackSent = espNowController->sendRelayCommandAck(masterMac, ack);
+    }
+    if (!ackSent) {
+        Serial.println("⚠️ [SLAVE] ACK não enviado após 3 tentativas — master usará ALL_RELAYS fallback");
+    }
+}
+
+void ESPNowBridge::publishAllRelaysStatus(const uint8_t* masterMac) {
+    if (!espNowController || !localRelayController || !masterMac) return;
+
+    SingleRelayState states[8];
+    localRelayController->fillAllRelaysStatus(states);
+    espNowController->sendAllRelaysStatus(masterMac, states, 8);
+}
+
+void ESPNowBridge::onStateChangedStatic(int relayNumber, bool state, int remainingTime) {
+    (void)relayNumber;
+    (void)state;
+    (void)remainingTime;
+    if (!instance || !instance->hasLastMasterMac) return;
+    instance->publishAllRelaysStatus(instance->lastMasterMac);
 }
 
 void ESPNowBridge::onRelayStatusReceived(const uint8_t* senderMac, int relayNumber, bool state, bool hasTimer, int remainingTime, const String& name) {
@@ -587,7 +669,18 @@ void ESPNowBridge::processReceivedMessage(const ESPNowMessage& message, const ui
             break;
         }
         
+        case MessageType::BROADCAST: {
+            Serial.println("📢 Broadcast recebido de: " + macToString(senderMac));
+            #ifndef MASTER_MODE
+            if (espNowController) {
+                espNowController->sendDeviceInfo(senderMac, "RelayCommandBox", 8, true, millis(), ESP.getFreeHeap());
+            }
+            #endif
+            break;
+        }
+        
         default:
+            Serial.println("❓ Tipo de mensagem ESP-NOW desconhecido: " + String((int)message.type));
             break;
     }
 }
@@ -622,18 +715,13 @@ bool ESPNowBridge::validateMessage(const ESPNowMessage& message) {
         return false;
     }
     
-    // Verificar se não é uma mensagem muito antiga (30 segundos - mais flexível)
-    unsigned long currentTime = millis();
-    if (currentTime > message.timestamp && (currentTime - message.timestamp) > 30000) {
-        Serial.println("❌ Mensagem muito antiga");
-        Serial.println("   Timestamp: " + String(message.timestamp));
-        Serial.println("   Atual: " + String(currentTime));
-        Serial.println("   Diferença: " + String(currentTime - message.timestamp) + "ms");
+    // Anti-replay local — não validar millis() cross-device (ESPNowController trata)
+    if (message.dataSize > sizeof(message.data)) {
+        Serial.println("❌ Tamanho de dados inválido: " + String(message.dataSize));
         return false;
     }
     
-    // Verificar tipo de mensagem válido
-    if (message.type > MessageType::WIFI_CREDENTIALS) {
+    if (message.type > MessageType::PERSISTENT_STATE_SYNC) {
         Serial.println("❌ Tipo de mensagem inválido: " + String((int)message.type));
         return false;
     }

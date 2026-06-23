@@ -272,11 +272,11 @@ private:
     
     // ===== MÉTODOS INTERNOS =====
     bool parseRuleFromJSON(const JsonObject& json_rule, DecisionRule& rule);
-    JsonObject ruleToJSON(const DecisionRule& rule, JsonDocument& doc);
+    void ruleToJSON(const DecisionRule& rule, JsonObject& out, JsonDocument& doc);
     bool parseConditionFromJSON(const JsonObject& json_cond, RuleCondition& condition);
-    JsonObject conditionToJSON(const RuleCondition& condition, JsonDocument& doc);
+    void conditionToJSON(const RuleCondition& condition, JsonObject& out, JsonDocument& doc);
     bool parseActionFromJSON(const JsonObject& json_action, RuleAction& action);
-    JsonObject actionToJSON(const RuleAction& action, JsonDocument& doc);
+    void actionToJSON(const RuleAction& action, JsonObject& out, JsonDocument& doc);
     
     float getSensorValue(const String& sensor_name, const SystemState& state);
     bool compareValues(float sensor_value, CompareOperator op, float target_min, float target_max);

@@ -89,7 +89,8 @@ public:
      * @param duration Duração em segundos (0 = sem timer)
      * @return true se comando foi processado com sucesso
      */
-    bool processCommand(int relayNumber, String action, int duration = 0);
+    bool processCommand(int relayNumber, String action, int duration = 0,
+                        const String& mode = "", int cycleOffSeconds = 0);
     
     /**
      * @brief Desliga todos os relés
@@ -118,9 +119,17 @@ public:
     bool applyPersistentStates(const PersistentRelayStateData& states);
     
     /**
+     * @brief Preenche array ALL_RELAYS_STATUS a partir do estado atual
+     */
+    void fillAllRelaysStatus(SingleRelayState out[8]) const;
+
+    /**
+     * @brief Aplica estados persistentes recebidos via ESP-NOW e grava NVS
+     */
+    bool applyAndSavePersistentStates(const PersistentRelayStateData& states);
+
+    /**
      * @brief Obtém estados persistentes atuais
-     * @param states Estrutura para preencher com estados atuais
-     * @return true se obtido com sucesso
      */
     bool getPersistentStates(PersistentRelayStateData& states);
     
@@ -144,7 +153,7 @@ public:
      * @param relayNumber Número do relé (0-7)
      * @return Segundos restantes (0 se não tem timer)
      */
-    int getRemainingTime(int relayNumber);
+    int getRemainingTime(int relayNumber) const;
     
     /**
      * @brief Obtém o nome de um relé
@@ -209,6 +218,19 @@ private:
     bool pcfInitialized;                      // Status de inicialização
     
     RelayState relayStates[8];       // Estados dos relés (8 relés)
+
+    struct RelayCycleState {
+        bool active;
+        uint16_t onSeconds;
+        uint16_t offSeconds;
+        unsigned long phaseStartMs;
+        bool phaseOn;
+    };
+    RelayCycleState cycleStates[8];
+
+    bool startCycle(int relayNumber, int onSeconds, int offSeconds);
+    bool stopCycle(int relayNumber);
+    void checkCycles();
     
     // Callbacks
     void (*stateChangeCallback)(int relayNumber, bool state, int remainingTime) = nullptr;
@@ -234,7 +256,7 @@ private:
      * @param relayNumber Número do relé a validar
      * @return true se número é válido (0-7)
      */
-    bool isValidRelayNumber(int relayNumber);
+    bool isValidRelayNumber(int relayNumber) const;
     
     /**
      * @brief Inicializa nomes padrão dos relés

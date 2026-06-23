@@ -333,11 +333,10 @@ void setupCallbacks() {
             }
         });
         
-        // Callback para PING recebido do SLAVE
+        // Callback para PING recebido do SLAVE (log em MasterSlaveManager::processPingReceived)
         masterManager->setPingReceivedCallback([](const uint8_t* macAddress, uint32_t pingId) {
-            Serial.println("🏓 Ping recebido de: " + ESPNowController::macToString(macAddress));
-            
-            // ✅ Atualizar lastSeen ao receber PING
+            (void)pingId;
+            // Atualizar knownSlaves local
             for (auto& slave : knownSlaves) {
                 if (memcmp(slave.macAddress, macAddress, 6) == 0) {
                     slave.lastSeen = millis();
@@ -390,19 +389,7 @@ void setupCallbacks() {
     //
     // REMOVIDO: Callback vazio que estava impedindo a atualização dos estados
     
-    // Callback para ping/pong
-    master.setPingCallback([](const uint8_t* senderMac) {
-        Serial.println("🏓 Pong recebido de: " + ESPNowController::macToString(senderMac));
-        
-        // ✅ CORREÇÃO CRÍTICA: Atualizar lastSeen e marcar slave como online
-        for (auto& slave : knownSlaves) {
-            if (memcmp(slave.macAddress, senderMac, 6) == 0) {
-                slave.lastSeen = millis();
-                slave.online = true;
-                break;
-            }
-        }
-    });
+    // Callback PING: MasterSlaveManager::begin() já registrou onPingReceivedStatic — não sobrescrever aqui
     
     // 🔄 FASE 2: Callback para ACK de comandos de relay
     if (masterManager) {
@@ -770,49 +757,36 @@ void monitorSlaves() {
     
     static unsigned long lastPing = 0;
     
-    // ===== CORREÇÃO CRÍTICA: Usar trustedSlaves como fonte de verdade (igual a MASTER-TASK) =====
-    // ✅ MASTER-TASK usa apenas uma lista (trustedSlaves) - não precisa de sincronização
-    // ✅ Nossos comandos (on_all, off_all) já usam trustedSlaves
-    // ✅ monitorSlaves() deve usar a mesma fonte para consistência
-    const unsigned long PING_INTERVAL = 15000;  // 15 segundos
-    const unsigned long CHECK_INTERVAL = 30000;  // 30 segundos
-    
-    // ✅ Usar trustedSlaves (fonte de verdade) - igual a MASTER-TASK
-    auto trustedSlaves = masterManager->getAllTrustedSlaves();
+    const unsigned long PING_INTERVAL = 30000;
+    const unsigned long CHECK_INTERVAL = 30000;
     
     if (millis() - lastPing > PING_INTERVAL) {
-        for (const auto& slave : trustedSlaves) {
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
             if (slave.isOnline()) {
                 masterManager->sendPingToSlave(slave.macAddress);
             }
-        }
+        });
         lastPing = millis();
     }
     
-    // ✅ MasterSlaveManager já verifica offline automaticamente em update()
-    // Não precisamos verificar manualmente aqui - o MasterSlaveManager faz isso
-    // Apenas sincronizar knownSlaves com trustedSlaves para comandos que ainda usam knownSlaves
     static unsigned long lastSync = 0;
     if (millis() - lastSync > CHECK_INTERVAL) {
-        // Sincronizar knownSlaves com trustedSlaves (para compatibilidade)
-        for (const auto& trusted : trustedSlaves) {
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
             bool found = false;
             for (auto& known : knownSlaves) {
-                if (memcmp(known.macAddress, trusted.macAddress, 6) == 0) {
+                if (memcmp(known.macAddress, slave.macAddress, 6) == 0) {
                     found = true;
-                    // Atualizar knownSlaves baseado em trustedSlaves (fonte de verdade)
-                    known.online = trusted.isOnline();
-                    known.lastSeen = trusted.lastSeen;
-                    known.deviceName = trusted.deviceName;
-                    known.deviceType = trusted.deviceType;
+                    known.online = slave.isOnline();
+                    known.lastSeen = slave.lastSeen;
+                    known.deviceName = slave.deviceName;
+                    known.deviceType = slave.deviceType;
                     break;
                 }
             }
-            if (!found && trusted.isOnline()) {
-                // Adicionar slave que está em trustedSlaves mas não em knownSlaves
-                addSlaveToList(trusted.macAddress, trusted.deviceName, trusted.deviceType, trusted.numRelays);
+            if (!found && slave.isOnline()) {
+                addSlaveToList(slave.macAddress, slave.deviceName, slave.deviceType, slave.numRelays);
             }
-        }
+        });
         lastSync = millis();
     }
 }
@@ -2800,7 +2774,7 @@ void espNowTask(void* parameter) {
     // Variáveis para timing
     unsigned long lastDiscovery = 0;
     unsigned long lastStatsUpdate = 0;
-    const unsigned long DISCOVERY_INTERVAL = 30000;      // 30 segundos
+    const unsigned long DISCOVERY_INTERVAL = 120000;     // 120 segundos
     const unsigned long STATS_UPDATE_INTERVAL = 120000;  // 2 minutos
     
     while (true) {
@@ -2816,12 +2790,15 @@ void espNowTask(void* parameter) {
         // Monitorar slaves periodicamente
         monitorSlaves();
         
-        // ✅ Discovery automático (a cada 30s)
+        // ✅ Discovery automático (a cada 30s) — único owner; skip se todos online
         unsigned long now = millis();
         if (now - lastDiscovery > DISCOVERY_INTERVAL) {
             if (masterManager) {
-                Serial.println("\n🔍 [TASK] Discovery automático iniciado...");
-                masterManager->rediscoverSlaves();
+                const int trusted = masterManager->getTrustedSlaveCount();
+                const int online = masterManager->getOnlineSlaveCount();
+                if (trusted == 0 || online < trusted) {
+                    masterManager->rediscoverSlaves();
+                }
             }
             lastDiscovery = now;
         }

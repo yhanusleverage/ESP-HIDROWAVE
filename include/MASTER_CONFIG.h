@@ -147,11 +147,33 @@ static const AutoCommand DEFAULT_AUTO_COMMANDS[] = {
 #define DEBUG_LEVEL_DEBUG 3
 
 // Configurações de debug por componente
-#define DEBUG_ESPNOW true
+#define DEBUG_ESPNOW false
 #define DEBUG_RELAYS true
-#define DEBUG_DISCOVERY true
+#define DEBUG_DISCOVERY false
 #define DEBUG_COMMANDS true
 #define DEBUG_NETWORK true
+
+// ===== MACROS ESP-NOW (gated por DEBUG_ESPNOW) =====
+
+#if DEBUG_ESPNOW && MASTER_DEBUG_LEVEL >= DEBUG_LEVEL_DEBUG
+    #define LOG_ESPNOW_DEBUG(x) DEBUG_DEBUG(x)
+#else
+    #define LOG_ESPNOW_DEBUG(x)
+#endif
+
+#if DEBUG_ESPNOW && MASTER_DEBUG_LEVEL >= DEBUG_LEVEL_INFO
+    #define LOG_ESPNOW_INFO(x) DEBUG_INFO(x)
+#else
+    #define LOG_ESPNOW_INFO(x)
+#endif
+
+#if DEBUG_ESPNOW && MASTER_DEBUG_LEVEL >= DEBUG_LEVEL_WARNING
+    #define LOG_ESPNOW_WARN(x) DEBUG_WARNING(x)
+#else
+    #define LOG_ESPNOW_WARN(x)
+#endif
+
+#define LOG_ESPNOW_ERROR(x) DEBUG_ERROR(x)
 
 // ===== MACROS DE DEBUG =====
 

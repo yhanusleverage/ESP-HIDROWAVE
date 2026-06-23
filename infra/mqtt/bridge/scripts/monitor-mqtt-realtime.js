@@ -10,7 +10,7 @@
  *
  * Env:
  *   MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS  (igual ao bridge)
- *   MONITOR_DEVICE_ID=ESP32_HIDRO_269844         (opcional — filtra device)
+ *   MONITOR_DEVICE_ID=ESP32_HIDRO_1A575C         (opcional — filtra device)
  *   MONITOR_TOPICS=ph,telemetry                   (opcional — só suffixes)
  */
 import 'dotenv/config';

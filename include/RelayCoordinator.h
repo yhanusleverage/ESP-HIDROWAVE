@@ -62,7 +62,9 @@ public:
         const RelayTarget& target,
         RelayActuationAction action,
         uint32_t durationSec = 0,
-        int supabaseCommandId = 0);
+        int supabaseCommandId = 0,
+        int cycleOffSec = 0,
+        const String& commandMode = "");
 
     bool releaseActuation(RelayOwner owner, const RelayTarget& target, bool tryOff = true);
 
@@ -76,7 +78,9 @@ public:
         int relay,
         const String& action,
         int durationSec,
-        int supabaseCommandId = 0);
+        int supabaseCommandId = 0,
+        int cycleOffSec = 0,
+        const String& commandMode = "");
 
 private:
     HydroControl* hydroControl;
@@ -96,7 +100,9 @@ private:
         int relay,
         const String& action,
         int durationSec,
-        int supabaseCommandId);
+        int supabaseCommandId,
+        int cycleOffSec = 0,
+        const String& commandMode = "");
     static bool macEquals(const uint8_t* a, const uint8_t* b);
     static bool parseMacString(const String& macStr, uint8_t* macOut);
 };

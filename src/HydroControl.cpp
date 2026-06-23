@@ -1,5 +1,6 @@
 #include "HydroControl.h"
 #include "PreferencesManager.h"  // ✅ Para persistência em NVS
+#include "StatePersistenceManager.h"
 #include "SensorSanitize.h"
 #include <Preferences.h>
 #include <cmath>
@@ -1299,6 +1300,32 @@ void HydroControl::cancelCurrentDosage() {
     }
 }
 
+bool HydroControl::abortAutoOperationsOnBoot() {
+    EcPhBootSnapshot snapshot = {};
+    bool hadSnapshot = StatePersistenceManager::loadEcPhBootSnapshot(snapshot);
+    bool wasActive = hadSnapshot &&
+        ((snapshot.lastEcState[0] != '\0' && strcmp(snapshot.lastEcState, "idle") != 0) ||
+         (snapshot.lastPhState[0] != '\0' && strcmp(snapshot.lastPhState, "idle") != 0));
+
+    cancelCurrentDosage();
+
+    if (phAutoState != PH_IDLE) {
+        if (phActiveRelay >= 0 && phActiveRelay < 8) {
+            setRelay(phActiveRelay, false);
+        }
+        phAutoState = PH_IDLE;
+        phActiveRelay = -1;
+        notifyPhOperationChanged();
+        wasActive = true;
+    }
+
+    StatePersistenceManager::saveEcPhBootSnapshot("idle", "idle", wasActive);
+    if (wasActive) {
+        Serial.println("⚠️ BOOT: ciclo Auto EC/pH interrompido — fail-safe idle");
+    }
+    return wasActive;
+}
+
 // ✅ Atualizar proporções dinâmicas da tabela nutricional (recebido do frontend)
 void HydroControl::updateNutrientProportions(JsonArray nutrients) {
     activeNutrientsCount = 0;
@@ -1731,6 +1758,8 @@ void HydroControl::emitPhControllerMetric(bool adjustmentNeeded, bool adjustment
 }
 
 void HydroControl::notifyEcOperationChanged() {
+    StatePersistenceManager::saveEcPhBootSnapshot(
+        getEcOperationStateName(), getPhOperationStateName(), false);
     if (ecOperationSyncCallback) {
         ecOperationSyncCallback(ecOperationSyncCallbackUserData);
     }
@@ -1966,6 +1995,8 @@ void HydroControl::setPhOperationSyncCallback(PhOperationSyncCallback cb, void* 
 }
 
 void HydroControl::notifyPhOperationChanged() {
+    StatePersistenceManager::saveEcPhBootSnapshot(
+        getEcOperationStateName(), getPhOperationStateName(), false);
     if (phOperationSyncCallback) {
         phOperationSyncCallback(phOperationSyncCallbackUserData);
     }

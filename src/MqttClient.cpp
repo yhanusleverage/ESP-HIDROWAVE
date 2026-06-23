@@ -70,6 +70,8 @@ bool MqttClientWrapper::begin(const String& id) {
     ecMetricTopic = String("hidrowave/") + deviceId + "/ec_metric";
     phMetricTopic = String("hidrowave/") + deviceId + "/ph_metric";
     ecDilutionTopic = String("hidrowave/") + deviceId + "/ec_dilution";
+    commandAckTopic = String("hidrowave/") + deviceId + "/command_ack";
+    relayStateTopic = String("hidrowave/") + deviceId + "/relay/state";
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     callbackInstance = this;
     mqtt.setCallback(mqttMessageCallback);
@@ -527,6 +529,115 @@ bool MqttClientWrapper::publishPhMetric(const MqttPhMetricReading& reading) {
                       reading.errorH, reading.doseRealMl, reading.adjustmentApplied ? 1 : 0);
     } else {
         Serial.println("[MQTT] ph_metric publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishCommandAck(const MqttCommandAckReading& reading) {
+    if (!ensureConnected() || reading.commandId <= 0) {
+        return false;
+    }
+
+    StaticJsonDocument<512> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ts"] = (uint32_t)(millis() / 1000UL);
+    doc["id"] = reading.commandId;
+    doc["status"] = reading.status ? reading.status : "completed";
+    doc["relay_index"] = reading.relayIndex;
+    if (reading.action && reading.action[0]) {
+        doc["action"] = reading.action;
+    }
+    doc["current_state"] = reading.currentState;
+    if (reading.espnowId > 0) {
+        doc["espnow_id"] = reading.espnowId;
+    }
+    if (reading.slaveMac && reading.slaveMac[0]) {
+        doc["slave_mac_address"] = reading.slaveMac;
+        if (reading.relayStates && reading.numRelayStates > 0) {
+            JsonArray arr = doc.createNestedArray("relay_states");
+            uint8_t n = reading.numRelayStates > 8 ? 8 : reading.numRelayStates;
+            for (uint8_t i = 0; i < n; i++) {
+                arr.add(reading.relayStates[i]);
+            }
+        }
+    }
+
+    char payload[512];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0 || len >= sizeof(payload)) {
+        return false;
+    }
+
+    bool published = mqtt.publish(commandAckTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] command_ack id=%d relay=%d state=%d\n",
+                      reading.commandId, reading.relayIndex, reading.currentState ? 1 : 0);
+    } else {
+        Serial.println("[MQTT] command_ack publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishRelayState(const MqttRelayStateReading& reading) {
+    if (!ensureConnected()) {
+        return false;
+    }
+
+    StaticJsonDocument<512> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ts"] = (uint32_t)(millis() / 1000UL);
+
+    if (reading.masterStates && reading.masterCount > 0) {
+        JsonArray master = doc.createNestedArray("master");
+        uint8_t n = reading.masterCount > 16 ? 16 : reading.masterCount;
+        for (uint8_t i = 0; i < n; i++) {
+            master.add(reading.masterStates[i] ? 1 : 0);
+        }
+    }
+
+    if (reading.slaveMac && reading.slaveMac[0]) {
+        doc["slave_mac_address"] = reading.slaveMac;
+        if (!reading.omitRelayStates && reading.slaveStates && reading.slaveCount > 0) {
+            JsonArray states = doc.createNestedArray("relay_states");
+            uint8_t n = reading.slaveCount > 8 ? 8 : reading.slaveCount;
+            for (uint8_t i = 0; i < n; i++) {
+                states.add(reading.slaveStates[i]);
+            }
+            if (reading.slaveHasTimers) {
+                JsonArray timers = doc.createNestedArray("relay_has_timers");
+                for (uint8_t i = 0; i < n; i++) {
+                    timers.add(reading.slaveHasTimers[i]);
+                }
+            }
+            if (reading.slaveRemainingTimes) {
+                JsonArray rem = doc.createNestedArray("relay_remaining_times");
+                for (uint8_t i = 0; i < n; i++) {
+                    rem.add(reading.slaveRemainingTimes[i]);
+                }
+            }
+        }
+        if (reading.hasLinkMeta) {
+            doc["link_online"] = reading.linkOnline;
+            doc["link_last_seen_s"] = reading.linkLastSeenS;
+        }
+        if (reading.heartbeat) {
+            doc["heartbeat"] = true;
+        }
+    }
+
+    char payload[512];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0 || len >= sizeof(payload)) {
+        return false;
+    }
+
+    bool published = mqtt.publish(relayStateTopic.c_str(), payload, false);
+    if (published) {
+        Serial.println("[MQTT] relay/state published");
+    } else {
+        Serial.println("[MQTT] relay/state publish failed");
     }
     return published;
 }

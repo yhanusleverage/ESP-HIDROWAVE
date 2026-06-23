@@ -13,7 +13,8 @@
 SupabaseClient::SupabaseClient() : 
     secureClient(nullptr),
     isConnected(false),
-    lastCommandCheck(0),
+    lastMasterCommandCheck(0),
+    lastSlaveCommandCheck(0),
     commandPollIntervalMs(COMMAND_POLL_INTERVAL_MS),
     commandPollQuiet(true),
     requestMutex(nullptr),        // ✅ NOVO: Mutex inicializado como nullptr
@@ -665,13 +666,13 @@ bool SupabaseClient::checkForCommands(RelayCommand* commands, int maxCommands, i
     
     // Verificar apenas a cada COMMAND_POLL_INTERVAL_MS
     unsigned long now = millis();
-    if (now - lastCommandCheck < commandPollIntervalMs) {
+    if (now - lastMasterCommandCheck < commandPollIntervalMs) {
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);  // ✅ Liberar mutex
         }
         return false;
     }
-    lastCommandCheck = now;  // ✅ Protegido pelo mutex
+    lastMasterCommandCheck = now;  // ✅ Protegido pelo mutex
     
     // ✅ BUSCAR COMANDOS PENDENTES com priorização correta
     // Ordenar por: command_type (peristaltic > rule > manual), priority DESC, created_at ASC
@@ -1026,15 +1027,15 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
         }
     }
     
-    // Verificar apenas a cada COMMAND_POLL_INTERVAL_MS
+    // Verificar apenas a cada COMMAND_POLL_INTERVAL_MS (master — independente do slave)
     unsigned long now = millis();
-    if (now - lastCommandCheck < commandPollIntervalMs) {
+    if (now - lastMasterCommandCheck < commandPollIntervalMs) {
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);
         }
         return false;
     }
-    lastCommandCheck = now;
+    lastMasterCommandCheck = now;
     
     // ✅ NOVO: Usar RPC atômica get_and_lock_master_commands
     // ✅ CORREÇÃO: Usar POST com payload JSON (GET é read-only, RPC precisa fazer UPDATE)
@@ -1044,7 +1045,7 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
     DynamicJsonDocument payloadDoc(256);
     payloadDoc["p_device_id"] = getDeviceID();
     payloadDoc["p_limit"] = maxCommands;
-    payloadDoc["p_timeout_seconds"] = 30;
+    payloadDoc["p_timeout_seconds"] = 90;
     
     String payload;
     serializeJson(payloadDoc, payload);
@@ -1485,15 +1486,15 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
         }
     }
     
-    // Verificar apenas a cada COMMAND_POLL_INTERVAL_MS
+    // Throttle slave independente — permite poll no mesmo ciclo que master
     unsigned long now = millis();
-    if (now - lastCommandCheck < commandPollIntervalMs) {
+    if (now - lastSlaveCommandCheck < commandPollIntervalMs) {
         if (commandCheckMutex != nullptr) {
             xSemaphoreGive(commandCheckMutex);
         }
         return false;
     }
-    lastCommandCheck = now;
+    lastSlaveCommandCheck = now;
     
     // ✅ NOVO: Usar RPC atômica get_and_lock_slave_commands
     // ✅ CORREÇÃO: Usar POST com payload JSON (GET é read-only, RPC precisa fazer UPDATE)
@@ -1503,7 +1504,7 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
     DynamicJsonDocument payloadDoc(256);
     payloadDoc["p_master_device_id"] = getDeviceID();
     payloadDoc["p_limit"] = maxCommands;
-    payloadDoc["p_timeout_seconds"] = 30;
+    payloadDoc["p_timeout_seconds"] = 90;
     
     String payload;
     serializeJson(payloadDoc, payload);
@@ -1884,10 +1885,12 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
         commands[i].status = cmd["status"].as<String>();
         commands[i].timestamp = now;
         
-        // ✅ NOVO: Parsear slave_mac_address para target_device_id
+        // ✅ Parsear slave_mac_address / target_device_id para target_device_id
         if (cmd.containsKey("slave_mac_address")) {
             String slaveMac = cmd["slave_mac_address"].as<String>();
             commands[i].target_device_id = slaveMac;
+        } else if (cmd.containsKey("target_device_id")) {
+            commands[i].target_device_id = cmd["target_device_id"].as<String>();
         } else {
             commands[i].target_device_id = "";
         }
@@ -2021,6 +2024,64 @@ bool SupabaseClient::markCommandCompleted(int commandId, bool currentState, bool
     vTaskDelay(pdMS_TO_TICKS(50));
     
     return (httpCode >= 200 && httpCode < 300);
+}
+
+bool SupabaseClient::completeRelayCommand(int commandId, bool currentState,
+                                          const String& slaveMac,
+                                          const bool* relayStates, uint8_t numRelays) {
+    if (secureClient == nullptr) {
+        setError("Cliente SSL não inicializado");
+        return false;
+    }
+
+    String endpoint = "rpc/complete_relay_command";
+
+    DynamicJsonDocument payloadDoc(512);
+    payloadDoc["p_command_id"] = commandId;
+    payloadDoc["p_device_id"] = getDeviceID();
+    payloadDoc["p_current_state"] = currentState;
+
+    if (slaveMac.length() > 0 && relayStates != nullptr && numRelays > 0) {
+        payloadDoc["p_slave_mac"] = slaveMac;
+        JsonArray arr = payloadDoc.createNestedArray("p_relay_states");
+        uint8_t n = numRelays > 8 ? 8 : numRelays;
+        for (uint8_t i = 0; i < n; i++) {
+            arr.add(relayStates[i]);
+        }
+    }
+
+    String payload;
+    serializeJson(payloadDoc, payload);
+
+    Serial.printf("🔒 [RPC COMPLETE] id=%d\n", commandId);
+
+    http.end();
+    http.begin(*secureClient, baseUrl + "/rest/v1/" + endpoint);
+    http.addHeader("Authorization", buildAuthHeader());
+    http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
+    http.addHeader("apikey", apiKey);
+    http.setTimeout(SUPABASE_TIMEOUT_MS);
+
+    int httpCode = http.POST(payload);
+    String response = http.getString();
+    http.end();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (httpCode < 200 || httpCode >= 300) {
+        Serial.printf("❌ [RPC COMPLETE] id=%d HTTP %d\n", commandId, httpCode);
+        return false;
+    }
+
+    DynamicJsonDocument respDoc(512);
+    DeserializationError err = deserializeJson(respDoc, response);
+    if (err || !respDoc.is<JsonArray>() || respDoc.as<JsonArray>().size() == 0) {
+        Serial.printf("⚠️ [RPC COMPLETE] id=%d respuesta vacía — fallback PATCH\n", commandId);
+        return false;
+    }
+
+    const char* st = respDoc[0]["status"] | "";
+    Serial.printf("✅ [RPC COMPLETE] id=%d status=%s\n", commandId, st);
+    return true;
 }
 
 bool SupabaseClient::markCommandFailed(int commandId, const String& errorMessage, bool isSlave) {
@@ -2748,9 +2809,9 @@ bool SupabaseClient::updateRelayMaster(const String& deviceId, bool* relayStates
     String response = http.getString();
     http.end();
     
-    // Se PATCH não encontrou (404) ou falhou, tentar POST (INSERT)
+    // PATCH 200/204 com [] = sucesso sem rows (PostgREST) — não tentar INSERT
     bool patchSuccess = (httpCode >= 200 && httpCode < 300);
-    bool needsInsert = !patchSuccess || response.length() < 10;
+    bool needsInsert = (httpCode == 404);
     
     if (needsInsert) {
         Serial.println("📝 [SUPABASE] relay_master não encontrado, fazendo INSERT...");
@@ -2826,6 +2887,26 @@ bool SupabaseClient::updateRelayMaster(const String& deviceId, bool* relayStates
         httpCode = http.POST(postPayload);
         response = http.getString();
         http.end();
+
+        // 409 duplicate key — fila já existe; reintentar PATCH
+        if (httpCode == 409) {
+            Serial.println("⚠️ [SUPABASE] relay_master INSERT 409 — reintentando PATCH...");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (!http.begin(*secureClient, patchUrl)) {
+                if (requestMutex != nullptr) {
+                    xSemaphoreGive(requestMutex);
+                }
+                return false;
+            }
+            http.addHeader("Authorization", buildAuthHeader());
+            http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
+            http.addHeader("apikey", apiKey);
+            http.addHeader("Prefer", "return=representation");
+            http.setTimeout(SUPABASE_TIMEOUT_MS);
+            httpCode = http.PATCH(payload);
+            response = http.getString();
+            http.end();
+        }
     }
     
     // ✅ Liberar mutex antes de retornar
@@ -2842,6 +2923,130 @@ bool SupabaseClient::updateRelayMaster(const String& deviceId, bool* relayStates
         setError("Erro HTTP " + String(httpCode));
         return false;
     }
+}
+
+// ===== Garantir device_status para Slaves (FK relay_slaves) =====
+bool SupabaseClient::ensureDeviceStatusEntry(const String& deviceId, const String& macAddress,
+                                             const String& userEmail, const String& deviceName,
+                                             const String& deviceType) {
+    if (!isReady() || secureClient == nullptr || userEmail.length() == 0) {
+        return false;
+    }
+
+    String checkUrl = baseUrl + "/rest/v1/" + String(SUPABASE_STATUS_TABLE) +
+                      "?device_id=eq." + deviceId + "&select=device_id";
+
+    HTTPClient checkHttp;
+    if (!checkHttp.begin(*secureClient, checkUrl)) {
+        return false;
+    }
+
+    checkHttp.addHeader("apikey", apiKey);
+    checkHttp.addHeader("Authorization", buildAuthHeader());
+    checkHttp.addHeader("Accept", "application/json");
+    checkHttp.setTimeout(5000);
+
+    int checkCode = checkHttp.GET();
+    String checkResponse = checkHttp.getString();
+    checkHttp.end();
+
+    if (checkCode == 200 && checkResponse.length() > 2) {
+        Serial.printf("✅ [DEVICE_STATUS] Slave já registrado: %s\n", deviceId.c_str());
+        return true;
+    }
+
+    Serial.printf("📝 [DEVICE_STATUS] Registrando slave em device_status: %s\n", deviceId.c_str());
+
+    DynamicJsonDocument doc(768);
+    doc["device_id"] = deviceId;
+    doc["mac_address"] = macAddress;
+    doc["user_email"] = userEmail;
+    doc["device_name"] = deviceName.length() > 0 ? deviceName : deviceId;
+    doc["device_type"] = deviceType;
+    doc["is_online"] = true;
+    doc["ip_address"] = "0.0.0.0";
+    doc["firmware_version"] = FIRMWARE_VERSION;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String postUrl = baseUrl + "/rest/v1/" + String(SUPABASE_STATUS_TABLE);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (!http.begin(*secureClient, postUrl)) {
+        setError("Falha ao iniciar conexão SSL para ensureDeviceStatusEntry");
+        return false;
+    }
+
+    http.addHeader("Authorization", buildAuthHeader());
+    http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
+    http.addHeader("apikey", apiKey);
+    http.addHeader("Prefer", "return=minimal");
+    http.setTimeout(SUPABASE_TIMEOUT_MS);
+
+    int httpCode = http.POST(payload);
+    String response = http.getString();
+    http.end();
+
+    if (httpCode >= 200 && httpCode < 300) {
+        Serial.printf("✅ [DEVICE_STATUS] Slave registrado: %s\n", deviceId.c_str());
+        return true;
+    }
+
+    Serial.printf("⚠️ [DEVICE_STATUS] Falha ao registrar slave (HTTP %d): %s\n", httpCode, response.c_str());
+    return false;
+}
+
+bool SupabaseClient::isRequestInProgress() {
+    if (requestMutex == nullptr) {
+        return false;
+    }
+    if (xSemaphoreTake(requestMutex, 0) == pdTRUE) {
+        xSemaphoreGive(requestMutex);
+        return false;
+    }
+    return true;
+}
+
+bool SupabaseClient::patchSlaveDeviceStatusHeartbeat(const String& deviceId, const String& macAddress,
+                                                     const String& userEmail) {
+    if (!isReady() || secureClient == nullptr || userEmail.length() == 0) {
+        return false;
+    }
+
+    DynamicJsonDocument doc(384);
+    doc["last_seen"] = "now()";
+    doc["is_online"] = true;
+    doc["mac_address"] = macAddress;
+    doc["user_email"] = userEmail;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String patchUrl = baseUrl + "/rest/v1/" + String(SUPABASE_STATUS_TABLE) + "?device_id=eq." + deviceId;
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (!http.begin(*secureClient, patchUrl)) {
+        Serial.println("⚠️ [DEVICE_STATUS] Falha SSL no heartbeat do slave");
+        return false;
+    }
+
+    http.addHeader("Authorization", buildAuthHeader());
+    http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
+    http.addHeader("apikey", apiKey);
+    http.addHeader("Prefer", "return=minimal");
+    http.setTimeout(5000);
+
+    int httpCode = http.PATCH(payload);
+    http.end();
+
+    if (httpCode >= 200 && httpCode < 300) {
+        Serial.printf("✅ [DEVICE_STATUS] Heartbeat slave OK: %s\n", deviceId.c_str());
+        return true;
+    }
+
+    Serial.printf("⚠️ [DEVICE_STATUS] Heartbeat falhou HTTP %d: %s\n", httpCode, deviceId.c_str());
+    return false;
 }
 
 // ===== NOVO: ATUALIZAR ESTADOS DOS RELÉS DE SLAVE (relay_slaves) =====
@@ -3058,6 +3263,11 @@ bool SupabaseClient::updateRelaySlaves(const String& slaveDeviceId, const String
     
     if (needsInsert) {
         Serial.println("📝 [SUPABASE] relay_slaves não encontrado, fazendo INSERT...");
+
+        String slaveName = "ESP-NOW Slave " + slaveMacAddress;
+        if (!ensureDeviceStatusEntry(slaveDeviceId, slaveMacAddress, userEmail, slaveName, "ESP32_SLAVE")) {
+            Serial.println("⚠️ [SUPABASE] device_status não criado — INSERT relay_slaves pode falhar (FK)");
+        }
         
         // ✅ POST: Enviar payload completo (incluindo arrays vazios para nomes)
         // Para INSERT, precisamos de arrays completos mesmo que vazios
@@ -3112,16 +3322,36 @@ bool SupabaseClient::updateRelaySlaves(const String& slaveDeviceId, const String
         Serial.printf("📥 [RELAY_SLAVES] POST HTTP %d\n", httpCode);
         Serial.printf("📄 [RELAY_SLAVES] Resposta POST: %s\n", response.c_str());
         http.end();
+
+        if (httpCode == 409) {
+            Serial.println("⚠️ [RELAY_SLAVES] registro já existe (409), tentando PATCH...");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (http.begin(*secureClient, patchUrl)) {
+                http.addHeader("Authorization", buildAuthHeader());
+                http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
+                http.addHeader("apikey", apiKey);
+                http.addHeader("Prefer", "return=representation");
+                http.setTimeout(SUPABASE_TIMEOUT_MS);
+                httpCode = http.PATCH(payload);
+                response = http.getString();
+                Serial.printf("📥 [RELAY_SLAVES] PATCH retry HTTP %d\n", httpCode);
+                http.end();
+            }
+        }
     }
-    
-    // ✅ Liberar mutex antes de retornar
+
+    bool syncSuccess = (httpCode >= 200 && httpCode < 300);
+    if (syncSuccess) {
+        Serial.printf("✅ [SUPABASE] Estados dos relés slave atualizados em relay_slaves: slave=%s\n", slaveMacAddress.c_str());
+        Serial.printf("✅ [RELAY_SLAVES] PATCH/POST sucesso! Resposta: %s\n", response.c_str());
+        patchSlaveDeviceStatusHeartbeat(slaveDeviceId, slaveMacAddress, userEmail);
+    }
+
     if (requestMutex != nullptr) {
         xSemaphoreGive(requestMutex);
     }
-    
-    if (httpCode >= 200 && httpCode < 300) {
-        Serial.printf("✅ [SUPABASE] Estados dos relés slave atualizados em relay_slaves: slave=%s\n", slaveMacAddress.c_str());
-        Serial.printf("✅ [RELAY_SLAVES] PATCH/POST sucesso! Resposta: %s\n", response.c_str());
+
+    if (syncSuccess) {
         return true;
     } else {
         Serial.printf("❌ [SUPABASE] Erro ao atualizar relay_slaves: HTTP %d\n", httpCode);
@@ -3132,14 +3362,23 @@ bool SupabaseClient::updateRelaySlaves(const String& slaveDeviceId, const String
             DynamicJsonDocument errorDoc(512);
             DeserializationError jsonError = deserializeJson(errorDoc, response);
             if (!jsonError) {
-                if (errorDoc.containsKey("message")) {
-                    Serial.printf("💬 [RELAY_SLAVES] Mensagem de erro: %s\n", errorDoc["message"].as<const char*>());
+                if (errorDoc.containsKey("message") && !errorDoc["message"].isNull()) {
+                    const char* msg = errorDoc["message"].as<const char*>();
+                    if (msg) {
+                        Serial.printf("💬 [RELAY_SLAVES] Mensagem de erro: %s\n", msg);
+                    }
                 }
-                if (errorDoc.containsKey("hint")) {
-                    Serial.printf("💡 [RELAY_SLAVES] Dica: %s\n", errorDoc["hint"].as<const char*>());
+                if (errorDoc.containsKey("hint") && !errorDoc["hint"].isNull()) {
+                    const char* hint = errorDoc["hint"].as<const char*>();
+                    if (hint) {
+                        Serial.printf("💡 [RELAY_SLAVES] Dica: %s\n", hint);
+                    }
                 }
-                if (errorDoc.containsKey("code")) {
-                    Serial.printf("🔢 [RELAY_SLAVES] Código: %s\n", errorDoc["code"].as<const char*>());
+                if (errorDoc.containsKey("code") && !errorDoc["code"].isNull()) {
+                    const char* code = errorDoc["code"].as<const char*>();
+                    if (code) {
+                        Serial.printf("🔢 [RELAY_SLAVES] Código: %s\n", code);
+                    }
                 }
             }
         }
@@ -3648,7 +3887,8 @@ bool SupabaseClient::insertEcDilutionEvent(const String& deviceId, const String&
 
 bool SupabaseClient::updateEcOperationState(const String& deviceId, const String& state,
                                             int operationRemainingSec, int nextCheckInSec,
-                                            float dilutionTargetL, float dilutionProgressL) {
+                                            float dilutionTargetL, float dilutionProgressL,
+                                            bool operationInterrupted) {
     if (!isReady()) {
         return false;
     }
@@ -3668,6 +3908,9 @@ bool SupabaseClient::updateEcOperationState(const String& deviceId, const String
     }
     if (dilutionProgressL >= 0.0f) {
         doc["ec_dilution_progress_l"] = round(dilutionProgressL * 100.0) / 100.0;
+    }
+    if (operationInterrupted) {
+        doc["last_operation_interrupted"] = true;
     }
 
     String payload;
@@ -3697,7 +3940,8 @@ bool SupabaseClient::updateEcOperationState(const String& deviceId, const String
 }
 
 bool SupabaseClient::updatePhOperationState(const String& deviceId, const String& state,
-                                            int operationRemainingSec, int nextCheckInSec) {
+                                            int operationRemainingSec, int nextCheckInSec,
+                                            bool operationInterrupted) {
     if (!isReady()) return false;
 
     if (requestMutex != nullptr) {
@@ -3708,6 +3952,9 @@ bool SupabaseClient::updatePhOperationState(const String& deviceId, const String
     doc["ph_operation_state"] = state;
     doc["ph_operation_remaining_sec"] = operationRemainingSec > 0 ? operationRemainingSec : 0;
     doc["ph_next_check_in_sec"] = nextCheckInSec > 0 ? nextCheckInSec : 0;
+    if (operationInterrupted) {
+        doc["last_operation_interrupted"] = true;
+    }
 
     String payload;
     serializeJson(doc, payload);
@@ -3733,6 +3980,28 @@ bool SupabaseClient::updatePhOperationState(const String& deviceId, const String
         xSemaphoreGive(requestMutex);
     }
     return ok;
+}
+
+bool SupabaseClient::patchBootInterrupted(const String& deviceId, bool interrupted) {
+    if (!isReady() || !interrupted) return false;
+
+    DynamicJsonDocument doc(64);
+    doc["last_operation_interrupted"] = true;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String masterUrl = baseUrl + "/rest/v1/relay_master?device_id=eq." + deviceId;
+    if (secureClient == nullptr || !http.begin(*secureClient, masterUrl)) {
+        return false;
+    }
+    http.addHeader("apikey", apiKey);
+    http.addHeader("Authorization", buildAuthHeader());
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Prefer", "return=minimal");
+    int code = http.PATCH(payload);
+    http.end();
+    return code >= 200 && code < 300;
 }
 
 bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {

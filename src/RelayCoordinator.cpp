@@ -256,12 +256,14 @@ uint32_t RelayCoordinator::executeSlaveRelay(
     int relay,
     const String& action,
     int durationSec,
-    int supabaseCommandId) {
+    int supabaseCommandId,
+    int cycleOffSec,
+    const String& commandMode) {
     if (!masterManager || !mac) {
         return 0;
     }
     return masterManager->sendRelayCommandToSlave(
-        mac, relay, action, durationSec, supabaseCommandId, false);
+        mac, relay, action, durationSec, supabaseCommandId, false, cycleOffSec, commandMode);
 }
 
 uint32_t RelayCoordinator::requestActuation(
@@ -269,7 +271,9 @@ uint32_t RelayCoordinator::requestActuation(
     const RelayTarget& target,
     RelayActuationAction action,
     uint32_t durationSec,
-    int supabaseCommandId) {
+    int supabaseCommandId,
+    int cycleOffSec,
+    const String& commandMode) {
     const bool turningOn = (action == RelayActuationAction::On || action == RelayActuationAction::Toggle);
     const bool turningOff = (action == RelayActuationAction::Off);
 
@@ -298,7 +302,8 @@ uint32_t RelayCoordinator::requestActuation(
         ok = executeLocalRelay(target.relay, actionStr, (int)durationSec);
         result = ok ? 1u : 0u;
     } else {
-        result = executeSlaveRelay(target.slaveMac, target.relay, actionStr, (int)durationSec, supabaseCommandId);
+        result = executeSlaveRelay(target.slaveMac, target.relay, actionStr, (int)durationSec,
+                                   supabaseCommandId, cycleOffSec, commandMode);
         ok = result > 0;
     }
 
@@ -359,13 +364,16 @@ uint32_t RelayCoordinator::actuateSlave(
     int relay,
     const String& action,
     int durationSec,
-    int supabaseCommandId) {
+    int supabaseCommandId,
+    int cycleOffSec,
+    const String& commandMode) {
     RelayTarget target = RelayTarget::remote(mac, relay);
     RelayActuationAction act = RelayActuationAction::Toggle;
-    if (action == "on") {
+    if (action == "on" || action == "timed_on") {
         act = RelayActuationAction::On;
-    } else if (action == "off") {
+    } else if (action == "off" || action == "cycle_stop") {
         act = RelayActuationAction::Off;
     }
-    return requestActuation(owner, target, act, (uint32_t)durationSec, supabaseCommandId);
+    return requestActuation(owner, target, act, (uint32_t)durationSec, supabaseCommandId, cycleOffSec,
+                            commandMode);
 }

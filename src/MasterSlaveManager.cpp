@@ -1,5 +1,6 @@
 #include "MasterSlaveManager.h"
 #include "Config.h"
+#include "MASTER_CONFIG.h"
 #include "ObjectPoolManager.h"  // ✅ Object Pool Pattern
 #include <Preferences.h>
 #include <nvs_flash.h>
@@ -9,12 +10,25 @@
 // Instância estática para callbacks
 MasterSlaveManager* MasterSlaveManager::instance = nullptr;
 
+static String resolveSlaveEspAction(const String& action, const String& commandMode) {
+    String modeLower = commandMode;
+    modeLower.toLowerCase();
+    if (modeLower == "timed_on" || modeLower == "timed_off" || modeLower == "cycle" ||
+        modeLower == "cycle_stop") {
+        return modeLower;
+    }
+    return action;
+}
+
 MasterSlaveManager::MasterSlaveManager(ESPNowController* espNowController) 
     : espNowController(espNowController), initialized(false),
       totalPingsReceived(0), totalPongsSent(0), totalAcksSent(0), 
-      totalAcksReceived(0), totalErrors(0), commandIdCounter(0),  // ⭐ Inicializar contador
-      processingStatusResponse(false) {  // ✅ Proteção contra loop infinito
+      totalAcksReceived(0), totalErrors(0), commandIdCounter(0),
+      processingStatusResponse(false), lastEspNowSendAt_(0) {
     instance = this;
+    memset(lastEspNowSendMac_, 0, 6);
+    
+    allRelaysStatusSem = xSemaphoreCreateBinary();
     
     // ✅ PROTEÇÃO MULTI-CORE: Criar mutex para proteger trustedSlaves
     trustedSlavesMutex = xSemaphoreCreateMutex();
@@ -45,6 +59,7 @@ bool MasterSlaveManager::begin() {
     
     // Callback para PING recebido
     espNowController->setPingCallback(onPingReceivedStatic);
+    espNowController->setPongCallback(onPongReceivedStatic);
     
     // Callback para informações de dispositivo
     Serial.println("🔍 [DEBUG] Configurando deviceInfoCallback...");
@@ -66,6 +81,13 @@ bool MasterSlaveManager::begin() {
     
     initialized = true;
     
+    Serial.println("\n💾 Carregando peers confiáveis de NVS...");
+    if (loadTrustedPeersFromNVS()) {
+        Serial.println("✅ Peers confiáveis restaurados");
+    } else {
+        Serial.println("💡 Nenhum peer em cache (primeira inicialização)");
+    }
+
     // ✅ NOVO: Carregar cache de estados de slaves de NVS
     Serial.println("\n💾 Carregando cache de estados de slaves de NVS...");
     if (loadSlaveRelayStatesFromNVS()) {
@@ -185,18 +207,6 @@ bool MasterSlaveManager::addTrustedSlave(const uint8_t* macAddress, const String
     Serial.printf("📊 Total de slaves na lista: %d\n", trustedSlaves.size());
     Serial.println("========================================\n");
     
-    // ⭐ POTENCIA MÁXIMA: Chamar callback SEMPRE que um slave é adicionado
-    // Isso garante sincronização entre trustedSlaves e knownSlaves
-    if (slaveDiscoveredCallback) {
-        Serial.println("📢 Chamando callback de descoberta...");
-        slaveDiscoveredCallback(macAddress, newSlave.deviceName, newSlave.deviceType);
-        Serial.println("✅ Callback de descoberta chamado");
-    } else {
-        Serial.println("⚠️ AVISO: slaveDiscoveredCallback NÃO está configurado!");
-        Serial.println("⚠️ O slave foi adicionado a trustedSlaves mas NÃO será adicionado a knownSlaves");
-        Serial.println("⚠️ Isso pode causar problemas com comandos 'relay on_all'");
-    }
-    
     // ✅ DEVICE_ID GERADO PARA USO NA API
     // O slave não precisa ser registrado no Supabase
     // Basta usar o device_id (ESP32_SLAVE_XX_XX_XX_XX_XX_XX) na tabela relay_commands
@@ -211,7 +221,23 @@ bool MasterSlaveManager::addTrustedSlave(const uint8_t* macAddress, const String
     Serial.println("💡 O Master enviará comandos via ESP-NOW automaticamente");
     Serial.println("========================================\n");
     
-    xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex antes de retornar
+    String callbackName = newSlave.deviceName;
+    String callbackType = newSlave.deviceType;
+    xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex ANTES de callbacks externos
+    saveTrustedPeersToNVS();
+    
+    // ⭐ POTENCIA MÁXIMA: Chamar callback SEMPRE que um slave é adicionado
+    // Isso garante sincronização entre trustedSlaves e knownSlaves
+    if (slaveDiscoveredCallback) {
+        Serial.println("📢 Chamando callback de descoberta...");
+        slaveDiscoveredCallback(macAddress, callbackName, callbackType);
+        Serial.println("✅ Callback de descoberta chamado");
+    } else {
+        Serial.println("⚠️ AVISO: slaveDiscoveredCallback NÃO está configurado!");
+        Serial.println("⚠️ O slave foi adicionado a trustedSlaves mas NÃO será adicionado a knownSlaves");
+        Serial.println("⚠️ Isso pode causar problemas com comandos 'relay on_all'");
+    }
+    
     return true;
 }
 
@@ -250,9 +276,8 @@ TrustedSlave* MasterSlaveManager::findTrustedSlaveUnsafe(const uint8_t* macAddre
 }
 
 TrustedSlave* MasterSlaveManager::getTrustedSlave(const uint8_t* macAddress) {
-    // ✅ PROTEÇÃO MULTI-CORE: Lock mutex antes de ler
     if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        Serial.println("⚠️ Timeout ao obter mutex em getTrustedSlave()");
+        logSlaveLink("mutex_timeout", macAddress);
         return nullptr;
     }
     
@@ -273,33 +298,44 @@ TrustedSlave* MasterSlaveManager::getTrustedSlave(const uint8_t* macAddress) {
 }
 
 std::vector<TrustedSlave> MasterSlaveManager::getAllTrustedSlaves() {
-    // ✅ PROTEÇÃO MULTI-CORE: Lock mutex antes de ler
-    // ⚠️ LOGGING REDUZIDO: Só loggar em caso de erro para evitar spam no Serial
-    // ✅ CORREÇÃO CRÍTICA: Otimizar cópia para evitar falta de memória
-    
+    // Evitar OOM: cópia de vector falha quando heap fragmentado (espNowTask + SSL)
+    static const uint32_t MIN_MAX_ALLOC_FOR_COPY = 8192;
+    static const uint32_t MIN_FREE_HEAP_FOR_COPY = 45000;
+    if (ESP.getMaxAllocHeap() < MIN_MAX_ALLOC_FOR_COPY ||
+        ESP.getFreeHeap() < MIN_FREE_HEAP_FOR_COPY) {
+        return std::vector<TrustedSlave>();
+    }
+
     TickType_t startTime = xTaskGetTickCount();
     if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        // ✅ OTIMIZAÇÃO: Reservar espaço antes de copiar para evitar realocações
         std::vector<TrustedSlave> copy;
-        copy.reserve(trustedSlaves.size());  // ✅ Reservar espaço exato
-        
-        // ✅ OTIMIZAÇÃO: Copiar manualmente para melhor controle de memória
+        copy.reserve(trustedSlaves.size());
+
         for (const auto& slave : trustedSlaves) {
-            copy.push_back(slave);  // ✅ Copy constructor otimizado
+            copy.push_back(slave);
         }
-        
-        xSemaphoreGive(trustedSlavesMutex);  // Liberar mutex
+
+        xSemaphoreGive(trustedSlavesMutex);
         return copy;
     } else {
-        // ⚠️ Só loggar se houver timeout (erro)
         TickType_t waitTime = xTaskGetTickCount() - startTime;
         Serial.printf("❌ [getAllTrustedSlaves] TIMEOUT após %lu ms!\n", waitTime * portTICK_PERIOD_MS);
-        Serial.println("   ⚠️ Possíveis causas:");
-        Serial.println("      - Mutex está bloqueado por outra função");
-        Serial.println("      - Deadlock entre cores");
-        Serial.println("      - Função está demorando muito para liberar mutex");
-        return std::vector<TrustedSlave>();  // Retornar vazio se timeout
+        return std::vector<TrustedSlave>();
     }
+}
+
+bool MasterSlaveManager::forEachTrustedSlave(const std::function<void(const TrustedSlave&)>& visitor) {
+    if (!visitor) {
+        return false;
+    }
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return false;
+    }
+    for (const auto& slave : trustedSlaves) {
+        visitor(slave);
+    }
+    xSemaphoreGive(trustedSlavesMutex);
+    return true;
 }
 
 std::vector<TrustedSlave> MasterSlaveManager::getOnlineSlaves() {
@@ -386,7 +422,10 @@ int MasterSlaveManager::sendPingToAllSlaves() {
     return pingsSent;
 }
 
-uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, int relayNumber, const String& action, int duration, int supabaseCommandId, bool updateStatus) {
+uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, int relayNumber,
+                                                     const String& action, int duration,
+                                                     int supabaseCommandId, bool updateStatus,
+                                                     int cycleOffDuration, const String& commandMode) {
     // ✅ MUDANÇA 1: Retornar 0 em vez de false (compatível: 0 = false, >0 = true)
     if (!initialized || !espNowController) return 0;
     
@@ -396,8 +435,9 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
         return 0;  // ✅ MUDANÇA 2: 0 em vez de false
     }
     
-    // 🚨 NOVO: Verificar se slave está OFFLINE
-    if (!slave->isOnline()) {
+    // Verificar se slave está inalcançável (sem contato radio recente)
+    if (!isSlaveReachable(*slave)) {
+        logSlaveLink("cmd_blocked_offline", macAddress);
         Serial.println("\n⏸️ ========================================");
         Serial.println("⏸️ SLAVE OFFLINE - COMANDO P");
         Serial.println("⏸️ ========================================");
@@ -408,12 +448,25 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
         Serial.println("💾 Comando será enviado quando slave voltar ONLINE");
         Serial.println("========================================\n");
         
-        // 🚨 NOVO: Adicionar à fila de comandos pendentes (não retry, mas pendente)
         uint32_t commandId = generateCommandId();
-        addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId);
+        addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, false,
+                        cycleOffDuration, commandMode);
         
-        // ✅ MUDANÇA 3: Retornar commandId mesmo se offline (para mapeamento futuro)
-        return commandId;  // Retorna ID para que possa ser mapeado quando enviado
+        return commandId;
+    }
+
+    if (hasInFlightForMac(macAddress)) {
+        uint32_t commandId = generateCommandId();
+        addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, false,
+                        cycleOffDuration, commandMode);
+        return commandId;
+    }
+
+    if (!canEspNowSendToMac(macAddress)) {
+        uint32_t commandId = generateCommandId();
+        addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, false,
+                        cycleOffDuration, commandMode);
+        return commandId;
     }
     
     // 🔄 FASE 1: Gerar ID único para este comando
@@ -429,11 +482,21 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
     if (duration > 0) {
         Serial.println("⏱️ Duração: " + String(duration) + "s");
     }
+    if (cycleOffDuration > 0) {
+        Serial.println("⏱️ Ciclo OFF: " + String(cycleOffDuration) + "s");
+    }
+    if (commandMode.length() > 0 && commandMode != "instant") {
+        Serial.println("🎛️ Modo: " + commandMode);
+    }
     
+    String espAction = resolveSlaveEspAction(action, commandMode);
+
     // Tentar enviar o comando
-    bool success = espNowController->sendRelayCommand(macAddress, relayNumber, action, duration);
+    bool success = espNowController->sendRelayCommand(macAddress, relayNumber, espAction, duration,
+                                                      commandId, cycleOffDuration, commandMode);
     
     if (success) {
+        markEspNowSendToMac(macAddress);
         Serial.println("✅ Comando enviado com sucesso!");
         Serial.println("========================================\n");
         
@@ -461,7 +524,10 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
         }
         
         // ✅ MUDANÇA 4: Retornar commandId em vez de success
-        return commandId;  // Retorna ID para mapeamento
+        if (supabaseCommandId > 0) {
+            addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, true);
+        }
+        return commandId;
     } else {
         Serial.println("❌ Falha ao enviar comando!");
         Serial.println("🔄 Adicionando à fila de retry...");
@@ -486,21 +552,18 @@ bool MasterSlaveManager::requestSlaveStatus(const uint8_t* macAddress) {
         return false;
     }
     
-    // Enviar comando de status para todos os relés
-    bool success = true;
+    // Um único comando "status" dispara ALL_RELAYS_STATUS no Slave (8 relés num pacote)
     TrustedSlave* slave = getTrustedSlave(macAddress);
-    if (slave) {
-        for (int i = 0; i < slave->numRelays; i++) {
-            if (!espNowController->sendRelayCommand(macAddress, i, "status", 0)) {
-                success = false;
-            }
-        }
+    if (!slave) {
+        return false;
     }
-    
+
+    bool success = espNowController->sendRelayCommand(macAddress, 0, "status", 0, 0);
+
     if (success) {
-        Serial.println("📊 Solicitação de status enviada para Slave: " + ESPNowController::macToString(macAddress));
+        LOG_ESPNOW_INFO("📊 ALL_RELAYS_STATUS solicitado: " + ESPNowController::macToString(macAddress));
     }
-    
+
     return success;
 }
 
@@ -543,23 +606,13 @@ void MasterSlaveManager::requestAllSlavesRelayStatus() {
         onlineSlaves++;
         Serial.println("📡 " + slave.deviceName + " (" + ESPNowController::macToString(slave.macAddress) + ")");
         
-        // Solicitar status de todos os relés deste slave
-        bool slaveSuccess = true;
-        for (int i = 0; i < slave.numRelays; i++) {
-            if (espNowController->sendRelayCommand(slave.macAddress, i, "status", 0)) {
-                requestsSent++;
-                totalRelays++;
-                delay(5); // Delay reduzido (5ms) para ser mais rápido
-            } else {
-                slaveSuccess = false;
-                requestsFailed++;
-            }
-        }
-        
-        if (slaveSuccess) {
-            Serial.println("   ✅ " + String(slave.numRelays) + " relés");
+        if (requestSlaveStatus(slave.macAddress)) {
+            requestsSent++;
+            totalRelays += slave.numRelays;
+            Serial.println("   ✅ ALL_RELAYS_STATUS solicitado");
         } else {
-            Serial.println("   ⚠️ Algumas falhas");
+            requestsFailed++;
+            Serial.println("   ⚠️ Falha ao solicitar status");
         }
         
         delay(20); // Delay entre slaves (20ms)
@@ -596,6 +649,30 @@ bool MasterSlaveManager::requestSlaveInfo(const uint8_t* macAddress) {
 
 void MasterSlaveManager::setProcessingStatusResponse(bool processing) {
     processingStatusResponse = processing;
+}
+
+void MasterSlaveManager::drainAllRelaysStatusWait() {
+    if (allRelaysStatusSem != nullptr) {
+        xSemaphoreTake(allRelaysStatusSem, 0);
+    }
+}
+
+bool MasterSlaveManager::waitForAllRelaysStatus(uint32_t timeoutMs) {
+    if (allRelaysStatusSem == nullptr) {
+        return false;
+    }
+    return xSemaphoreTake(allRelaysStatusSem, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+void MasterSlaveManager::notifyAllRelaysStatusReceived(const uint8_t* senderMac,
+                                                       const bool relayStates[8],
+                                                       uint8_t numRelays) {
+    if (allRelaysStatusSem != nullptr) {
+        xSemaphoreGive(allRelaysStatusSem);
+    }
+    if (allRelaysSnapshotCallback && senderMac && relayStates && numRelays > 0) {
+        allRelaysSnapshotCallback(senderMac, relayStates, numRelays);
+    }
 }
 
 bool MasterSlaveManager::sendAck(const uint8_t* macAddress, uint32_t messageId) {
@@ -690,19 +767,141 @@ void MasterSlaveManager::setSupabaseCommandCallback(std::function<void(int supab
     this->supabaseCommandCallback = callback;
 }
 
+void MasterSlaveManager::setSlaveCommandResolvedCallback(
+    std::function<void(int supabaseCommandId, uint32_t espNowCommandId, const uint8_t* mac,
+                       int relayNumber, bool currentState)> callback) {
+    this->slaveCommandResolvedCallback = callback;
+}
+
 void MasterSlaveManager::setSupabaseRelayStateCallback(std::function<void(const String& masterDeviceId, const String& slaveMacAddress, const String& slaveDeviceId, int relayNumber, bool state, bool hasTimer, int remainingTime)> callback) {
     this->supabaseRelayStateCallback = callback;
+}
+
+// ===== SLAVE-LINK: vínculo radio + logging correlacionável =====
+
+void MasterSlaveManager::logSlaveLink(const char* event, const uint8_t* mac, long lastSeenDeltaMs) {
+    if (!event) return;
+    String macBuf = mac ? ESPNowController::macToString(mac) : String("unknown");
+    Serial.printf("[SLAVE-LINK] event=%s mac=%s queue=%u heap=%u",
+                  event,
+                  macBuf.c_str(),
+                  (unsigned)pendingRelayCommands.size(),
+                  (unsigned)ESP.getFreeHeap());
+    if (lastSeenDeltaMs >= 0) {
+        Serial.printf(" last_seen_delta_ms=%ld", lastSeenDeltaMs);
+    }
+    Serial.println();
+}
+
+bool MasterSlaveManager::isSlaveReachable(const TrustedSlave& slave) const {
+    if (slave.isOnline()) {
+        return true;
+    }
+    if (slave.lastSeen == 0) {
+        return false;
+    }
+    return (millis() - slave.lastSeen) < SLAVE_REACHABLE_MS;
+}
+
+bool MasterSlaveManager::readSlaveRelaySnapshot(const uint8_t* macAddress, bool states[8],
+                                              bool timers[8], int remaining[8], uint8_t& numRelays,
+                                              bool& linkOnline, uint16_t& linkLastSeenS) {
+    if (!macAddress || !states || !timers || !remaining) {
+        return false;
+    }
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return false;
+    }
+    TrustedSlave* slave = findTrustedSlaveUnsafe(macAddress);
+    if (!slave) {
+        xSemaphoreGive(trustedSlavesMutex);
+        return false;
+    }
+    numRelays = slave->numRelays > 8 ? 8 : slave->numRelays;
+    for (uint8_t i = 0; i < numRelays; i++) {
+        states[i] = slave->relayStates[i].state;
+        timers[i] = slave->relayStates[i].hasTimer;
+        remaining[i] = slave->relayStates[i].remainingTime;
+    }
+    linkOnline = isSlaveReachable(*slave);
+    linkLastSeenS = (uint16_t)(slave->getTimeSinceLastSeen() / 1000UL);
+    xSemaphoreGive(trustedSlavesMutex);
+    return true;
+}
+
+bool MasterSlaveManager::hasInFlightForMac(const uint8_t* mac) const {
+    if (!mac) return false;
+    for (const auto& cmd : pendingRelayCommands) {
+        if (cmd.waitingForAck && memcmp(cmd.targetMac, mac, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MasterSlaveManager::canEspNowSendToMac(const uint8_t* mac) const {
+    if (!mac) return false;
+    if (memcmp(lastEspNowSendMac_, mac, 6) != 0) {
+        return true;
+    }
+    return (millis() - lastEspNowSendAt_) >= MIN_ESPNOW_SEND_GAP_MS;
+}
+
+void MasterSlaveManager::markEspNowSendToMac(const uint8_t* mac) {
+    if (!mac) return;
+    memcpy(lastEspNowSendMac_, mac, 6);
+    lastEspNowSendAt_ = millis();
+}
+
+void MasterSlaveManager::notifyEspNowSendFail(const uint8_t* mac, uint8_t consecutiveFails) {
+    if (!mac || consecutiveFails < 3) return;
+    Serial.printf("[SLAVE-LINK] event=espnow_send_fail mac=%s fails=%u heap=%u\n",
+                  ESPNowController::macToString(mac).c_str(),
+                  (unsigned)consecutiveFails,
+                  (unsigned)ESP.getFreeHeap());
+}
+
+void MasterSlaveManager::touchSlaveLink(const uint8_t* mac, const char* reason) {
+    if (!mac || !reason) return;
+
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        logSlaveLink("mutex_timeout", mac);
+        return;
+    }
+
+    TrustedSlave* slave = findTrustedSlaveUnsafe(mac);
+    if (!slave) {
+        xSemaphoreGive(trustedSlavesMutex);
+        return;
+    }
+
+    bool wasOffline = !slave->isOnline();
+    unsigned long prevLastSeen = slave->lastSeen;
+    slave->updateLastSeen();
+    slave->messagesReceived++;
+    slave->status = SlaveStatus::ONLINE;
+    String deviceName = slave->deviceName;
+    xSemaphoreGive(trustedSlavesMutex);
+
+    long delta = (prevLastSeen > 0) ? (long)(millis() - prevLastSeen) : 0;
+    const char* logEvent = wasOffline ? "online_mark" : reason;
+    logSlaveLink(logEvent, mac, delta);
+
+    if (wasOffline) {
+        sendPendingCommandsToSlave(mac);
+        requestSlaveStatus(mac);
+        if (slaveOnlineCallback) {
+            slaveOnlineCallback(mac, deviceName);
+        }
+    }
 }
 
 // ===== MÉTODOS PRIVADOS =====
 
 void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t pingId) {
-    Serial.println("\n🏓 ========================================");
-    Serial.println("🏓 PING RECEBIDO DO SLAVE!");
-    Serial.println("🏓 ========================================");
-    Serial.println("📥 De: " + ESPNowController::macToString(senderMac));
-    Serial.println("🆔 Ping ID: " + String(pingId));
-    Serial.println("⏰ Timestamp: " + String(millis() / 1000) + "s");
+    Serial.printf("[ESPNOW] PING rx %s id=%u\n",
+                  ESPNowController::macToString(senderMac).c_str(), pingId);
+    LOG_ESPNOW_DEBUG("\n🏓 PING RECEBIDO DO SLAVE: " + ESPNowController::macToString(senderMac));
     
     // ✅ PROTEÇÃO MULTI-CORE: Lock mutex antes de verificar/adicionar
     if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -712,7 +911,6 @@ void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t 
     
     // Verificar se Slave está na lista confiável (usar versión unsafe porque ya tenemos mutex)
     TrustedSlave* slave = findTrustedSlaveUnsafe(senderMac);
-    bool wasNewSlave = false;
     
     if (!slave) {
         xSemaphoreGive(trustedSlavesMutex);  // Liberar antes de addTrustedSlave (que toma mutex)
@@ -721,43 +919,51 @@ void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t 
         String genericName = "Slave-" + ESPNowController::macToString(senderMac).substring(12);
         addTrustedSlave(senderMac, genericName, "RelayBox");
         
-        // Tomar mutex de nuevo para buscar
-        if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            slave = findTrustedSlaveUnsafe(senderMac);
-            wasNewSlave = true;
-        } else {
+        // Tomar mutex de novo para buscar
+        if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
             Serial.println("⚠️ Timeout ao obter mutex após addTrustedSlave()");
             return;
         }
-        
-        // ⭐ CORREÇÃO: Adicionar à knownSlaves imediatamente quando recebe PING
-        // Isso garante que o slave apareça na lista mesmo antes de receber DEVICE_INFO
-        if (slaveDiscoveredCallback) {
-            Serial.println("📢 Adicionando slave à knownSlaves (nome temporário)...");
-            slaveDiscoveredCallback(senderMac, genericName, "RelayBox");
-        }
+        slave = findTrustedSlaveUnsafe(senderMac);
         
         // ⭐ POTENCIA MÁXIMA: Solicitar DEVICE_INFO automáticamente para obtener información completa
-        Serial.println("\n📋 === SOLICITANDO DEVICE_INFO AUTOMÁTICAMENTE ===");
-        Serial.println("🎯 Usando DEVICE_INFO como fuente principal de información");
-        if (espNowController) {
-            // Usar handshake para solicitar información completa del slave
-            espNowController->initiateHandshake(senderMac);
-            Serial.println("✅ Handshake iniciado - Slave debería responder con DEVICE_INFO");
-        }
-        Serial.println("==================================================\n");
-    } else {
-        // ⭐ POTENCIA MÁXIMA: Si el slave tiene nombre genérico, solicitar DEVICE_INFO para actualizar
-        if (slave->deviceName.startsWith("Slave-") || slave->deviceName == "Unknown") {
-            Serial.println("\n📋 === SLAVE CON INFORMACIÓN INCOMPLETA ===");
-            Serial.println("🔄 Solicitando DEVICE_INFO para actualizar información...");
+        if (slave) {
+            xSemaphoreGive(trustedSlavesMutex);
+            
+            Serial.println("\n📋 === SOLICITANDO DEVICE_INFO AUTOMÁTICAMENTE ===");
+            Serial.println("🎯 Usando DEVICE_INFO como fuente principal de información");
             if (espNowController) {
                 espNowController->initiateHandshake(senderMac);
-                Serial.println("✅ Handshake iniciado para obtener información completa");
+                Serial.println("✅ Handshake iniciado - Slave debería responder con DEVICE_INFO");
             }
-            Serial.println("============================================\n");
+            Serial.println("==================================================\n");
+            
+            if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                Serial.println("⚠️ Timeout ao obter mutex após handshake em processPingReceived()");
+                return;
+            }
+            slave = findTrustedSlaveUnsafe(senderMac);
         }
+    } else if (slave->deviceName.startsWith("Slave-") || slave->deviceName == "Unknown") {
+        xSemaphoreGive(trustedSlavesMutex);
+        
+        Serial.println("\n📋 === SLAVE CON INFORMACIÓN INCOMPLETA ===");
+        Serial.println("🔄 Solicitando DEVICE_INFO para actualizar información...");
+        if (espNowController) {
+            espNowController->initiateHandshake(senderMac);
+            Serial.println("✅ Handshake iniciado para obtener información completa");
+        }
+        Serial.println("============================================\n");
+        
+        if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            Serial.println("⚠️ Timeout ao obter mutex após handshake em processPingReceived()");
+            return;
+        }
+        slave = findTrustedSlaveUnsafe(senderMac);
     }
+    
+    String deviceNameForCallback;
+    bool shouldCallOnlineCallback = false;
     
     if (slave) {
         // Atualizar informações do Slave
@@ -771,6 +977,10 @@ void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t 
             slave->status = SlaveStatus::PING_RECEIVED;
             Serial.println("📊 Status atualizado: PING_RECEIVED");
         }
+        
+        deviceNameForCallback = slave->deviceName;
+        
+        xSemaphoreGive(trustedSlavesMutex);
         
         // 🚨 CRÍTICO: Verificar se o peer existe e se o canal está sincronizado antes de enviar PONG
         if (espNowController && espNowController->peerExists(senderMac)) {
@@ -786,87 +996,88 @@ void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t 
                     Serial.println("   📶 Canal atual do Master: " + String(currentMasterChannel));
                     Serial.println("   🔄 Atualizando peer...");
                     
-                    // Remover e re-adicionar peer com canal correto
                     esp_now_del_peer(senderMac);
-                    String slaveName = slave->deviceName.isEmpty() ? "Slave-" + ESPNowController::macToString(senderMac).substring(12) : slave->deviceName;
+                    String slaveName = deviceNameForCallback.isEmpty()
+                        ? "Slave-" + ESPNowController::macToString(senderMac).substring(12)
+                        : deviceNameForCallback;
                     espNowController->addPeerWithChannel(senderMac, currentMasterChannel, slaveName);
                 }
             }
         }
         
         // Responder automaticamente com PONG
-        Serial.println("\n🏓 Enviando PONG de resposta...");
-        bool pongSent = espNowController->sendPing(senderMac);  // ESPNowController já responde PING com PONG
+        LOG_ESPNOW_DEBUG("[ESPNOW] PONG tx " + ESPNowController::macToString(senderMac));
+        bool pongSent = espNowController->sendPing(senderMac);
         
         if (pongSent) {
-            slave->pongsSent++;
-            slave->lastPongId++;
-            Serial.println("✅ PONG enviado com sucesso!");
-            Serial.println("🔗 Conectividade confirmada");
-            
-            // Atualizar status para ONLINE se ainda não estiver
-            if (slave->status == SlaveStatus::PING_RECEIVED || slave->status == SlaveStatus::DISCOVERED) {
-                slave->status = SlaveStatus::ONLINE;
-                Serial.println("📊 Status atualizado: ONLINE");
-                
-                // ✅ CRÍTICO: Atualizar lastSeen quando recebe PING
-                slave->updateLastSeen();
-                
-                // Chamar callback de online (atualiza knownSlaves)
-                if (slaveOnlineCallback) {
-                    slaveOnlineCallback(senderMac, slave->deviceName);
+            if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                slave = findTrustedSlaveUnsafe(senderMac);
+                if (slave) {
+                    slave->pongsSent++;
+                    slave->lastPongId++;
+                    if (slave->status == SlaveStatus::PING_RECEIVED || slave->status == SlaveStatus::DISCOVERED) {
+                        slave->status = SlaveStatus::ONLINE;
+                        slave->updateLastSeen();
+                        shouldCallOnlineCallback = true;
+                        deviceNameForCallback = slave->deviceName;
+                        Serial.println("[ESPNOW] slave ONLINE");
+                    }
                 }
+                xSemaphoreGive(trustedSlavesMutex);
+            }
+            
+            if (shouldCallOnlineCallback && slaveOnlineCallback) {
+                slaveOnlineCallback(senderMac, deviceNameForCallback);
             }
         } else {
-            slave->messagesLost++;
+            if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                slave = findTrustedSlaveUnsafe(senderMac);
+                if (slave) {
+                    slave->messagesLost++;
+                }
+                xSemaphoreGive(trustedSlavesMutex);
+            }
             Serial.println("❌ Falha ao enviar PONG");
         }
         
-        Serial.println("📊 Estatísticas do Slave:");
-        Serial.println("   PINGs recebidos: " + String(slave->pingsReceived));
-        Serial.println("   PINGs enviados: " + String(slave->pingsSent));
-        Serial.println("   PONGs recebidos: " + String(slave->pongsReceived));
-        Serial.println("   PONGs enviados: " + String(slave->pongsSent));
-        Serial.println("   Mensagens recebidas: " + String(slave->messagesReceived));
-        Serial.println("   Mensagens perdidas: " + String(slave->messagesLost));
-        Serial.println("   Último contato: " + String(slave->getTimeSinceLastSeen() / 1000) + "s atrás");
+#if DEBUG_ESPNOW && MASTER_DEBUG_LEVEL >= DEBUG_LEVEL_DEBUG
+        if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            slave = findTrustedSlaveUnsafe(senderMac);
+            if (slave) {
+                Serial.printf("[ESPNOW] stats ping_rx=%u pong_tx=%u msg_rx=%u\n",
+                              slave->pingsReceived, slave->pongsSent, slave->messagesReceived);
+            }
+            xSemaphoreGive(trustedSlavesMutex);
+        }
+#endif
+    } else {
+        xSemaphoreGive(trustedSlavesMutex);
     }
     
     // Chamar callback se definido
     if (pingReceivedCallback) {
         pingReceivedCallback(senderMac, pingId);
     }
-    
-    Serial.println("========================================\n");
+
+    touchSlaveLink(senderMac, "ping_rx");
 }
 
 void MasterSlaveManager::processPongReceived(const uint8_t* senderMac, uint32_t pongId) {
-    // ✅ REDUZIDO: Log removido (PONGs são frequentes)
-    // Serial.println("🏓 PONG recebido de: " + ESPNowController::macToString(senderMac) + " (ID: " + String(pongId) + ")");
-    
-    TrustedSlave* slave = getTrustedSlave(senderMac);
-    if (slave) {
-        bool wasOffline = !slave->isOnline();
-        slave->updateLastSeen();
-        slave->pongsReceived++;  // ✅ CORREÇÃO: Incrementar PONGs recebidos
-        slave->messagesReceived++;
-        slave->status = SlaveStatus::ONLINE; // ✅ CRÍTICO: Marcar como online quando recebe PONG
-        
-        // 🚨 NOVO: Se slave estava offline e voltou online, enviar comandos pendentes
-        if (wasOffline) {
-            Serial.println("🔄 Slave voltou online: " + ESPNowController::macToString(senderMac));
-            sendPendingCommandsToSlave(senderMac);
+    Serial.printf("[ESPNOW] PONG rx %s id=%u\n",
+                  ESPNowController::macToString(senderMac).c_str(), pongId);
+
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        TrustedSlave* slave = findTrustedSlaveUnsafe(senderMac);
+        if (slave) {
+            slave->pongsReceived++;
         }
-        
-        // ✅ CORREÇÃO CRÍTICA: Sincronizar knownSlaves
-        if (slaveOnlineCallback) {
-            slaveOnlineCallback(senderMac, slave->deviceName);
-        }
-        
-        // Chamar callback se definido
-        if (pongReceivedCallback) {
-            pongReceivedCallback(senderMac, pongId);
-        }
+        xSemaphoreGive(trustedSlavesMutex);
+    }
+
+    touchSlaveLink(senderMac, "pong_rx");
+
+    if (pongReceivedCallback) {
+        pongReceivedCallback(senderMac, pongId);
     }
 }
 
@@ -885,28 +1096,26 @@ void MasterSlaveManager::processAckReceived(const uint8_t* senderMac, uint32_t m
 }
 
 void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, const String& deviceName, const String& deviceType, uint8_t numRelays, bool operational, uint8_t wifiChannel) {
-    Serial.println("\n📋 ========================================");
-    Serial.println("📋 INFORMAÇÕES DO SLAVE RECEBIDAS!");
-    Serial.println("📋 ========================================");
-    Serial.println("📥 De: " + ESPNowController::macToString(senderMac));
-    Serial.println("📝 Nome: " + deviceName);
-    Serial.println("🏷️ Tipo: " + deviceType);
-    Serial.println("🔌 Relés: " + String(numRelays));
-    Serial.println("✅ Operacional: " + String(operational ? "Sim" : "Não"));
-    Serial.println("📶 Canal WiFi: " + String(wifiChannel > 0 ? String(wifiChannel) : "Desconhecido"));
+    const bool knownSlave = (getTrustedSlave(senderMac) != nullptr);
+
+    if (knownSlave) {
+        LOG_ESPNOW_DEBUG("[ESPNOW] DEVICE_INFO " + ESPNowController::macToString(senderMac) +
+                         " " + deviceName + " ch=" + String(wifiChannel));
+    } else {
+        Serial.println("\n[ESPNOW] DEVICE_INFO novo " + ESPNowController::macToString(senderMac));
+        Serial.println("   nome=" + deviceName + " tipo=" + deviceType + " relés=" + String(numRelays));
+    }
     
-    // 🔍 DEBUG: Estado WiFi do Master
     wifi_mode_t wifiMode = WiFi.getMode();
+    (void)wifiMode;
     bool wifiConnected = (WiFi.status() == WL_CONNECTED);
     uint8_t masterChannel;
     wifi_second_chan_t secondChan;
     esp_wifi_get_channel(&masterChannel, &secondChan);
-    Serial.println("\n🔍 [DEBUG] Estado WiFi do Master:");
-    Serial.println("   📶 Modo WiFi: " + String(wifiMode == WIFI_AP_STA ? "AP+STA" : wifiMode == WIFI_STA ? "STA" : wifiMode == WIFI_AP ? "AP" : "OFF"));
-    Serial.println("   📡 WiFi conectado: " + String(wifiConnected ? "SIM ✅" : "NÃO ❌"));
-    Serial.println("   📶 Canal Master: " + String(masterChannel));
-    Serial.println("   📶 Canal Slave: " + String(wifiChannel));
-    if (wifiChannel > 0 && masterChannel != wifiChannel) {
+    if (!knownSlave) {
+        Serial.println("   canal master=" + String(masterChannel) + " slave=" + String(wifiChannel));
+    }
+    if (wifiChannel > 0 && masterChannel != wifiChannel && !knownSlave) {
         Serial.println("   ⚠️ CONFLITO DE CANAL DETECTADO!");
         Serial.println("   💡 Master no canal " + String(masterChannel) + ", Slave no canal " + String(wifiChannel));
         if (wifiConnected) {
@@ -916,15 +1125,20 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
     }
     
     // ⭐ CORREÇÃO CRÍTICA: Adicionar Slave como peer ESP-NOW se não existir
-    // 🚨 CRÍTICO: Usar canal WiFi do Slave se disponível
+    // Master com WiFi STA: peer sempre no canal RF do Master
     uint8_t peerChannel = wifiChannel;
     if (peerChannel == 0) {
-        // Se canal não foi fornecido, detectar canal real em que recebemos a mensagem
         uint8_t currentChannel;
         wifi_second_chan_t secondChan;
         esp_wifi_get_channel(&currentChannel, &secondChan);
         peerChannel = currentChannel;
         Serial.println("⚠️ Canal WiFi não fornecido, usando canal detectado: " + String(peerChannel));
+    }
+    if (wifiConnected && masterChannel > 0) {
+        if (peerChannel != masterChannel) {
+            Serial.println("   💡 Peer forçado ao canal Master " + String(masterChannel) + " (Slave reportou " + String(wifiChannel) + ")");
+        }
+        peerChannel = masterChannel;
     }
     
     if (espNowController && !espNowController->peerExists(senderMac)) {
@@ -1007,50 +1221,28 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
                 Serial.println("⚠️ Timeout ao obter mutex após addTrustedSlave()");
                 return;
             }
-            
-            // Disparar callback de descoberta
-            if (slaveDiscoveredCallback) {
-                Serial.println("📢 Disparando callback de descoberta...");
-                slaveDiscoveredCallback(senderMac, deviceName, deviceType);
-            }
         } else {
             Serial.println("❌ Falha ao adicionar Slave à lista confiável");
+            return;
         }
         Serial.println("===============================\n");
-    } else {
-        // Slave já existe, apenas atualizar
-        // Actualizar directamente (ya tenemos mutex)
+    }
+    
+    // Atualizar informações detalhadas do Slave (mutex mantido para novos e existentes)
+    if (slave) {
+        bool wasOffline = !slave->isOnline();
         slave->numRelays = numRelays;
         slave->operational = operational;
-        slave->updateLastSeen();
+        slave->messagesReceived++;
         slave->status = SlaveStatus::ONLINE;
+        slave->updateLastSeen();
+        
         if (!deviceName.isEmpty()) {
             slave->deviceName = deviceName;
         }
         if (!deviceType.isEmpty()) {
             slave->deviceType = deviceType;
         }
-        
-        // Guardar datos para callbacks (antes de liberar mutex)
-        String deviceNameForCallback = slave->deviceName;
-        
-        xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex ANTES de callbacks
-        
-        // ✅ CORREÇÃO: NÃO chamar slaveDiscoveredCallback para slaves existentes
-        // Isso evita logs repetidos de "NOVO SLAVE DESCOBERTO!"
-        // O callback só deve ser chamado quando o slave é realmente novo
-    }
-    
-    // Atualizar informações detalhadas do Slave
-    if (slave) {
-        bool wasOffline = !slave->isOnline();
-        slave->numRelays = numRelays;
-        slave->operational = operational;
-        slave->messagesReceived++;
-        
-        // Actualizar todos los datos ANTES de liberar mutex
-        slave->status = SlaveStatus::ONLINE;
-        slave->updateLastSeen(); // ✅ CRÍTICO: Atualizar lastSeen quando recebe mensagem
         
         // 🚨 CRÍTICO: Guardar canal WiFi do Slave
         if (wifiChannel > 0 && wifiChannel <= 13) {
@@ -1060,10 +1252,9 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
             }
         }
         
-        // Guardar datos para callbacks (antes de liberar mutex)
         String deviceNameForCallback = slave->deviceName;
         
-        xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex ANTES de callbacks y operaciones externas
+        xSemaphoreGive(trustedSlavesMutex);  // ✅ Um único give por caminho
         
         // 🚨 NOVO: Se slave estava offline e voltou online, enviar comandos pendentes
         if (wasOffline) {
@@ -1072,18 +1263,18 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
             Serial.println("🔄 ========================================");
             sendPendingCommandsToSlave(senderMac);
             
-            // ✅ CORREÇÃO: Solo llamar callback cuando el slave realmente cambia de offline a online
             if (slaveOnlineCallback) {
                 slaveOnlineCallback(senderMac, deviceNameForCallback);
             }
         }
-        // ✅ NO llamar callback si el slave ya estaba online (evitar spam)
         
         if (isNewSlave) {
             Serial.println("📊 Slave configurado na lista confiável");
         } else {
             Serial.println("📊 Informações atualizadas na lista confiável");
         }
+    } else {
+        xSemaphoreGive(trustedSlavesMutex);
     }
     
     // Chamar callback de device info se definido (para compatibilidade)
@@ -1115,37 +1306,23 @@ void MasterSlaveManager::processRelayStatusReceived(const uint8_t* senderMac, in
     }
     
     if (slave) {
-        slave->updateLastSeen();
-        slave->messagesReceived++;
-        slave->status = SlaveStatus::ONLINE; // ✅ CRÍTICO: Marcar como online cuando recibe mensaje
-        
-        // ⭐ POTENCIA MÁXIMA: Atualizar estado do relé remoto
+        slave->messagesReceived++;// ⭐ POTENCIA MÁXIMA: Atualizar estado do relé remoto
         if (relayNumber >= 0 && relayNumber < 8) {
-            // ✅ DEBUG: Log antes de atualizar
             bool oldState = slave->relayStates[relayNumber].state;
-            Serial.printf("🔄 [SLAVE] Atualizando relé %d do slave %s: %s → %s\n",
-                         relayNumber,
-                         ESPNowController::macToString(senderMac).c_str(),
-                         oldState ? "ON" : "OFF",
-                         state ? "ON" : "OFF");
+            if (!processingStatusResponse && oldState != state) {
+                Serial.printf("[ESPNOW] relay delta %s r%d %s→%s\n",
+                             ESPNowController::macToString(senderMac).c_str(),
+                             relayNumber,
+                             oldState ? "ON" : "OFF",
+                             state ? "ON" : "OFF");
+            }
             
             slave->relayStates[relayNumber].state = state;
             slave->relayStates[relayNumber].hasTimer = hasTimer;
             slave->relayStates[relayNumber].remainingTime = remainingTime;
             slave->relayStates[relayNumber].lastUpdate = millis();
             if (!name.isEmpty()) {
-                slave->relayStates[relayNumber].name = name;  // ✅ Armazenar nome do relé
-            }
-            
-            // ✅ DEBUG: Verificar se foi atualizado corretamente
-            if (slave->relayStates[relayNumber].state != state) {
-                Serial.printf("❌ [SLAVE] ERRO: Estado não foi atualizado! Esperado: %s, Atual: %s\n",
-                             state ? "ON" : "OFF",
-                             slave->relayStates[relayNumber].state ? "ON" : "OFF");
-            } else {
-                Serial.printf("✅ [SLAVE] Estado confirmado: relé %d = %s\n",
-                             relayNumber,
-                             slave->relayStates[relayNumber].state ? "ON" : "OFF");
+                slave->relayStates[relayNumber].name = name;
             }
             
             // ✅ CRÍTICO: Atualizar Supabase (fonte única de verdade)
@@ -1174,18 +1351,13 @@ void MasterSlaveManager::processRelayStatusReceived(const uint8_t* senderMac, in
         
         // Guardar deviceName para callback (antes de liberar mutex)
         String deviceName = slave->deviceName;
-        bool wasOfflineBefore = !slave->isOnline(); // ✅ Verificar si estaba offline antes
         
-        xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex ANTES de callbacks
-        
-        // ✅ CORREÇÃO CRÍTICA: Solo llamar slaveOnlineCallback si:
-        // 1. El slave estaba offline y ahora está online (cambio de estado)
-        // 2. NO estamos procesando un ALL_RELAYS_STATUS (para evitar spam)
-        if (slaveOnlineCallback && wasOfflineBefore && !processingStatusResponse) {
-            slaveOnlineCallback(senderMac, deviceName);
-        }
+        xSemaphoreGive(trustedSlavesMutex);
+
+        touchSlaveLink(senderMac, "all_relays_rx");
+        (void)deviceName;
     } else {
-        xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex se não encontrou
+        xSemaphoreGive(trustedSlavesMutex);
     }
     
     // Chamar callback se definido
@@ -1228,23 +1400,19 @@ void MasterSlaveManager::updateTrustedSlave(const uint8_t* macAddress, const Str
 }
 
 void MasterSlaveManager::checkSlaveStatus() {
-    // ✅ PROTEÇÃO MULTI-CORE: Lock mutex antes de modificar
-    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        Serial.println("⚠️ Timeout ao obter mutex em checkSlaveStatus()");
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return;
     }
     
-    unsigned long currentTime = millis();
-    const unsigned long offlineTimeout = 30000;  // 30 segundos
+    const unsigned long offlineTimeout = SLAVE_OFFLINE_TIMEOUT_MS;
     
     for (auto& slave : trustedSlaves) {
         if (slave.isOfflineTimeout(offlineTimeout)) {
             if (slave.status != SlaveStatus::OFFLINE) {
                 slave.status = SlaveStatus::OFFLINE;
-                Serial.println("🔴 Slave offline: " + ESPNowController::macToString(slave.macAddress) + 
-                              " (" + slave.deviceName + ")");
+                logSlaveLink("offline_mark", slave.macAddress,
+                             (long)slave.getTimeSinceLastSeen());
                 
-                // Chamar callback se definido
                 if (slaveOfflineCallback) {
                     slaveOfflineCallback(slave.macAddress, slave.deviceName);
                 }
@@ -1252,7 +1420,7 @@ void MasterSlaveManager::checkSlaveStatus() {
         }
     }
     
-    xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex
+    xSemaphoreGive(trustedSlavesMutex);
 }
 
 void MasterSlaveManager::cleanupExpiredAcks() {
@@ -1432,34 +1600,31 @@ void MasterSlaveManager::printTrustedSlaves() {
 }
 
 void MasterSlaveManager::cleanupOfflineSlaves() {
-    // ✅ PROTEÇÃO MULTI-CORE: Lock mutex antes de modificar
     if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         Serial.println("⚠️ Timeout ao obter mutex em cleanupOfflineSlaves()");
         return;
     }
     
-    Serial.println("🧹 Limpando Slaves offline...");
-    
-    int removedCount = 0;
-    for (auto it = trustedSlaves.begin(); it != trustedSlaves.end();) {
-        if (it->isOfflineTimeout(120000)) {  // 2 minutos offline
-            Serial.println("🗑️ Removendo Slave offline: " + ESPNowController::macToString(it->macAddress) + 
-                          " (" + it->deviceName + ")");
-            it = trustedSlaves.erase(it);
-            removedCount++;
-        } else {
-            ++it;
+    int offlineCount = 0;
+    for (const auto& slave : trustedSlaves) {
+        if (slave.isOfflineTimeout(120000)) {
+            offlineCount++;
         }
     }
     
-    Serial.println("✅ " + String(removedCount) + " Slaves offline removidos");
+    Serial.println("🧹 Slaves offline (>2min): " + String(offlineCount) + " — mantidos em trustedSlaves (use 'cleanup remove' manual se necessário)");
     
-    xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex
+    xSemaphoreGive(trustedSlavesMutex);
 }
 
 void MasterSlaveManager::rediscoverSlaves() {
     if (!espNowController) {
         Serial.println("❌ ESPNowController não inicializado");
+        return;
+    }
+
+    if (getTrustedSlaveCount() > 0 && getOnlineSlaveCount() >= getTrustedSlaveCount()) {
+        LOG_ESPNOW_DEBUG("Discovery skip: todos slaves online");
         return;
     }
     
@@ -1489,15 +1654,11 @@ void MasterSlaveManager::rediscoverSlaves() {
         }
     }
     
-    // ✅ PATRÓN MASTER-TASK: Enviar múltiplos broadcasts espaciados para garantir descoberta
-    Serial.println("📢 Enviando broadcasts de descoberta (padrão MASTER-TASK)...");
+    // ✅ PATRÓN MASTER-TASK: Enviar broadcasts espaciados (1 log INFO/ciclo)
+    LOG_ESPNOW_INFO("📢 Discovery: enviando 3 broadcasts ESP-NOW");
     for (int i = 0; i < 3; i++) {
         bool success = espNowController->sendDiscoveryBroadcast();
-        if (success) {
-            Serial.printf("   ✅ Broadcast %d/3 enviado\n", i + 1);
-        } else {
-            Serial.printf("   ❌ Falha ao enviar broadcast %d/3\n", i + 1);
-        }
+        LOG_ESPNOW_DEBUG(String("   Broadcast ") + (i + 1) + "/3: " + (success ? "OK" : "FALHA"));
         
         // ✅ Delay entre broadcasts (1.5s como no MASTER-TASK)
         // ✅ CORREÇÃO: Usar vTaskDelay() em vez de delay() para não bloquear outras tasks
@@ -1512,8 +1673,19 @@ void MasterSlaveManager::rediscoverSlaves() {
         }
     }
     
+#if DEBUG_ESPNOW
     Serial.println("⏳ Aguardando respostas dos Slaves...");
+#endif
 }
+
+#if DEBUG_ESPNOW
+static void formatRelayMask(const bool states[8], char* buf) {
+    for (int i = 0; i < 8; i++) {
+        buf[i] = states[i] ? 'T' : 'F';
+    }
+    buf[8] = '\0';
+}
+#endif
 
 // ===== 🔄 FASE 1: IMPLEMENTAÇÃO DO SISTEMA DE RETRY =====
 
@@ -1521,21 +1693,33 @@ uint32_t MasterSlaveManager::generateCommandId() {
     return ++commandIdCounter;
 }
 
-void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumber, const String& action, int duration, uint32_t commandId, int supabaseCommandId) {
+void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumber, const String& action,
+                                         int duration, uint32_t commandId, int supabaseCommandId,
+                                         bool waitingForAck, int cycleOffDuration,
+                                         const String& commandMode) {
     PendingRelayCommand cmd;
     memcpy(cmd.targetMac, targetMac, 6);
     cmd.relayNumber = relayNumber;
     cmd.action = action;
     cmd.duration = duration;
-    cmd.timestamp = millis();
-    cmd.nextRetry = millis() + RETRY_INTERVAL;  // Primeiro retry em 2s
+    cmd.cycleOffDuration = cycleOffDuration;
+    cmd.commandMode = commandMode;
+    cmd.enqueuedAt = millis();
+    cmd.ackWaitStartedAt = waitingForAck ? millis() : 0;
+    cmd.nextRetry = waitingForAck ? (millis() + 60000UL) : (millis() + RETRY_INTERVAL);
     cmd.retryCount = 0;
     cmd.commandId = commandId;
-    cmd.waitingForAck = false;
-    cmd.supabaseCommandId = supabaseCommandId;  // ✅ Guardar ID de Supabase
+    cmd.waitingForAck = waitingForAck;
+    cmd.supabaseCommandId = supabaseCommandId;
     
     pendingRelayCommands.push_back(cmd);
     
+    if (waitingForAck) {
+        Serial.printf("📋 [ACK-WAIT] ESP-NOW id=%u supabase=%d relay=%d %s\n",
+                      commandId, supabaseCommandId, relayNumber, action.c_str());
+        return;
+    }
+
     Serial.println("\n📋 ========================================");
     Serial.println("📋 COMANDO ADICIONADO À FILA DE RETRY");
     Serial.println("📋 ========================================");
@@ -1553,8 +1737,17 @@ void MasterSlaveManager::processRetryQueue() {
     unsigned long now = millis();
     
     for (auto it = pendingRelayCommands.begin(); it != pendingRelayCommands.end();) {
-        // Verificar se é hora de tentar novamente
-        if (now >= it->nextRetry && it->retryCount < MAX_RELAY_RETRIES) {
+        if (now >= it->nextRetry && it->retryCount < MAX_RELAY_RETRIES && !it->waitingForAck) {
+            if (hasInFlightForMac(it->targetMac)) {
+                ++it;
+                continue;
+            }
+            if (!canEspNowSendToMac(it->targetMac)) {
+                it->nextRetry = now + MIN_ESPNOW_SEND_GAP_MS;
+                ++it;
+                continue;
+            }
+
             Serial.println("\n🔄 ========================================");
             Serial.println("🔄 REINTENTANDO COMANDO");
             Serial.println("🔄 ========================================");
@@ -1564,18 +1757,21 @@ void MasterSlaveManager::processRetryQueue() {
             Serial.println("⚡ Ação: " + it->action);
             Serial.println("🔢 Tentativa: " + String(it->retryCount + 1) + "/" + String(MAX_RELAY_RETRIES));
             
-            // Tentar reenviar o comando
-            bool success = espNowController->sendRelayCommand(it->targetMac, it->relayNumber, it->action, it->duration);
+            String espAction = resolveSlaveEspAction(it->action, it->commandMode);
+            bool success = espNowController->sendRelayCommand(it->targetMac, it->relayNumber, espAction,
+                                                              it->duration, it->commandId,
+                                                              it->cycleOffDuration, it->commandMode);
             
             if (success) {
+                markEspNowSendToMac(it->targetMac);
                 Serial.println("✅ Reintento exitoso!");
                 Serial.println("⏳ Aguardando confirmação do Slave...");
                 Serial.println("========================================\n");
                 
-                // Marcar como aguardando ACK
                 it->waitingForAck = true;
+                it->ackWaitStartedAt = now;
                 it->retryCount++;
-                it->nextRetry = now + (RETRY_INTERVAL * it->retryCount);  // Backoff exponencial
+                it->nextRetry = now + (RETRY_INTERVAL * it->retryCount);
                 ++it;
             } else {
                 Serial.println("❌ Reintento falhou!");
@@ -1610,16 +1806,17 @@ void MasterSlaveManager::processRetryQueue() {
             }
         }
         // 🚨 CRÍTICO: Verificar timeout de 1 minuto (comandos acumulados por offline)
-        else if (now - it->timestamp > 30000) {  // 30 secs timeout
+        else if (!it->waitingForAck && (now - it->enqueuedAt > SLAVE_QUEUE_OFFLINE_TIMEOUT_MS)) {
+            long ageSec = (long)(now - it->enqueuedAt) / 1000L;
             Serial.println("\n⏰ ========================================");
-            Serial.println("⏰ TIMEOUT DE COMANDO (1 minuto)");
+            Serial.println("⏰ TIMEOUT DE COMANDO (60 segundos)");
             Serial.println("⏰ ========================================");
             Serial.println("🆔 Command ID: " + String(it->commandId));
             Serial.println("📡 Destino: " + ESPNowController::macToString(it->targetMac));
             Serial.println("🔌 Relé: " + String(it->relayNumber));
             Serial.println("⚡ Ação: " + it->action);
-            Serial.println("⏱️ Tempo em fila: " + String((now - it->timestamp) / 1000) + "s");
-            Serial.println("⚠️ Comando descartado por timeout (slave offline > 1 minuto)");
+            Serial.println("⏱️ Tempo em fila: " + String(ageSec) + "s");
+            Serial.println("⚠️ Comando descartado por timeout (slave offline > 60s)");
             
             // ✅ Marcar como failed en Supabase si viene de Supabase
             if (it->supabaseCommandId > 0 && supabaseCommandCallback) {
@@ -1640,24 +1837,43 @@ void MasterSlaveManager::processRetryQueue() {
             it = pendingRelayCommands.erase(it);
         }
         // Verificar timeout de ACK (se está esperando muito tempo por ACK)
-        else if (it->waitingForAck && (now - it->timestamp > 30000)) {  // 30 segundos timeout para ACK
+        else if (it->waitingForAck && it->ackWaitStartedAt > 0 &&
+                 (now - it->ackWaitStartedAt > ACK_WAIT_TIMEOUT_MS)) {
             Serial.println("\n⏰ ========================================");
             Serial.println("⏰ TIMEOUT DE ACK");
             Serial.println("⏰ ========================================");
             Serial.println("🆔 Command ID: " + String(it->commandId));
             Serial.println("📡 Destino: " + ESPNowController::macToString(it->targetMac));
-            Serial.println("⚠️ Comando descartado por timeout de ACK");
-            
-            // ✅ Marcar como failed en Supabase si viene de Supabase
-            if (it->supabaseCommandId > 0 && supabaseCommandCallback) {
-                String errorMsg = "Timeout esperando ACK del slave";
-                supabaseCommandCallback(it->supabaseCommandId, false, errorMsg);
-                Serial.println("📤 Comando marcado como FAILED en Supabase (ID: " + String(it->supabaseCommandId) + ")");
+
+            TrustedSlave* slave = getTrustedSlave(it->targetMac);
+            bool hardwareOk = false;
+            if (slave && it->relayNumber >= 0 && it->relayNumber < slave->numRelays) {
+                const bool actualOn = slave->relayStates[it->relayNumber].state;
+                const bool expectedOn = (it->action == "on" || it->action == "on_forever");
+                hardwareOk = (actualOn == expectedOn);
             }
-            
-            Serial.println("========================================\n");
-            
-            it = pendingRelayCommands.erase(it);
+
+            if (hardwareOk) {
+                Serial.println("ℹ️ Hardware confirma estado — omitindo failed (ALL_RELAYS/estado real)");
+                if (it->supabaseCommandId > 0 && slaveCommandResolvedCallback) {
+                    const bool expectedOn = (it->action == "on" || it->action == "on_forever");
+                    slaveCommandResolvedCallback(it->supabaseCommandId, it->commandId, it->targetMac,
+                                                 it->relayNumber, expectedOn);
+                }
+                Serial.println("========================================\n");
+                it = pendingRelayCommands.erase(it);
+            } else {
+                Serial.println("⚠️ Comando descartado por timeout de ACK");
+
+                if (it->supabaseCommandId > 0 && supabaseCommandCallback) {
+                    String errorMsg = "Timeout esperando ACK del slave";
+                    supabaseCommandCallback(it->supabaseCommandId, false, errorMsg);
+                    Serial.println("📤 Comando marcado como FAILED en Supabase (ID: " + String(it->supabaseCommandId) + ")");
+                }
+
+                Serial.println("========================================\n");
+                it = pendingRelayCommands.erase(it);
+            }
         }
         else {
             ++it;
@@ -1665,7 +1881,7 @@ void MasterSlaveManager::processRetryQueue() {
     }
 }
 
-void MasterSlaveManager::removeFromRetryQueue(uint32_t commandId, bool currentState) {
+void MasterSlaveManager::removeFromRetryQueue(uint32_t commandId, bool currentState, bool notifySupabase) {
     for (auto it = pendingRelayCommands.begin(); it != pendingRelayCommands.end(); ++it) {
         if (it->commandId == commandId) {
             Serial.println("\n✅ ========================================");
@@ -1678,10 +1894,7 @@ void MasterSlaveManager::removeFromRetryQueue(uint32_t commandId, bool currentSt
             Serial.println("💡 Estado final: " + String(currentState ? "ON" : "OFF"));
             Serial.println("🎯 Removido da fila de retry");
             
-            // ✅ NOVO: Marcar como completed en Supabase com currentState
-            if (it->supabaseCommandId > 0 && supabaseCommandCallback) {
-                // ✅ Callback precisa ser atualizado para receber currentState
-                // Por enquanto, passar currentState via string no errorMessage (temporário)
+            if (it->supabaseCommandId > 0 && supabaseCommandCallback && notifySupabase) {
                 String stateStr = currentState ? "true" : "false";
                 supabaseCommandCallback(it->supabaseCommandId, true, stateStr);
                 Serial.println("📤 Comando marcado como COMPLETED en Supabase (ID: " + String(it->supabaseCommandId) + ", state: " + stateStr + ")");
@@ -1699,70 +1912,22 @@ void MasterSlaveManager::removeFromRetryQueue(uint32_t commandId, bool currentSt
 void MasterSlaveManager::sendPendingCommandsToSlave(const uint8_t* macAddress) {
     if (!initialized || !espNowController) return;
     
-    // Contar comandos pendentes para este slave
     int pendingCount = 0;
-    for (const auto& cmd : pendingRelayCommands) {
-        if (memcmp(cmd.targetMac, macAddress, 6) == 0) {
+    unsigned long now = millis();
+    for (auto& cmd : pendingRelayCommands) {
+        if (memcmp(cmd.targetMac, macAddress, 6) == 0 && !cmd.waitingForAck) {
             pendingCount++;
+            cmd.retryCount = 0;
+            cmd.nextRetry = now + 100;
         }
     }
     
     if (pendingCount == 0) {
-        Serial.println("✅ Nenhum comando pendente para este slave");
-        Serial.println("========================================\n");
         return;
     }
-    
-    Serial.println("📋 Comandos pendentes encontrados: " + String(pendingCount));
-    Serial.println("📡 Destino: " + ESPNowController::macToString(macAddress));
-    Serial.println("🚀 Enviando comandos em lote...");
-    Serial.println("========================================\n");
-    
-    // Enviar todos os comandos pendentes para este slave
-    int sentCount = 0;
-    int failedCount = 0;
-    
-    for (auto it = pendingRelayCommands.begin(); it != pendingRelayCommands.end();) {
-        if (memcmp(it->targetMac, macAddress, 6) == 0) {
-            Serial.println("📤 Enviando comando pendente:");
-            Serial.println("   🆔 Command ID: " + String(it->commandId));
-            Serial.println("   🔌 Relé: " + String(it->relayNumber));
-            Serial.println("   ⚡ Ação: " + it->action);
-            if (it->duration > 0) {
-                Serial.println("   ⏱️ Duração: " + String(it->duration) + "s");
-            }
-            
-            // Resetar contador de retry para dar nova chance
-            it->retryCount = 0;
-            it->nextRetry = millis() + 100; // Enviar imediatamente (100ms)
-            it->waitingForAck = false;
-            
-            // Tentar enviar
-            bool success = espNowController->sendRelayCommand(it->targetMac, it->relayNumber, it->action, it->duration);
-            
-            if (success) {
-                sentCount++;
-                Serial.println("   ✅ Comando enviado com sucesso!");
-                it->waitingForAck = true;
-                it->timestamp = millis();
-                ++it;
-            } else {
-                failedCount++;
-                Serial.println("   ❌ Falha ao enviar comando - permanecerá na fila");
-                ++it;
-            }
-            
-            delay(50); // Pequeno delay entre comandos para não sobrecarregar
-        } else {
-            ++it;
-        }
-    }
-    
-    Serial.println("\n📊 Resumo do envio em lote:");
-    Serial.println("   ✅ Enviados: " + String(sentCount));
-    Serial.println("   ❌ Falhas: " + String(failedCount));
-    Serial.println("   📋 Total pendente: " + String(pendingCount));
-    Serial.println("========================================\n");
+
+    Serial.printf("[SLAVE-LINK] event=pending_drain mac=%s count=%d\n",
+                  ESPNowController::macToString(macAddress).c_str(), pendingCount);
 }
 
 // ===== 🔄 FASE 2: PROCESSAMENTO DE ACKs DE RELAY =====
@@ -1812,9 +1977,8 @@ void MasterSlaveManager::processRelayCommandAck(const RelayCommandAck& ack, cons
     // 🎯 CRITICAL: Remover comando da fila de retry
     if (ack.success) {
         Serial.println("\n🔄 Removendo comando da fila de retry...");
-        // ✅ NOVO: Passar currentState do ACK
         bool currentState = (ack.currentState == 1);
-        removeFromRetryQueue(ack.commandId, currentState);
+        removeFromRetryQueue(ack.commandId, currentState, false);
         Serial.println("✅ Comando removido - retry cancelado!");
     } else {
         Serial.println("\n⚠️ Comando falhou no Slave");
@@ -2370,6 +2534,78 @@ bool MasterSlaveManager::loadSlaveRelayStatesFromNVS() {
     }
     
     return loadedCount > 0;
+}
+
+bool MasterSlaveManager::saveTrustedPeersToNVS() {
+    TrustedPeersCache cache = {};
+    cache.timestamp = millis();
+    cache.version = 1;
+
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
+
+    cache.numPeers = trustedSlaves.size() > 8 ? 8 : static_cast<uint8_t>(trustedSlaves.size());
+    for (uint8_t i = 0; i < cache.numPeers; i++) {
+        memcpy(cache.peers[i].mac, trustedSlaves[i].macAddress, 6);
+        strncpy(cache.peers[i].deviceName, trustedSlaves[i].deviceName.c_str(), sizeof(cache.peers[i].deviceName) - 1);
+        String deviceId = "ESP32_SLAVE_" + ESPNowController::macToString(trustedSlaves[i].macAddress);
+        deviceId.replace(":", "_");
+        strncpy(cache.peers[i].deviceId, deviceId.c_str(), sizeof(cache.peers[i].deviceId) - 1);
+    }
+    xSemaphoreGive(trustedSlavesMutex);
+
+    uint8_t checksum = 0;
+    uint8_t* data = reinterpret_cast<uint8_t*>(&cache);
+    for (size_t i = 0; i < sizeof(TrustedPeersCache) - 1; i++) {
+        checksum ^= data[i];
+    }
+    cache.checksum = checksum;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("hidro_state", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+    err = nvs_set_blob(handle, "trusted_peers", &cache, sizeof(TrustedPeersCache));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+bool MasterSlaveManager::loadTrustedPeersFromNVS() {
+    TrustedPeersCache cache = {};
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("hidro_state", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    size_t required = sizeof(TrustedPeersCache);
+    err = nvs_get_blob(handle, "trusted_peers", &cache, &required);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    uint8_t checksum = 0;
+    uint8_t* data = reinterpret_cast<uint8_t*>(&cache);
+    for (size_t i = 0; i < sizeof(TrustedPeersCache) - 1; i++) {
+        checksum ^= data[i];
+    }
+    if (checksum != cache.checksum || cache.numPeers == 0) {
+        return false;
+    }
+
+    int restored = 0;
+    for (uint8_t i = 0; i < cache.numPeers && i < 8; i++) {
+        if (addTrustedSlave(cache.peers[i].mac, String(cache.peers[i].deviceName), "RelayCommandBox")) {
+            restored++;
+        }
+    }
+    return restored > 0;
 }
 
 void MasterSlaveManager::validateCachedStates() {

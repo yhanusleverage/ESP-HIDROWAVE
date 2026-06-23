@@ -104,6 +104,15 @@ bool DeviceRegistration::registerDeviceWithEmail(const String& email, const Stri
                 Serial.println("🔄 reboot_count na BD zerado (novo ciclo no portal)");
             }
             return true;
+        } else if (response.indexOf("\"success\": true") >= 0 ||
+                   response.indexOf("\"success\":true") >= 0) {
+            // JSON malformado no RPC mas registro OK (ex.: ""user_email" typo no payload)
+            isRegistered = true;
+            userEmail = normalizedEmail;
+            Serial.println("🎉 Dispositivo registrado com sucesso! (parse fallback — JSON RPC malformado)");
+            Serial.println("👤 Email pedido: " + normalizedEmail);
+            Serial.println("🆔 Device ID: " + deviceId);
+            return true;
         } else {
             lastError = doc["message"].as<String>();
             if (lastError.isEmpty()) lastError = "Erro na resposta do servidor";

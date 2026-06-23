@@ -158,4 +158,20 @@ struct SlaveRelayStatesCache {
     uint8_t checksum;                // Checksum para validação
 } __attribute__((packed));
 
+// ===== TRUSTED PEERS (MASTER NVS) =====
+struct TrustedPeerEntry {
+    uint8_t mac[6];
+    char deviceName[32];
+    char deviceId[40];
+} __attribute__((packed));
+
+struct TrustedPeersCache {
+    uint32_t timestamp;
+    uint8_t version;
+    uint8_t numPeers;
+    uint8_t padding[2];
+    TrustedPeerEntry peers[8];
+    uint8_t checksum;
+} __attribute__((packed));
+
 #endif // ESPNOW_TYPES_H

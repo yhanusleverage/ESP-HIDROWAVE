@@ -54,6 +54,24 @@
 #ifndef MQTT_HEALTH_ONLY
 #define MQTT_HEALTH_ONLY 0
 #endif
+// 1 = cierre command_ack + relay/state via MQTT → bridge Node (sem HTTPS no hot path)
+#ifndef MQTT_COMMAND_BRIDGE_ONLY
+#define MQTT_COMMAND_BRIDGE_ONLY 1
+#endif
+// 1 = nao poll get_and_lock se MQTT conectado >60s
+#ifndef COMMAND_POLL_DISABLED_IF_MQTT_OK
+#define COMMAND_POLL_DISABLED_IF_MQTT_OK 1
+#endif
+// 1 = nao sync HTTPS relay_master/slaves periodico se MQTT OK
+#ifndef RELAY_HTTPS_SYNC_DISABLED_IF_MQTT_OK
+#define RELAY_HTTPS_SYNC_DISABLED_IF_MQTT_OK 1
+#endif
+#ifndef MQTT_COMMAND_PATH_STABLE_MS
+#define MQTT_COMMAND_PATH_STABLE_MS 60000UL
+#endif
+#ifndef CONFIG_POLL_INTERVAL_MQTT_OK_MS
+#define CONFIG_POLL_INTERVAL_MQTT_OK_MS 300000UL
+#endif
 #endif
 
 // ===== CONFIGURAÇÕES DA API =====
@@ -100,6 +118,11 @@
 #define PEER_OFFLINE_TIMEOUT 60000          // Timeout para considerar peer offline (60s)
 #define DISCOVERY_INTERVAL_MS 30000         // Intervalo de descoberta (30 segundos)
 #define STATUS_BROADCAST_INTERVAL 30000    // Intervalo de broadcast de status (30s)
+
+// Master STA+ESP-NOW: no cambiar canal WiFi dinámicamente (evita peer channel mismatch)
+#ifndef ESPNOW_LOCK_WIFI_CHANNEL
+#define ESPNOW_LOCK_WIFI_CHANNEL 1
+#endif
 
 // ===== CONFIGURAÇÕES DE ROBUSTEZ ESP-NOW =====
 #define MAX_RETRY_ATTEMPTS 3                // Máximo de tentativas de retry

@@ -66,7 +66,10 @@ struct RelayCommandData {
     int relayNumber;           // Número do relé (0-7)
     bool state;               // Estado desejado
     int duration;             // Duração em segundos (0 = sem timer)
-    char action[12];          // "on", "off", "toggle", "status"
+    char action[12];          // "on", "off", "toggle", "status", "timed_on", "cycle", ...
+    uint32_t commandId;       // ID do comando (master) para ACK
+    int cycleOffDuration;     // OFF seconds for cycle mode (0 = not cycle)
+    char mode[12];            // "instant","timed_on","timed_off","cycle","cycle_stop"
 } __attribute__((packed));
 
 #ifndef RELAY_STATUS_DATA_DEFINED
@@ -205,7 +208,13 @@ public:
      * @param duration Duração em segundos (0 = sem timer)
      * @return true se mensagem foi enviada
      */
-    bool sendRelayCommand(const uint8_t* targetMac, int relayNumber, const String& action, int duration = 0);
+    bool sendRelayCommand(const uint8_t* targetMac, int relayNumber, const String& action, int duration = 0,
+                          uint32_t commandId = 0, int cycleOffDuration = 0, const String& mode = "");
+
+    /**
+     * @brief Envia ACK de comando de relé (slave → master, formato TaskESPNowMessage)
+     */
+    bool sendRelayCommandAck(const uint8_t* targetMac, const RelayCommandAck& ack);
     
     /**
      * @brief Envia status de relé
@@ -260,6 +269,17 @@ public:
      * @return true se broadcast foi enviado
      */
     bool sendDiscoveryBroadcast();
+
+    /**
+     * @brief Escaneia canais WiFi e sincroniza com o Master (modo Slave sem WiFi STA)
+     * @return true se Master foi detectado num canal
+     */
+    bool scanAndSyncToMasterChannel();
+
+    /**
+     * @brief Indica se houve contacto recente com o Master
+     */
+    bool hasRecentMasterContact() const;
     
     /**
      * @brief Envia credenciais WiFi em broadcast para todos os dispositivos
@@ -380,7 +400,14 @@ public:
      * @brief Define callback para comandos de relé recebidos
      * @param callback Função a ser chamada
      */
-    void setRelayCommandCallback(std::function<void(const uint8_t* senderMac, int relayNumber, const String& action, int duration)> callback);
+    void setRelayCommandCallback(std::function<void(const uint8_t* senderMac, uint32_t commandId, int relayNumber,
+                                                    const String& action, int duration, const String& mode,
+                                                    int cycleOffDuration)> callback);
+
+    /**
+     * @brief Callback para sincronização de estados persistentes (PERSISTENT_STATE_SYNC)
+     */
+    void setPersistentStateCallback(std::function<void(const uint8_t* senderMac, const PersistentRelayStateData& states)> callback);
     
     /**
      * @brief Define callback para status de relé recebido
@@ -399,6 +426,11 @@ public:
      * @param callback Função a ser chamada
      */
     void setPingCallback(void (*callback)(const uint8_t* senderMac));
+
+    /**
+     * @brief Define callback para PONG recebido (master respondeu ao ping do slave)
+     */
+    void setPongCallback(void (*callback)(const uint8_t* senderMac));
     
     /**
      * @brief Define callback para credenciais WiFi recebidas
@@ -507,15 +539,35 @@ private:
     uint32_t messagesReceived;
     uint32_t messagesLost;
     uint32_t lastMessageId;
+
+    // Anti-replay local (messageId por remetente — não depende de millis() cross-device)
+    struct RecentSenderEntry {
+        uint8_t mac[6];
+        uint32_t lastMessageId;
+        unsigned long lastSeenMs;
+    };
+    static const size_t MAX_RECENT_SENDERS = 12;
+    RecentSenderEntry recentSenders[MAX_RECENT_SENDERS];
+    size_t recentSenderCount;
+
+    unsigned long lastMasterContactMs;
+    bool masterContactEstablished;
+
+    bool isDuplicateMessage(const ESPNowMessage& message);
+    void recordMessageId(const ESPNowMessage& message);
+    bool setWifiChannel(uint8_t channel);
     
     // Lista de peers conhecidos
     std::vector<PeerInfo> knownPeers;
     
     // Callbacks
-    std::function<void(const uint8_t* senderMac, int relayNumber, const String& action, int duration)> relayCommandCallback = nullptr;
+    std::function<void(const uint8_t* senderMac, uint32_t commandId, int relayNumber, const String& action,
+                       int duration, const String& mode, int cycleOffDuration)> relayCommandCallback = nullptr;
+    std::function<void(const uint8_t* senderMac, const PersistentRelayStateData& states)> persistentStateCallback = nullptr;
     std::function<void(const uint8_t* senderMac, int relayNumber, bool state, bool hasTimer, int remainingTime, const String& name)> relayStatusCallback = nullptr;
      std::function<void(const uint8_t* senderMac, const String& deviceName, const String& deviceType, uint8_t numRelays, bool operational, uint8_t wifiChannel)> deviceInfoCallback = nullptr;
     void (*pingCallback)(const uint8_t* senderMac) = nullptr;
+    void (*pongCallback)(const uint8_t* senderMac) = nullptr;
     void (*errorCallback)(const String& error) = nullptr;
     void (*wifiCredentialsCallback)(const String& ssid, const String& password, uint8_t channel) = nullptr;
     void (*handshakeCallback)(const uint8_t* senderMac, uint32_t sessionId, const String& deviceName, bool wifiConnected) = nullptr;
@@ -536,7 +588,7 @@ private:
      * @param message Mensagem para validar
      * @return true se mensagem é válida
      */
-    bool validateMessage(const ESPNowMessage& message);
+    bool validateMessage(const ESPNowMessage& message, const uint8_t* senderMac = nullptr);
     
     /**
      * @brief Atualiza informações do peer

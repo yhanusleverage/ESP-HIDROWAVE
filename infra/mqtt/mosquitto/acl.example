@@ -14,15 +14,17 @@ topic read hidrowave/+/ph_dose
 topic read hidrowave/+/ec_metric
 topic read hidrowave/+/ph_metric
 topic read hidrowave/+/ec_dilution
+topic read hidrowave/+/command_ack
 topic read hidrowave/+/relay/state
 
-# --- UI / Railway publish (Fase 3 comandos — NÃO é bridge_internal) ---
+# --- UI / Railway publish (Fase 3 — wildcard, qualquer master) ---
 user hidrowave
 topic write hidrowave/+/command
 topic read hidrowave/+/#
 
-# --- Um ESP (substituir XXXXXX pelo sufixo MAC) ---
-user mqtt_ESP32_HIDRO_XXXXXX
-topic read hidrowave/ESP32_HIDRO_XXXXXX/command
-topic write hidrowave/ESP32_HIDRO_XXXXXX/#
+# --- Master ESP produção (MAC EC:E3:34:1A:57:5C) ---
+# Provisionar: sudo bash align-broker-production.sh ESP32_HIDRO_1A575C 'SENHA'
+user mqtt_ESP32_HIDRO_1A575C
+topic read hidrowave/ESP32_HIDRO_1A575C/command
+topic write hidrowave/ESP32_HIDRO_1A575C/#
 

@@ -1,0 +1,25 @@
+# Canonical ACL — HIDROWAVE production (Lightsail)
+# Path: /var/lib/mosquitto/acl
+# Apply: sudo bash align-broker-production.sh
+
+# --- Bridge Node (read ESP → Supabase) ---
+user bridge_internal
+topic read hidrowave/+/telemetry
+topic read hidrowave/+/heartbeat
+topic read hidrowave/+/status
+topic read hidrowave/+/ec_operation
+topic read hidrowave/+/dose
+topic read hidrowave/+/ph_operation
+topic read hidrowave/+/ph_dose
+topic read hidrowave/+/ec_metric
+topic read hidrowave/+/ph_metric
+topic read hidrowave/+/ec_dilution
+topic read hidrowave/+/command_ack
+topic read hidrowave/+/relay/state
+
+# --- Railway / UI publish (comandos — qualquer master) ---
+user hidrowave
+topic write hidrowave/+/command
+topic read hidrowave/+/#
+
+# --- Master ESP (bloco injetado por align-broker-production.sh) ---

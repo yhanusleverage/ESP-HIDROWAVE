@@ -115,6 +115,36 @@ struct MqttPhMetricReading {
     const char* sequenceId;
 };
 
+/** hidrowave/{id}/command_ack — bridge → complete_relay_command */
+struct MqttCommandAckReading {
+    int commandId;
+    const char* status;
+    int relayIndex;
+    const char* action;
+    bool currentState;
+    const char* slaveMac;
+    const bool* relayStates;
+    uint8_t numRelayStates;
+    uint32_t espnowId;
+};
+
+/** hidrowave/{id}/relay/state — doc mqtt/04 §3.4 */
+struct MqttRelayStateReading {
+    const bool* masterStates;
+    uint8_t masterCount;
+    const char* slaveMac;
+    const bool* slaveStates;
+    const bool* slaveHasTimers;
+    const int* slaveRemainingTimes;
+    uint8_t slaveCount;
+    bool linkOnline;
+    uint16_t linkLastSeenS;
+    bool heartbeat;
+    bool hasLinkMeta;
+    /** Heartbeat link-only: omit relay_states[] so cloud cache is not overwritten */
+    bool omitRelayStates;
+};
+
 typedef void (*MqttCommandPayloadHandler)(const char* payload, size_t length, void* userData);
 
 #if ENABLE_MQTT
@@ -139,6 +169,8 @@ public:
     bool publishPhDose(const MqttPhDoseReading& reading);
     bool publishEcMetric(const MqttEcMetricReading& reading);
     bool publishPhMetric(const MqttPhMetricReading& reading);
+    bool publishCommandAck(const MqttCommandAckReading& reading);
+    bool publishRelayState(const MqttRelayStateReading& reading);
 
     void setCommandHandler(MqttCommandPayloadHandler handler, void* userData);
 
@@ -157,6 +189,8 @@ private:
     String ecMetricTopic;
     String phMetricTopic;
     String ecDilutionTopic;
+    String commandAckTopic;
+    String relayStateTopic;
     char lwtPayload[128];
     unsigned long lastReconnectAttempt;
     unsigned long reconnectIntervalMs;
@@ -187,6 +221,8 @@ public:
     bool publishPhDose(const MqttPhDoseReading&) { return false; }
     bool publishEcMetric(const MqttEcMetricReading&) { return false; }
     bool publishPhMetric(const MqttPhMetricReading&) { return false; }
+    bool publishCommandAck(const MqttCommandAckReading&) { return false; }
+    bool publishRelayState(const MqttRelayStateReading&) { return false; }
     void setCommandHandler(MqttCommandPayloadHandler, void*) {}
 };
 
