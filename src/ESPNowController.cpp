@@ -1243,11 +1243,27 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
                                  slave->deviceName.startsWith("Slave-") || 
                                  slave->deviceName == "Unknown";
                 
+                addPeerSafe(senderMac, "Auto-" + macToString(senderMac).substring(12));
+                
                 if (needsInfo) {
-                    Serial.println("📋 Broadcast de slave - solicitando DEVICE_INFO para obtener nombre real...");
-                    delay(100);
+                    Serial.println("📋 Broadcast slave — handshake + PONG + DEVICE_INFO...");
+                    delay(50);
                     MasterSlaveManager::getInstance()->requestSlaveInfo(senderMac);
                 }
+                
+                // PONG unicast acelera discovery multi-canal do slave
+                ESPNowMessage pongMsg = {};
+                pongMsg.type = MessageType::PONG;
+                getLocalMac(pongMsg.senderId);
+                memcpy(pongMsg.targetId, senderMac, 6);
+                pongMsg.messageId = ++messageCounter;
+                pongMsg.timestamp = millis();
+                pongMsg.dataSize = 0;
+                pongMsg.checksum = calculateChecksum(pongMsg);
+                sendMessage(pongMsg, senderMac);
+                
+                delay(50);
+                sendDeviceInfo(senderMac, deviceName, 8, true, millis(), ESP.getFreeHeap());
             }
             #endif
             break;
