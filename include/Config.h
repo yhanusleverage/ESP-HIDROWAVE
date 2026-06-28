@@ -124,6 +124,11 @@
 #define ESPNOW_LOCK_WIFI_CHANNEL 1
 #endif
 
+/** Bancada: canal esperado del slave (debe coincidir con WiFi.channel() del router) */
+#ifndef ESPNOW_FIXED_CHANNEL
+#define ESPNOW_FIXED_CHANNEL 11
+#endif
+
 // ===== CONFIGURAÇÕES DE ROBUSTEZ ESP-NOW =====
 #define MAX_RETRY_ATTEMPTS 3                // Máximo de tentativas de retry
 #define RETRY_DELAY_MS 1000                 // Delay entre tentativas (1 segundo)

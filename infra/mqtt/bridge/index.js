@@ -1630,6 +1630,7 @@ async function patchRelaySlaveFromMqtt(row) {
   };
   if (row.relayHasTimers) patch.relay_has_timers = row.relayHasTimers;
   if (row.relayRemainingTimes) patch.relay_remaining_times = row.relayRemainingTimes;
+  // relay_names nunca incluido — UI es fuente de verdad; upsert solo estados/timers
 
   const { error } = await supabase.from('relay_slaves').upsert(patch, { onConflict: 'device_id' });
   if (error) {

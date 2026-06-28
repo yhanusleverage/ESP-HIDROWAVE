@@ -142,6 +142,8 @@ HydroControl::HydroControl()
     dilutionEcBefore = NAN;
     ecDilutionCallback = nullptr;
     ecDilutionCallbackUserData = nullptr;
+    dilutionSlaveRelayCallback = nullptr;
+    dilutionSlaveRelayCallbackUserData = nullptr;
 }
 
 /**
@@ -2395,6 +2397,26 @@ void HydroControl::setDilutionRelays(int drainRelay, int fillRelay) {
     }
 }
 
+void HydroControl::setDilutionSlaveRelays(const String& drainMac, int drainRelay,
+                                          const String& fillMac, int fillRelay) {
+    setDilutionRelays(drainRelay, fillRelay);
+    dilutionDrainSlaveMac = drainMac;
+    dilutionFillSlaveMac = fillMac;
+    if (drainMac.length() > 0) {
+        PreferencesManager::saveConfig("dil_drainMac", drainMac);
+    }
+    if (fillMac.length() > 0) {
+        PreferencesManager::saveConfig("dil_fillMac", fillMac);
+    }
+    Serial.printf("[DILUTION] slave drain %s r%d | fill %s r%d\n",
+                  drainMac.c_str(), drainRelay, fillMac.c_str(), fillRelay);
+}
+
+void HydroControl::setDilutionSlaveRelayCallback(DilutionSlaveRelayCallback cb, void* userData) {
+    dilutionSlaveRelayCallback = cb;
+    dilutionSlaveRelayCallbackUserData = userData;
+}
+
 void HydroControl::setDilutionMaxVolumeL(float maxL) {
     if (maxL > 0.0f) {
         dilutionMaxVolumeL = maxL;
@@ -2422,6 +2444,28 @@ void HydroControl::setEcDilutionCallback(EcDilutionCallback cb, void* userData) 
 }
 
 void HydroControl::setDilutionRelay(int relayIndex, bool on) {
+    auto invokeSlave = [&](const String& mac) -> bool {
+        if (mac.length() == 0 || !dilutionSlaveRelayCallback) {
+            return false;
+        }
+        unsigned int b0, b1, b2, b3, b4, b5;
+        if (sscanf(mac.c_str(), "%x:%x:%x:%x:%x:%x", &b0, &b1, &b2, &b3, &b4, &b5) != 6) {
+            return false;
+        }
+        uint8_t macBytes[6] = {
+            (uint8_t)b0, (uint8_t)b1, (uint8_t)b2, (uint8_t)b3, (uint8_t)b4, (uint8_t)b5
+        };
+        dilutionSlaveRelayCallback(macBytes, relayIndex, on, dilutionSlaveRelayCallbackUserData);
+        return true;
+    };
+
+    if (relayIndex == dilutionDrainRelay && invokeSlave(dilutionDrainSlaveMac)) {
+        return;
+    }
+    if (relayIndex == dilutionFillRelay && invokeSlave(dilutionFillSlaveMac)) {
+        return;
+    }
+
     if (relayIndex < 0 || relayIndex >= 8 || !pcf2_ok) {
         return;
     }
@@ -2444,6 +2488,10 @@ bool HydroControl::startEcDilution(float volumeLiters, const char* source) {
     }
     if (dilutionDrainRelay < 0 || dilutionFillRelay < 0) {
         Serial.println("[DILUTION] relés dreno/llenado no configurados");
+        return false;
+    }
+    if (dilutionDrainSlaveMac.length() == 0 || dilutionFillSlaveMac.length() == 0) {
+        Serial.println("[DILUTION] MAC slave dreno/reposição não configurado");
         return false;
     }
     if (currentState != IDLE || dilutionState != DILUTION_IDLE) {

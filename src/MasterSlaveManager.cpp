@@ -37,6 +37,11 @@ MasterSlaveManager::MasterSlaveManager(ESPNowController* espNowController)
     } else {
         Serial.println("✅ Mutex criado para proteção multi-core");
     }
+
+    pendingRelayCommandsMutex = xSemaphoreCreateMutex();
+    if (pendingRelayCommandsMutex == NULL) {
+        Serial.println("❌ Erro ao criar mutex para pendingRelayCommands!");
+    }
 }
 
 bool MasterSlaveManager::begin() {
@@ -670,6 +675,9 @@ void MasterSlaveManager::notifyAllRelaysStatusReceived(const uint8_t* senderMac,
     if (allRelaysStatusSem != nullptr) {
         xSemaphoreGive(allRelaysStatusSem);
     }
+    if (senderMac) {
+        touchSlaveLink(senderMac, "all_relays_rx");
+    }
     if (allRelaysSnapshotCallback && senderMac && relayStates && numRelays > 0) {
         allRelaysSnapshotCallback(senderMac, relayStates, numRelays);
     }
@@ -785,7 +793,7 @@ void MasterSlaveManager::logSlaveLink(const char* event, const uint8_t* mac, lon
     Serial.printf("[SLAVE-LINK] event=%s mac=%s queue=%u heap=%u",
                   event,
                   macBuf.c_str(),
-                  (unsigned)pendingRelayCommands.size(),
+                  (unsigned)getPendingRelayCommandCount(),
                   (unsigned)ESP.getFreeHeap());
     if (lastSeenDeltaMs >= 0) {
         Serial.printf(" last_seen_delta_ms=%ld", lastSeenDeltaMs);
@@ -831,11 +839,16 @@ bool MasterSlaveManager::readSlaveRelaySnapshot(const uint8_t* macAddress, bool 
 
 bool MasterSlaveManager::hasInFlightForMac(const uint8_t* mac) const {
     if (!mac) return false;
+    if (!lockPendingQueue(pdMS_TO_TICKS(100))) {
+        return false;
+    }
     for (const auto& cmd : pendingRelayCommands) {
         if (cmd.waitingForAck && memcmp(cmd.targetMac, mac, 6) == 0) {
+            unlockPendingQueue();
             return true;
         }
     }
+    unlockPendingQueue();
     return false;
 }
 
@@ -1354,7 +1367,9 @@ void MasterSlaveManager::processRelayStatusReceived(const uint8_t* senderMac, in
         
         xSemaphoreGive(trustedSlavesMutex);
 
-        touchSlaveLink(senderMac, "all_relays_rx");
+        if (!processingStatusResponse) {
+            touchSlaveLink(senderMac, "relay_status_rx");
+        }
         (void)deviceName;
     } else {
         xSemaphoreGive(trustedSlavesMutex);
@@ -1689,6 +1704,26 @@ static void formatRelayMask(const bool states[8], char* buf) {
 
 // ===== 🔄 FASE 1: IMPLEMENTAÇÃO DO SISTEMA DE RETRY =====
 
+bool MasterSlaveManager::lockPendingQueue(TickType_t timeout) const {
+    if (!pendingRelayCommandsMutex) return true;
+    return xSemaphoreTake(pendingRelayCommandsMutex, timeout) == pdTRUE;
+}
+
+void MasterSlaveManager::unlockPendingQueue() const {
+    if (pendingRelayCommandsMutex) {
+        xSemaphoreGive(pendingRelayCommandsMutex);
+    }
+}
+
+size_t MasterSlaveManager::getPendingRelayCommandCount() const {
+    if (!lockPendingQueue(pdMS_TO_TICKS(50))) {
+        return 0;
+    }
+    size_t n = pendingRelayCommands.size();
+    unlockPendingQueue();
+    return n;
+}
+
 uint32_t MasterSlaveManager::generateCommandId() {
     return ++commandIdCounter;
 }
@@ -1711,8 +1746,70 @@ void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumb
     cmd.commandId = commandId;
     cmd.waitingForAck = waitingForAck;
     cmd.supabaseCommandId = supabaseCommandId;
-    
+
+    if (!lockPendingQueue()) {
+        Serial.println("❌ addToRetryQueue: mutex timeout");
+        return;
+    }
+
+    for (auto& existing : pendingRelayCommands) {
+        if (memcmp(existing.targetMac, targetMac, 6) != 0 || existing.relayNumber != relayNumber) {
+            continue;
+        }
+        existing.action = action;
+        existing.duration = duration;
+        existing.cycleOffDuration = cycleOffDuration;
+        existing.commandMode = commandMode;
+        existing.commandId = commandId;
+        existing.supabaseCommandId = supabaseCommandId;
+        existing.enqueuedAt = millis();
+        if (waitingForAck) {
+            existing.waitingForAck = true;
+            existing.ackWaitStartedAt = millis();
+            existing.nextRetry = millis() + 60000UL;
+        } else if (!existing.waitingForAck) {
+            existing.nextRetry = millis() + RETRY_INTERVAL;
+            existing.retryCount = 0;
+        }
+        unlockPendingQueue();
+        Serial.printf("📋 [QUEUE] coalesce relay=%d esp=%u supabase=%d\n",
+                      relayNumber, commandId, supabaseCommandId);
+        return;
+    }
+
+    while (pendingRelayCommands.size() >= MAX_PENDING_RELAY_COMMANDS) {
+        size_t victimIdx = 0;
+        unsigned long oldestAt = ULONG_MAX;
+        bool foundNonAck = false;
+        for (size_t i = 0; i < pendingRelayCommands.size(); i++) {
+            const auto& entry = pendingRelayCommands[i];
+            if (entry.waitingForAck) {
+                continue;
+            }
+            foundNonAck = true;
+            if (entry.enqueuedAt < oldestAt) {
+                oldestAt = entry.enqueuedAt;
+                victimIdx = i;
+            }
+        }
+        if (!foundNonAck) {
+            oldestAt = ULONG_MAX;
+            for (size_t i = 0; i < pendingRelayCommands.size(); i++) {
+                if (pendingRelayCommands[i].enqueuedAt < oldestAt) {
+                    oldestAt = pendingRelayCommands[i].enqueuedAt;
+                    victimIdx = i;
+                }
+            }
+        }
+        const auto dropped = pendingRelayCommands[victimIdx];
+        pendingRelayCommands.erase(pendingRelayCommands.begin() + static_cast<long>(victimIdx));
+        Serial.printf("⚠️ [QUEUE] cap=%u drop esp=%u relay=%d supabase=%d\n",
+                      static_cast<unsigned>(MAX_PENDING_RELAY_COMMANDS),
+                      dropped.commandId, dropped.relayNumber, dropped.supabaseCommandId);
+    }
+
     pendingRelayCommands.push_back(cmd);
+    unlockPendingQueue();
     
     if (waitingForAck) {
         Serial.printf("📋 [ACK-WAIT] ESP-NOW id=%u supabase=%d relay=%d %s\n",
@@ -1732,7 +1829,13 @@ void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumb
 }
 
 void MasterSlaveManager::processRetryQueue() {
-    if (pendingRelayCommands.empty()) return;
+    if (!lockPendingQueue(pdMS_TO_TICKS(200))) {
+        return;
+    }
+    if (pendingRelayCommands.empty()) {
+        unlockPendingQueue();
+        return;
+    }
     
     unsigned long now = millis();
     
@@ -1879,9 +1982,14 @@ void MasterSlaveManager::processRetryQueue() {
             ++it;
         }
     }
+    unlockPendingQueue();
 }
 
 void MasterSlaveManager::removeFromRetryQueue(uint32_t commandId, bool currentState, bool notifySupabase) {
+    if (!lockPendingQueue(pdMS_TO_TICKS(500))) {
+        Serial.println("❌ removeFromRetryQueue: mutex timeout id=" + String(commandId));
+        return;
+    }
     for (auto it = pendingRelayCommands.begin(); it != pendingRelayCommands.end(); ++it) {
         if (it->commandId == commandId) {
             Serial.println("\n✅ ========================================");
@@ -1906,12 +2014,17 @@ void MasterSlaveManager::removeFromRetryQueue(uint32_t commandId, bool currentSt
             break;
         }
     }
+    unlockPendingQueue();
 }
 
 // 🚨 NOVO: Enviar todos os comandos pendentes para um slave quando ele volta online
 void MasterSlaveManager::sendPendingCommandsToSlave(const uint8_t* macAddress) {
     if (!initialized || !espNowController) return;
     
+    if (!lockPendingQueue(pdMS_TO_TICKS(200))) {
+        return;
+    }
+
     int pendingCount = 0;
     unsigned long now = millis();
     for (auto& cmd : pendingRelayCommands) {
@@ -1921,6 +2034,7 @@ void MasterSlaveManager::sendPendingCommandsToSlave(const uint8_t* macAddress) {
             cmd.nextRetry = now + 100;
         }
     }
+    unlockPendingQueue();
     
     if (pendingCount == 0) {
         return;
@@ -1933,37 +2047,34 @@ void MasterSlaveManager::sendPendingCommandsToSlave(const uint8_t* macAddress) {
 // ===== 🔄 FASE 2: PROCESSAMENTO DE ACKs DE RELAY =====
 
 void MasterSlaveManager::processRelayCommandAck(const RelayCommandAck& ack, const uint8_t* senderMac) {
-    Serial.println("\n🎊 ========================================");
-    Serial.println("🎊 ACK DE COMANDO RECEBIDO!");
-    Serial.println("🎊 ========================================");
-    Serial.println("📥 De: " + ESPNowController::macToString(senderMac));
-    Serial.println("🆔 Command ID: " + String(ack.commandId));
-    Serial.println("🔌 Relé: " + String(ack.relayNumber));
-    Serial.println("✅ Success: " + String(ack.success ? "Sim" : "Não"));
-    Serial.println("💡 Estado atual: " + String(ack.currentState ? "ON" : "OFF"));
-    Serial.println("⏰ Timestamp: " + String(ack.timestamp));
+    Serial.printf("[RELAY-ACK] id=%u relay=%u ok=%u state=%s mac=%s\n",
+                  (unsigned)ack.commandId, (unsigned)ack.relayNumber,
+                  (unsigned)ack.success, ack.currentState ? "ON" : "OFF",
+                  ESPNowController::macToString(senderMac).c_str());
+
+    touchSlaveLink(senderMac, "relay_ack_rx");
+
+    // Liberar cola ANTES de callbacks bloqueantes (SSL/MQTT) — evita race com processRetryQueue
+    const bool currentState = (ack.currentState == 1);
+    if (ack.success) {
+        removeFromRetryQueue(ack.commandId, currentState, false);
+    }
+
+    // Callback rápido (MQTT command_ack) — no bloquear cola
+    if (relayAckCallback) {
+        relayAckCallback(senderMac, ack.commandId, ack.success, ack.relayNumber, ack.currentState);
+    }
     
-    // Atualizar estatísticas do Slave
+    // Atualizar estatísticas do Slave (sem SSL aquí)
     TrustedSlave* slave = getTrustedSlave(senderMac);
     if (slave) {
         slave->updateLastSeen();
         slave->messagesReceived++;
         
-        // ⭐ POTENCIA MÁXIMA: Atualizar estado do relé remoto desde ACK
         if (ack.success && ack.relayNumber < 8) {
-            bool newState = (ack.currentState == 1);
-            slave->relayStates[ack.relayNumber].state = newState;
+            slave->relayStates[ack.relayNumber].state = currentState;
             slave->relayStates[ack.relayNumber].lastUpdate = millis();
-            Serial.println("✅ Estado do relé " + String(ack.relayNumber) + " atualizado desde ACK: " + (newState ? "ON" : "OFF"));
-            
-            // ✅ CRÍTICO: Atualizar Supabase (fonte única de verdade)
-            if (supabaseRelayStateCallback) {
-                String masterDeviceId = getDeviceID();
-                String slaveMac = ESPNowController::macToString(senderMac);
-                String slaveDeviceId = "ESP32_SLAVE_" + slaveMac;
-                slaveDeviceId.replace(":", "_");
-                supabaseRelayStateCallback(masterDeviceId, slaveMac, slaveDeviceId, ack.relayNumber, newState, false, 0);
-            }
+            Serial.println("✅ Estado do relé " + String(ack.relayNumber) + " atualizado desde ACK: " + (currentState ? "ON" : "OFF"));
         }
         
         if (ack.success) {
@@ -1972,25 +2083,12 @@ void MasterSlaveManager::processRelayCommandAck(const RelayCommandAck& ack, cons
             Serial.println("⚠️ Slave reportou falha na execução");
             slave->errors++;
         }
-    }
-    
-    // 🎯 CRITICAL: Remover comando da fila de retry
-    if (ack.success) {
-        Serial.println("\n🔄 Removendo comando da fila de retry...");
-        bool currentState = (ack.currentState == 1);
-        removeFromRetryQueue(ack.commandId, currentState, false);
-        Serial.println("✅ Comando removido - retry cancelado!");
+    } else if (ack.success) {
+        Serial.println("📊 Slave executou comando com sucesso!");
     } else {
         Serial.println("\n⚠️ Comando falhou no Slave");
         Serial.println("🔄 Sistema de retry continuará tentando...");
     }
-    
-    // Chamar callback se definido
-    if (relayAckCallback) {
-        relayAckCallback(senderMac, ack.commandId, ack.success, ack.relayNumber, ack.currentState);
-    }
-    
-    Serial.println("========================================\n");
 }
 
 

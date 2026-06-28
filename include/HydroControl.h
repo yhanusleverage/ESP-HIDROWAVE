@@ -137,6 +137,7 @@ struct EcDilutionEvent {
 };
 
 typedef void (*EcDilutionCallback)(const EcDilutionEvent* event, void* userData);
+typedef void (*DilutionSlaveRelayCallback)(const uint8_t* mac, int relayIndex, bool on, void* userData);
 
 class HydroControl {
 public:
@@ -214,6 +215,9 @@ public:
     void setDilutionAutoEnabled(bool enabled, bool saveToNVS = true);
     bool isDilutionAutoEnabled() const { return dilutionAutoEnabled; }
     void setDilutionRelays(int drainRelay, int fillRelay);
+    void setDilutionSlaveRelays(const String& drainMac, int drainRelay,
+                                const String& fillMac, int fillRelay);
+    void setDilutionSlaveRelayCallback(DilutionSlaveRelayCallback cb, void* userData);
     void setDilutionMaxVolumeL(float maxL);
     void setDilutionFillFlowLps(float lps);
     void setFlowmeterPulsesPerLiter(float ppl);
@@ -386,6 +390,8 @@ private:
     bool dilutionAutoEnabled;
     int dilutionDrainRelay;
     int dilutionFillRelay;
+    String dilutionDrainSlaveMac;
+    String dilutionFillSlaveMac;
     float dilutionMaxVolumeL;
     float dilutionFillFlowLps;
     float dilutionTargetL;
@@ -402,6 +408,8 @@ private:
     float dilutionEcBefore;
     EcDilutionCallback ecDilutionCallback;
     void* ecDilutionCallbackUserData;
+    DilutionSlaveRelayCallback dilutionSlaveRelayCallback;
+    void* dilutionSlaveRelayCallbackUserData;
     
     // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
     unsigned long lastDosageCompleteTime;  // Timestamp da última dosagem completa

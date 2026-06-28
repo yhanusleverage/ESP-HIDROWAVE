@@ -512,6 +512,9 @@ public:
      * @return Ponteiro para instância ou nullptr
      */
     static MasterSlaveManager* getInstance() { return instance; }
+
+    /** Comandos ESP-NOW pendentes (retry/ACK) — usado para defer SSL */
+    size_t getPendingRelayCommandCount() const;
     
     // ===== UTILITÁRIOS =====
     
@@ -607,9 +610,12 @@ private:
         int supabaseCommandId;       // ID do comando en Supabase (0 = no viene de Supabase)
     };
     std::vector<PendingRelayCommand> pendingRelayCommands;
+    mutable SemaphoreHandle_t pendingRelayCommandsMutex = nullptr;
     
-    // Configurações de retry e link slave
+    bool lockPendingQueue(TickType_t timeout = portMAX_DELAY) const;
+    void unlockPendingQueue() const;
     static constexpr uint8_t MAX_RELAY_RETRIES = 3;
+    static constexpr size_t MAX_PENDING_RELAY_COMMANDS = 8;
     static constexpr unsigned long RETRY_INTERVAL = 2000;
     static constexpr unsigned long SLAVE_REACHABLE_MS = 45000;
     static constexpr unsigned long SLAVE_OFFLINE_TIMEOUT_MS = 60000;

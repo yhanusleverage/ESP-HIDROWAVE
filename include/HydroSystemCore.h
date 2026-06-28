@@ -128,6 +128,7 @@ private:
     static const unsigned long RELAY_STATES_SYNC_FORCE_RF_MS = 60000; // backup ALL_RELAYS RF a cada 60s
     static const unsigned long SLAVE_RELAY_HEARTBEAT_INTERVAL = 45000; // relay/state periódico p/ cloud
     unsigned long lastSlaveRelayHeartbeat;
+    unsigned long lastSlaveRelayFullSync;
     static const unsigned long MQTT_CLOUD_LAST_SEEN_INTERVAL = 240000UL; // 4 min — margem sob UI 5 min
     static const unsigned long EC_OPERATION_SYNC_INTERVAL = 12000; // 12s — remaining_sec fresco durante dosing/recirc
     static const unsigned long EC_OPERATION_IDLE_SYNC_INTERVAL = 30000; // 30s — limpa ec_operation huérfano em Supabase
@@ -191,6 +192,14 @@ private:
     bool hasPendingCloudAcks() const { return pendingCloudAckCount > 0; }
     bool hasPendingSlaveAcks();
     bool isSslHotPathBusy();
+
+    static const size_t RECENTLY_CLOSED_ACK_CAP = 16;
+    static const unsigned long RECENTLY_CLOSED_ACK_TTL_MS = 15000;
+    int recentlyClosedSupabaseIds[RECENTLY_CLOSED_ACK_CAP];
+    unsigned long recentlyClosedAtMs[RECENTLY_CLOSED_ACK_CAP];
+    uint8_t recentlyClosedCount;
+    bool wasRecentlyClosedCloudAck(int supabaseCommandId) const;
+    void markRecentlyClosedCloudAck(int supabaseCommandId);
 #if ENABLE_MQTT
     unsigned long mqttConnectedSinceMs;
     bool isMqttCommandPathStable() const;
@@ -198,6 +207,7 @@ private:
                                    const uint8_t* slaveMac, int relayNumber, bool currentState);
     void publishSlaveRelayStateMqtt(const uint8_t* slaveMac, int fallbackRelay = -1,
                                     bool fallbackState = false, bool heartbeat = false);
+    void forceSlaveRelayMqttFullSync();
 #endif
     
 public:
@@ -289,6 +299,7 @@ private:
     void syncPhOperationStateToSupabase();
     void handleNutrientDoseEvent(const NutrientDoseEvent* event);
     void handleEcDilutionEvent(const EcDilutionEvent* event);
+    void handleDilutionSlaveRelay(const uint8_t* mac, int relay, bool on);
     void handlePhDoseEvent(const PhDoseEvent* event);
     void handleEcMetricEvent(const EcControllerMetricEvent* event);
     void handlePhMetricEvent(const PhControllerMetricEvent* event);
@@ -304,6 +315,7 @@ private:
     static void onPhGainLearnedStatic(void* userData);
     static void onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData);
     static void onEcDilutionStatic(const EcDilutionEvent* event, void* userData);
+    static void onDilutionSlaveRelayStatic(const uint8_t* mac, int relay, bool on, void* userData);
     static void onPhDoseStatic(const PhDoseEvent* event, void* userData);
     static void onEcMetricStatic(const EcControllerMetricEvent* event, void* userData);
     static void onPhMetricStatic(const PhControllerMetricEvent* event, void* userData);

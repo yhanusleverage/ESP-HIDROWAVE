@@ -87,6 +87,8 @@ struct ECConfig {
     bool dilution_auto_enabled;
     int dilution_drain_relay;
     int dilution_fill_relay;
+    String dilution_drain_slave_mac;
+    String dilution_fill_slave_mac;
     double dilution_max_volume_l;
     double flowmeter_pulses_per_liter;
     double dilution_fill_flow_lps;
@@ -184,7 +186,8 @@ public:
     bool updateRelaySlaves(const String& slaveDeviceId, const String& masterDeviceId,
                           const String& slaveMacAddress, bool* relayStates, 
                           bool* hasTimers = nullptr, int* remainingTimes = nullptr, 
-                          const String* relayNames = nullptr);
+                          const String* relayNames = nullptr,
+                          bool allowNameWrite = false);
 
     /** Garante registro em device_status antes de INSERT em relay_slaves (FK) */
     bool ensureDeviceStatusEntry(const String& deviceId, const String& macAddress,

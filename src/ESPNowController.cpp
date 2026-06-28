@@ -1800,13 +1800,15 @@ void ESPNowController::onDataReceived(const uint8_t* mac, const uint8_t* incomin
                 RelayCommandAck ack;
                 memcpy(&ack, taskMsg.data, sizeof(RelayCommandAck));
                 
-                // Validar checksum
+                // Validar checksum (zero checksum byte antes do XOR, igual validateMessage)
+                uint8_t receivedChecksum = ack.checksum;
+                ack.checksum = 0;
                 uint8_t expectedChecksum = 0;
                 for (size_t i = 0; i < sizeof(RelayCommandAck) - 1; i++) {
                     expectedChecksum ^= ((uint8_t*)&ack)[i];
                 }
                 
-                if (ack.checksum == expectedChecksum) {
+                if (receivedChecksum == expectedChecksum) {
                     Serial.println("✅ Checksum válido");
                     Serial.println("🆔 Command ID: " + String(ack.commandId));
                     Serial.println("🔌 Relé: " + String(ack.relayNumber));

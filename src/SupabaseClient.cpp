@@ -9,6 +9,7 @@
 #include <math.h>    // ✅ Para isnan() e isinf() no ESP32
 #include <freertos/FreeRTOS.h>  // ✅ Para vTaskDelay
 #include <freertos/task.h>      // ✅ Para vTaskDelay
+#include <esp_task_wdt.h>
 
 SupabaseClient::SupabaseClient() : 
     secureClient(nullptr),
@@ -1989,18 +1990,22 @@ bool SupabaseClient::markCommandCompleted(int commandId, bool currentState, bool
     
     // ✅ Cerrar cualquier conexión previa antes de reutilizar http
     http.end();
+    esp_task_wdt_reset();
     // ✅ Usar secureClient para mantener conexión SSL
     http.begin(*secureClient, baseUrl + "/rest/v1/" + endpoint);
     http.addHeader("Authorization", buildAuthHeader());
     http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
     http.addHeader("apikey", apiKey);
     http.setTimeout(SUPABASE_TIMEOUT_MS);
-    
+
+    esp_task_wdt_reset();
     int httpCode = http.PATCH(payload);
+    esp_task_wdt_reset();
     if (httpCode < 200 || httpCode >= 300) {
         Serial.printf("⚠️ [ACK] markCommandCompleted id=%d HTTP %d — retry sem current_state\n", commandId, httpCode);
         http.end();
         vTaskDelay(pdMS_TO_TICKS(50));
+        esp_task_wdt_reset();
 
         DynamicJsonDocument docFallback(128);
         docFallback["status"] = "completed";
@@ -2014,7 +2019,9 @@ bool SupabaseClient::markCommandCompleted(int commandId, bool currentState, bool
         http.addHeader("Content-Type", SUPABASE_CONTENT_TYPE);
         http.addHeader("apikey", apiKey);
         http.setTimeout(SUPABASE_TIMEOUT_MS);
+        esp_task_wdt_reset();
         httpCode = http.PATCH(payloadFallback);
+        esp_task_wdt_reset();
     }
     if (httpCode < 200 || httpCode >= 300) {
         Serial.printf("❌ [ACK] markCommandCompleted id=%d HTTP %d\n", commandId, httpCode);
@@ -3054,7 +3061,8 @@ bool SupabaseClient::patchSlaveDeviceStatusHeartbeat(const String& deviceId, con
 bool SupabaseClient::updateRelaySlaves(const String& slaveDeviceId, const String& masterDeviceId,
                                        const String& slaveMacAddress, bool* relayStates,
                                        bool* hasTimers, int* remainingTimes, 
-                                       const String* relayNames) {
+                                       const String* relayNames,
+                                       bool allowNameWrite) {
     // ✅ CRÍTICO: Proteger com mutex para evitar conflitos de escritura sequencial
     if (requestMutex == nullptr) {
         Serial.println("⚠️ [SUPABASE] requestMutex não inicializado - operação não protegida");
@@ -3181,10 +3189,10 @@ bool SupabaseClient::updateRelaySlaves(const String& slaveDeviceId, const String
     JsonArray timers = doc.createNestedArray("relay_has_timers");
     JsonArray times = doc.createNestedArray("relay_remaining_times");
     
-    // ✅ Nomes: Só enviar se temos nomes novos (não sobrescrever existentes)
+    // relay_names: só incluir com allowNameWrite explícito (UI é fonte de verdade)
     bool hasNewSlaveNames = false;
     JsonArray names;
-    if (relayNames) {
+    if (allowNameWrite && relayNames) {
         for (int i = 0; i < 8; i++) {
             if (relayNames[i].length() > 0) {
                 hasNewSlaveNames = true;
@@ -3203,7 +3211,7 @@ bool SupabaseClient::updateRelaySlaves(const String& slaveDeviceId, const String
         if (hasNewSlaveNames && relayNames && relayNames[i].length() > 0) {
             names.add(relayNames[i]);
         } else if (hasNewSlaveNames) {
-            names.add(nullptr);  // Só adiciona null se estamos enviando o array
+            names.add("");
         }
     }
     
@@ -3282,14 +3290,13 @@ bool SupabaseClient::updateRelaySlaves(const String& slaveDeviceId, const String
         JsonArray postStates = postDoc.createNestedArray("relay_states");
         JsonArray postTimers = postDoc.createNestedArray("relay_has_timers");
         JsonArray postTimes = postDoc.createNestedArray("relay_remaining_times");
-        JsonArray postNames = postDoc.createNestedArray("relay_names");
         
         for (int i = 0; i < 8; i++) {
             postStates.add(relayStates ? relayStates[i] : false);
             postTimers.add(hasTimers ? hasTimers[i] : false);
             postTimes.add(remainingTimes ? remainingTimes[i] : 0);
-            postNames.add(nullptr);  // Array completo para INSERT
         }
+        // relay_names omitido no INSERT — UI preenche depois
         
         postDoc["last_update"] = "now()";
         postDoc["updated_at"] = "now()";
@@ -3751,6 +3758,12 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     config.dilution_auto_enabled = configObj["dilution_auto_enabled"] | false;
     config.dilution_drain_relay = configObj["dilution_drain_relay"] | -1;
     config.dilution_fill_relay = configObj["dilution_fill_relay"] | -1;
+    if (configObj.containsKey("dilution_drain_slave_mac") && !configObj["dilution_drain_slave_mac"].isNull()) {
+        config.dilution_drain_slave_mac = configObj["dilution_drain_slave_mac"].as<String>();
+    }
+    if (configObj.containsKey("dilution_fill_slave_mac") && !configObj["dilution_fill_slave_mac"].isNull()) {
+        config.dilution_fill_slave_mac = configObj["dilution_fill_slave_mac"].as<String>();
+    }
     config.dilution_max_volume_l = configObj["dilution_max_volume_l"] | 50.0;
     config.flowmeter_pulses_per_liter = configObj["flowmeter_pulses_per_liter"] | 450.0;
     config.dilution_fill_flow_lps = configObj["dilution_fill_flow_lps"] | 0.5;

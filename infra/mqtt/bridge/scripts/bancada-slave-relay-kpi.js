@@ -70,8 +70,9 @@ console.log('\n--- [3/3] Supabase relay_slaves row ---');
 runNode('check-relay-slave-row.js', { SLAVE_MAC: slaveMac });
 
 console.log('\n=== CHECKLIST MANUAL (bancada) ===');
-console.log('[ ] Master serial: ACK relé slave sin TIMEOUT DE ACK');
-console.log('[ ] Slave serial: masterConnected, sin scan multi-canal activo');
+console.log('[ ] Master serial: [RELAY-ACK] + [CMD ACK-DIRECT] antes de ACK-FALLBACK');
+console.log('[ ] Slave serial: RELAY_ACK enviado; sin MASTER ENCONTRADO en cada PONG');
+console.log('[ ] Slave serial: sin Auto-discovery cada 30s con canal locked');
 console.log('[ ] GPIO: relé físico cambia de estado');
 console.log('[ ] Cronómetro UI toggle → estado UI actualizado: _____ s (objetivo <2s)');
 console.log('[ ] relay_commands.status = completed en Supabase');

@@ -18,7 +18,7 @@ const supabase = createClient(url, key);
 
 const { data, error } = await supabase
   .from('relay_slaves')
-  .select('device_id, slave_mac_address, relay_states, last_update, updated_at')
+  .select('device_id, slave_mac_address, relay_states, relay_names, last_update, updated_at')
   .ilike('slave_mac_address', `%${mac.replace(/:/g, '%')}%`);
 
 if (error) {
@@ -43,6 +43,7 @@ for (const row of data) {
         slave_mac_address: row.slave_mac_address,
         relays_on: onCount,
         relay_states: row.relay_states,
+        relay_names: row.relay_names,
         last_update: row.last_update,
         age_sec: ageSec,
       },

@@ -66,6 +66,7 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     lastStatusSend(0),
     lastRelayStatesSync(0),  // ✅ NOVO: Inicializar controle de sincronização
     lastSlaveRelayHeartbeat(0),
+    lastSlaveRelayFullSync(0),
     lastStatusPrint(0),
     lastSupabaseCheck(0),
     lastRulesCheck(0),  // ✅ NOVO: Inicializar controle de verificação de regras
@@ -82,6 +83,7 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     pendingPhDoseCount(0),
     pendingCloudAckHead(0),
     pendingCloudAckCount(0),
+    recentlyClosedCount(0),
 #if ENABLE_MQTT
     mqttConnectedSinceMs(0),
 #endif
@@ -93,6 +95,8 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     memset(pendingNutrientDoseQueue, 0, sizeof(pendingNutrientDoseQueue));
     memset(pendingPhDoseQueue, 0, sizeof(pendingPhDoseQueue));
     memset(pendingCloudAckQueue, 0, sizeof(pendingCloudAckQueue));
+    memset(recentlyClosedSupabaseIds, 0, sizeof(recentlyClosedSupabaseIds));
+    memset(recentlyClosedAtMs, 0, sizeof(recentlyClosedAtMs));
     // Log de dependências injetadas
     if (webServerTask) {
         Serial.println("✅ HydroSystemCore: WebServerTask injetado");
@@ -113,11 +117,9 @@ void HydroSystemCore::wireMasterManagerIntegration() {
     masterManager->setRelayAckCallback([this](const uint8_t* senderMac, uint32_t commandId,
                                               bool success, uint8_t relayNumber, uint8_t currentState) {
         Serial.println("\n🎊 === ACK DE RELAY RECEBIDO (EVENT-DRIVEN) ===");
-        Serial.println("📱 De: " + ESPNowController::macToString(senderMac));
-        Serial.println("🆔 Command ID (ESP-NOW): " + String(commandId));
-        Serial.println("🔌 Relé: " + String(relayNumber));
-        Serial.println("✅ Success: " + String(success ? "Sim" : "Não"));
-        Serial.println("💡 Estado: " + String(currentState ? "ON" : "OFF"));
+        Serial.printf("[CMD ACK-DIRECT] espnow_id=%u supabase=%d R%d state=%s\n",
+                      (unsigned)commandId, findSupabaseCommandId(commandId), relayNumber,
+                      currentState ? "ON" : "OFF");
 
         int supabaseCommandId = findSupabaseCommandId(commandId);
 
@@ -235,6 +237,7 @@ bool HydroSystemCore::begin() {
 
     hydroControl.setNutrientDoseCallback(&HydroSystemCore::onNutrientDoseStatic, this);
     hydroControl.setEcDilutionCallback(&HydroSystemCore::onEcDilutionStatic, this);
+    hydroControl.setDilutionSlaveRelayCallback(&HydroSystemCore::onDilutionSlaveRelayStatic, this);
     hydroControl.setPhDoseCallback(&HydroSystemCore::onPhDoseStatic, this);
     hydroControl.setEcMetricCallback(&HydroSystemCore::onEcMetricStatic, this);
     hydroControl.setPhMetricCallback(&HydroSystemCore::onPhMetricStatic, this);
@@ -488,6 +491,13 @@ void HydroSystemCore::loop() {
             publishSlaveRelayStateMqtt(slave.macAddress, -1, false, true);
         }
         lastSlaveRelayHeartbeat = now;
+    }
+
+    // Sync completo relay_states[] via RF + MQTT (60s) — evita UI stale (só link-only)
+    if (masterManager && mqttClient.isConnected() &&
+        now - lastSlaveRelayFullSync >= RELAY_STATES_SYNC_FORCE_RF_MS) {
+        forceSlaveRelayMqttFullSync();
+        lastSlaveRelayFullSync = now;
     }
 #endif
     
@@ -969,7 +979,11 @@ void HydroSystemCore::checkECConfigFromSupabase() {
             hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);
             hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
             hydroControl.setDilutionAutoEnabled(config.dilution_auto_enabled, false);
-            hydroControl.setDilutionRelays(config.dilution_drain_relay, config.dilution_fill_relay);
+            hydroControl.setDilutionSlaveRelays(
+                config.dilution_drain_slave_mac,
+                config.dilution_drain_relay,
+                config.dilution_fill_slave_mac,
+                config.dilution_fill_relay);
             hydroControl.setDilutionMaxVolumeL((float)config.dilution_max_volume_l);
             hydroControl.setFlowmeterPulsesPerLiter((float)config.flowmeter_pulses_per_liter);
             hydroControl.setDilutionFillFlowLps((float)config.dilution_fill_flow_lps);
@@ -1443,6 +1457,20 @@ void HydroSystemCore::onEcDilutionStatic(const EcDilutionEvent* event, void* use
     if (userData && event) {
         static_cast<HydroSystemCore*>(userData)->handleEcDilutionEvent(event);
     }
+}
+
+void HydroSystemCore::onDilutionSlaveRelayStatic(const uint8_t* mac, int relay, bool on, void* userData) {
+    if (userData && mac) {
+        static_cast<HydroSystemCore*>(userData)->handleDilutionSlaveRelay(mac, relay, on);
+    }
+}
+
+void HydroSystemCore::handleDilutionSlaveRelay(const uint8_t* mac, int relay, bool on) {
+    if (!masterManager) {
+        return;
+    }
+    String action = on ? "on" : "off";
+    masterManager->sendRelayCommandToSlave(mac, relay, action, 0, 0, false);
 }
 
 void HydroSystemCore::onEcMetricStatic(const EcControllerMetricEvent* event, void* userData) {
@@ -2176,13 +2204,11 @@ void HydroSystemCore::syncAllRelayStatesToSupabase() {
             bool slaveRelayStates[8] = {false};
             bool slaveHasTimers[8] = {false};
             int slaveRemainingTimes[8] = {0};
-            String slaveRelayNames[8];
 
             for (int i = 0; i < slave->numRelays && i < 8; i++) {
                 slaveRelayStates[i] = slave->relayStates[i].state;
                 slaveHasTimers[i] = slave->relayStates[i].hasTimer;
                 slaveRemainingTimes[i] = slave->relayStates[i].remainingTime;
-                slaveRelayNames[i] = slave->relayStates[i].name;
             }
 
             char mask[9];
@@ -2205,7 +2231,7 @@ void HydroSystemCore::syncAllRelayStatesToSupabase() {
 
             if (supabase.updateRelaySlaves(slaveDeviceId, getDeviceID(), slaveMac,
                                           slaveRelayStates, slaveHasTimers,
-                                          slaveRemainingTimes, slaveRelayNames)) {
+                                          slaveRemainingTimes, nullptr)) {
                 storeLastSynced(slave->macAddress, slaveRelayStates);
                 updatedCount++;
                 Serial.printf("[SYNC] PATCH ok slave=%s heap=%u\n",
@@ -2844,8 +2870,10 @@ void HydroSystemCore::flushPendingCloudAcks() {
                         item.slaveMac[4] != 0 || item.slaveMac[5] != 0;
     const uint8_t* macPtr = hasMac ? item.slaveMac : nullptr;
 
+    esp_task_wdt_reset();
     if (tryCloseCloudRelayCommand(item.supabaseCommandId, macPtr, item.relayNumber, item.currentState,
                                   item.espNowCommandId)) {
+        esp_task_wdt_reset();
         logCmdCloudAckResult("cloud-retry", item.supabaseCommandId, item.espNowCommandId,
                              item.relayNumber, item.currentState, true);
         pendingCloudAckHead = (pendingCloudAckHead + 1) % PENDING_CLOUD_ACK_CAP;
@@ -2865,6 +2893,14 @@ void HydroSystemCore::flushPendingCloudAcks() {
 void HydroSystemCore::completeSlaveCommand(int supabaseCommandId, uint32_t espNowCommandId,
                                            const uint8_t* slaveMac, int relayNumber, bool currentState,
                                            const char* via) {
+    if (supabaseCommandId > 0 && wasRecentlyClosedCloudAck(supabaseCommandId)) {
+        Serial.printf("[CMD] skip duplicate close id=%d via=%s\n", supabaseCommandId, via);
+        if (masterManager && espNowCommandId > 0) {
+            masterManager->removeFromRetryQueue(espNowCommandId, currentState, false);
+        }
+        return;
+    }
+
     if (masterManager && espNowCommandId > 0) {
         masterManager->removeFromRetryQueue(espNowCommandId, currentState, false);
     }
@@ -2907,9 +2943,71 @@ void HydroSystemCore::completeSlaveCommand(int supabaseCommandId, uint32_t espNo
 
     logCmdCloudAckResult(via, supabaseCommandId, espNowCommandId, relayNumber, currentState, cloudClosed);
 
+    if (cloudClosed && supabaseCommandId > 0) {
+        markRecentlyClosedCloudAck(supabaseCommandId);
+    }
+
     if (!cloudClosed && supabaseCommandId > 0) {
         Serial.printf("⚠️ [%s] hardware OK — ACK cloud en cola id=%d\n", via, supabaseCommandId);
     }
+}
+
+bool HydroSystemCore::isSslHotPathBusy() {
+    if (hasPendingCloudAcks()) {
+        return true;
+    }
+    if (relaySyncInProgress) {
+        return true;
+    }
+    if (hasPendingSlaveAcks()) {
+        return true;
+    }
+    if (masterManager && masterManager->getPendingRelayCommandCount() > 0) {
+        return true;
+    }
+    if (supabase.isRequestInProgress()) {
+        return true;
+    }
+    return false;
+}
+
+bool HydroSystemCore::wasRecentlyClosedCloudAck(int supabaseCommandId) const {
+    if (supabaseCommandId <= 0) {
+        return false;
+    }
+    const unsigned long now = millis();
+    for (uint8_t i = 0; i < recentlyClosedCount; i++) {
+        if (recentlyClosedSupabaseIds[i] != supabaseCommandId) {
+            continue;
+        }
+        if (now - recentlyClosedAtMs[i] <= RECENTLY_CLOSED_ACK_TTL_MS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void HydroSystemCore::markRecentlyClosedCloudAck(int supabaseCommandId) {
+    if (supabaseCommandId <= 0) {
+        return;
+    }
+    const unsigned long now = millis();
+    for (uint8_t i = 0; i < recentlyClosedCount; i++) {
+        if (recentlyClosedSupabaseIds[i] == supabaseCommandId) {
+            recentlyClosedAtMs[i] = now;
+            return;
+        }
+    }
+    if (recentlyClosedCount >= RECENTLY_CLOSED_ACK_CAP) {
+        memmove(recentlyClosedSupabaseIds, recentlyClosedSupabaseIds + 1,
+                (RECENTLY_CLOSED_ACK_CAP - 1) * sizeof(recentlyClosedSupabaseIds[0]));
+        memmove(recentlyClosedAtMs, recentlyClosedAtMs + 1,
+                (RECENTLY_CLOSED_ACK_CAP - 1) * sizeof(recentlyClosedAtMs[0]));
+        recentlyClosedCount = RECENTLY_CLOSED_ACK_CAP - 1;
+    }
+    recentlyClosedSupabaseIds[recentlyClosedCount] = supabaseCommandId;
+    recentlyClosedAtMs[recentlyClosedCount] = now;
+    recentlyClosedCount++;
 }
 
 void HydroSystemCore::reconcilePendingSlaveAcks(const uint8_t* slaveMac, const bool relayStates[8],
@@ -2953,6 +3051,9 @@ void HydroSystemCore::reconcilePendingSlaveAcks(const uint8_t* slaveMac, const b
     xSemaphoreGive(pendingAckMutex);
 
     for (const auto& pending : matched) {
+        if (wasRecentlyClosedCloudAck(pending.supabaseCommandId)) {
+            continue;
+        }
         Serial.printf("[ACK-FALLBACK] completed via ALL_RELAYS id=%d relay=%d\n",
                       pending.supabaseCommandId, pending.relayNumber);
         completeSlaveCommand(pending.supabaseCommandId, pending.espNowCommandId, slaveMac,
@@ -2976,7 +3077,6 @@ void HydroSystemCore::updateRelaySlaveState(const String& slaveDeviceId,
     bool relayStates[8] = {false};
     bool hasTimers[8] = {false};
     int remainingTimes[8] = {0};
-    String relayNames[8];
     
     // Tentar buscar slave da lista confiável
     auto trustedSlaves = masterManager->getAllTrustedSlaves();
@@ -2985,12 +3085,10 @@ void HydroSystemCore::updateRelaySlaveState(const String& slaveDeviceId,
     for (const auto& s : trustedSlaves) {
         if (memcmp(s.macAddress, slaveMac, 6) == 0) {
             slaveFound = true;
-            // Preencher arrays com estados atuais do slave
             for (int i = 0; i < 8 && i < s.numRelays; i++) {
                 relayStates[i] = s.relayStates[i].state;
                 hasTimers[i] = s.relayStates[i].hasTimer;
                 remainingTimes[i] = s.relayStates[i].remainingTime;
-                relayNames[i] = s.relayStates[i].name;
             }
             break;
         }
@@ -3014,7 +3112,7 @@ void HydroSystemCore::updateRelaySlaveState(const String& slaveDeviceId,
         relayStates,
         hasTimers,
         remainingTimes,
-        relayNames
+        nullptr
     );
     
     if (success) {
@@ -3046,22 +3144,6 @@ bool HydroSystemCore::hasPendingSlaveAcks() {
     const bool has = !pendingSlaveCommandAcks.empty();
     xSemaphoreGive(pendingAckMutex);
     return has;
-}
-
-bool HydroSystemCore::isSslHotPathBusy() {
-    if (hasPendingCloudAcks()) {
-        return true;
-    }
-    if (relaySyncInProgress) {
-        return true;
-    }
-    if (hasPendingSlaveAcks()) {
-        return true;
-    }
-    if (supabase.isRequestInProgress()) {
-        return true;
-    }
-    return false;
 }
 
 #if ENABLE_MQTT
@@ -3118,6 +3200,34 @@ bool HydroSystemCore::tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t 
     return true;
 }
 
+void HydroSystemCore::forceSlaveRelayMqttFullSync() {
+    if (!masterManager || !mqttClient.isConnected()) {
+        return;
+    }
+
+    std::vector<TrustedSlave> slaves = masterManager->getAllTrustedSlaves();
+    for (const auto& slave : slaves) {
+        const unsigned long sinceSeen = millis() - slave.lastSeen;
+        if (!slave.isOnline() && sinceSeen >= 60000) {
+            continue;
+        }
+
+        masterManager->drainAllRelaysStatusWait();
+        masterManager->requestSlaveStatus(slave.macAddress);
+        const bool gotStatus = masterManager->waitForAllRelaysStatus(800);
+        esp_task_wdt_reset();
+
+        if (gotStatus) {
+            publishSlaveRelayStateMqtt(slave.macAddress, -1, false, false);
+            Serial.printf("[SYNC-MQTT] full relay_states mac=%s\n",
+                          ESPNowController::macToString(slave.macAddress).c_str());
+        } else {
+            Serial.printf("[SYNC-MQTT] ALL_RELAYS timeout mac=%s\n",
+                          ESPNowController::macToString(slave.macAddress).c_str());
+        }
+    }
+}
+
 void HydroSystemCore::publishSlaveRelayStateMqtt(const uint8_t* slaveMac, int fallbackRelay,
                                                  bool fallbackState, bool heartbeat) {
     if (!slaveMac || !masterManager || !mqttClient.isConnected()) {
@@ -3131,8 +3241,16 @@ void HydroSystemCore::publishSlaveRelayStateMqtt(const uint8_t* slaveMac, int fa
     bool linkOnline = false;
     uint16_t linkLastSeenS = 0;
 
-    if (masterManager->readSlaveRelaySnapshot(slaveMac, states, timers, remaining, n,
-                                            linkOnline, linkLastSeenS)) {
+    bool gotSnapshot = masterManager->readSlaveRelaySnapshot(slaveMac, states, timers, remaining, n,
+                                                             linkOnline, linkLastSeenS);
+    if (!gotSnapshot) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        esp_task_wdt_reset();
+        gotSnapshot = masterManager->readSlaveRelaySnapshot(slaveMac, states, timers, remaining, n,
+                                                            linkOnline, linkLastSeenS);
+    }
+
+    if (gotSnapshot) {
         // snapshot ok
     } else if (fallbackRelay >= 0 && fallbackRelay < 8) {
         states[fallbackRelay] = fallbackState;
