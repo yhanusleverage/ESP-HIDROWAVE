@@ -1,11 +1,13 @@
-#!/bin/bash
+﻿#!/bin/bash
 # Provisiona user MQTT dedicado por device no Mosquitto (Lightsail).
-# Uso na VM:
-#   sudo bash provision-device.sh ESP32_HIDRO_269844 'SUA_SENHA_FORTE'
-#   sudo bash provision-device.sh ESP32_HIDRO_269844          # gera senha aleatória
+# El firmware usa user = mqtt_{device_id} (MAC) y la misma mqtt_pass en todos.
+# Uso na VM (NO usar align-broker-production.sh si hay varios masters):
+#   sudo bash provision-device.sh ESP32_HIDRO_1A575C 'MESMA_SENHA'
+#   sudo bash provision-device.sh ESP32_HIDRO_269844 'MESMA_SENHA'
+#   sudo bash provision-device.sh ESP32_HIDRO_269844          # gera senha aleatoria
 #   sudo bash provision-device.sh ESP32_HIDRO_269844 'SENHA' --retire-hidrowave
 #
-# Depois: copiar mqtt_user e mqtt_pass para secrets.ini do ESP e reflash.
+# Depois: mismo firmware en todas las placas (secrets.ini mqtt_host + mqtt_pass).
 
 set -euo pipefail
 
@@ -27,7 +29,7 @@ if [[ -z "$PASS" ]]; then
 fi
 
 if [[ ! "$DEVICE_ID" =~ ^ESP32_HIDRO_[0-9A-F]{6}$ ]]; then
-  echo "[provision] device_id inválido: $DEVICE_ID" >&2
+  echo "[provision] device_id invalido: $DEVICE_ID" >&2
   exit 1
 fi
 
@@ -45,7 +47,7 @@ mosquitto_passwd -b "$PASSWD_FILE" "$MQTT_USER" "$PASS"
 
 MARKER="# --- device ${DEVICE_ID} (provision-device.sh) ---"
 if grep -qF "$MARKER" "$ACL_FILE" 2>/dev/null; then
-  echo "[provision] ACL já existe para $DEVICE_ID — atualizando bloco"
+  echo "[provision] ACL ja existe para $DEVICE_ID — atualizando bloco"
   sed -i "/${MARKER}/,/^$/d" "$ACL_FILE"
 fi
 
@@ -69,12 +71,13 @@ chmod 640 "$PASSWD_FILE" "$ACL_FILE"
 systemctl reload mosquitto 2>/dev/null || systemctl restart mosquitto
 
 echo ""
-echo "=== Próximo passo (PC local) ==="
+echo "=== Proximo passo (PC local) ==="
 echo "secrets.ini:"
 echo "  mqtt_user = ${MQTT_USER}"
 echo "  mqtt_pass = ${PASS}"
 echo ""
-echo "Depois: platformio run -t upload && monitor"
+echo "Firmware: mqtt_user es automatico (mqtt_ + device_id). Solo mqtt_host + mqtt_pass en secrets.ini."
+echo "  pio run -t upload"
 echo ""
 echo "Teste na VM:"
 echo "  mosquitto_pub -h 127.0.0.1 -u ${MQTT_USER} -P '***' \\"

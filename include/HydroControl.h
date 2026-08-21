@@ -4,10 +4,12 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include "Config.h"
+#if HIDRO_ENABLE_DS18B20_FALLBACK
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#endif
 #include <PCF8574.h>
-#include "Config.h"
 #if USE_PH_MODBUS_SENSOR
 #include "PhModbusSensor.h"
 #else
@@ -18,7 +20,8 @@
 #include "DiscreteLevelBank.h"
 #include "Controller.h"  // ✅ Controller KP para controle automático de EC
 #include "EcDilutionController.h"
-#include "FlowmeterSensor.h"
+#include "WaterFlowSensor.h"
+#include "FlowSensorBank.h"
 #include "AdaptivePHController.h"
 #include <ArduinoJson.h>  // ✅ Para JsonArray en executeWebDosage
 #include "PreferencesManager.h"  // ✅ Para persistência em NVS
@@ -29,14 +32,17 @@
 // ===== SISTEMA SEQUENCIAL SIMPLES =====
 enum SequentialState {
     IDLE,           // Parado - nenhuma dosagem ativa
-    DOSING,         // Dosando nutriente atual
+    DOSING,         // Pulso ON do nutriente atual
+    PULSE_GAP,      // Gap entre pulsos do mesmo nutriente
     WAITING,        // Pausa curta entre nutrientes (~3s) — publicado como "dosing" na UI
     RECIRCULATING   // Aguardando tempo_recirculacao após secuencia completa
 };
 
 enum DilutionState {
     DILUTION_IDLE,
+    DILUTION_WAIT_DRAIN_ACK,
     DILUTION_DRAINING,
+    DILUTION_WAIT_FILL_ACK,
     DILUTION_FILLING,
     DILUTION_RECIRCULATING
 };
@@ -45,7 +51,8 @@ struct SimpleNutrient {
     String name;        // Nome do nutriente (ex: "Grow", "Micro")
     int relay;          // Índice do relé (0-15 para ESP-HIDROWAVE)
     float dosageML;     // Quantidade em ml
-    int durationMs;     // Duração em milissegundos
+    int durationMs;     // Duração total estimada (legado / telemetria)
+    float flowRateMlPerS; // Caudal da bomba deste nutriente
 };
 
 /** Evento emitido ao completar dosagem de um nutriente (para Supabase nutrient_dosages). */
@@ -137,7 +144,7 @@ struct EcDilutionEvent {
 };
 
 typedef void (*EcDilutionCallback)(const EcDilutionEvent* event, void* userData);
-typedef void (*DilutionSlaveRelayCallback)(const uint8_t* mac, int relayIndex, bool on, void* userData);
+typedef uint32_t (*DilutionSlaveRelayCallback)(const uint8_t* mac, int relayIndex, bool on, void* userData);
 
 class HydroControl {
 public:
@@ -153,17 +160,28 @@ public:
     void loop();
     void update();
     void showMessage(String msg);
-    void toggleRelay(int relay, int seconds = 0);
-    void setRelay(int relay, bool state, int seconds = 0);  // ✅ NOVO: Define estado direto
+    bool toggleRelay(int relay, int seconds = 0);
+    bool setRelay(int relay, bool state, int seconds = 0);
+    bool isPcf1Ok() const { return pcf1_ok; }
+    bool isPcf2Ok() const { return pcf2_ok; }
     void updateSensorData(float temp, float humidity, float ph, float ecUsCm);
     void updateRelayTimers();
     bool* getRelayStates() { return relayStates; }
     bool areSensorsWorking() { return sensorsOk; }
     bool isWaterLevelOk() { return tankLevelOk; }
-    /** true si nivel bajo o hold P1 activo — pausa checkAutoEC/checkAutoPH. */
+    /** normal = ≠vazio; carrera = solo alto (4/4). Persistido NVS. */
+    enum LevelInterlockMode : uint8_t { LEVEL_INTERLOCK_NORMAL = 0, LEVEL_INTERLOCK_CARRERA = 1 };
+    bool setLevelInterlockMode(LevelInterlockMode mode);
+    LevelInterlockMode getLevelInterlockMode() const { return levelInterlockMode; }
+    const char* getLevelInterlockModeName() const;
+    /** true si nivel bajo o procedimiento de tanque/dilución activo — pausa Auto EC/pH. */
     bool isAutoDosingPausedByInterlock() const;
-    /** Extiende pausa de dosaje químico durante script tanque (P1). */
-    void holdAutoDosingForTankScript(unsigned long durationMs);
+    /**
+     * Gate P1: pausa Auto EC/pH mientras un procedimiento secuencial de tanque está activo.
+     * Sin timers — liberar con setTankProcedureActive(false) al terminar el script.
+     */
+    void setTankProcedureActive(bool active);
+    bool isTankProcedureActive() const { return tankProcedureHoldCount > 0; }
     bool isLevelWet(int levelIndex) const;
     const char* getWaterLevelAggregate() const;
     bool isDiscreteLevelBankActive() const { return levelBank.isAvailable(); }
@@ -194,10 +212,22 @@ public:
     float getECTolerance() const { return ecTolerance; }
     void setAutoECEnabled(bool enabled, bool saveToNVS = true);  // ✅ saveToNVS: false para evitar guardar múltiples veces
     bool isAutoECEnabled() const { return autoECEnabled; }
-    void setAutoECInterval(int intervalSeconds, bool saveToNVS = true);  // ✅ saveToNVS: false para evitar guardar múltiples veces
+    void setAutoECInterval(int intervalSeconds, bool saveToNVS = true);
     int getAutoECInterval() const { return autoECIntervalSeconds; }
+    void setMaxStepEcFraction(float fraction);
+    float getMaxStepEcFraction() const { return ecAggressiveness; }
+    void setConsumoEc24hEnabled(bool enabled);
+    bool isConsumoEc24hEnabled() const { return consumoEc24hEnabled; }
+    void setConsumoPh24hEnabled(bool enabled);
+    bool isConsumoPh24hEnabled() const { return consumoPh24hEnabled; }
     void setTempoRecirculacaoSeconds(unsigned long seconds);
     unsigned long getTempoRecirculacaoSeconds() const { return tempoRecirculacaoSeconds; }
+    void setEcPulseDosing(float pulseMl, float pulseGapSec);
+    float getEcPulseMl() const { return ecPulseMl; }
+    float getEcPulseGapSec() const { return ecPulseGapSec; }
+    void setPhPulseDosing(float pulseMl, float pulseGapSec);
+    float getPhPulseMl() const { return phPulseMl; }
+    float getPhPulseGapSec() const { return phPulseGapSec; }
     void setNutrientDoseCallback(NutrientDoseCallback cb, void* userData);
     void setEcOperationSyncCallback(EcOperationSyncCallback cb, void* userData);
     void setPhysicalRecircCallback(PhysicalRecircCallback cb, void* userData);
@@ -208,15 +238,48 @@ public:
     const char* getEcOperationStateName() const;
     int getEcOperationRemainingSec() const;
     int getEcNextCheckInSec() const;
-    float getEcDilutionTargetL() const { return dilutionTargetL; }
+    float getEcDilutionTargetL() const {
+        // Em filling a UI não usa litros como stop — target só faz sentido no dreno.
+        if (dilutionState == DILUTION_FILLING || dilutionState == DILUTION_WAIT_FILL_ACK) {
+            return 0.0f;
+        }
+        return dilutionTargetL;
+    }
     float getEcDilutionProgressL() const { return dilutionProgressL; }
     bool isDilutionActive() const { return dilutionState != DILUTION_IDLE; }
+    bool isDilutionAwaitingValve() const {
+        return dilutionState == DILUTION_WAIT_DRAIN_ACK || dilutionState == DILUTION_WAIT_FILL_ACK;
+    }
+    /** true si este relé es dreno/fill de la dilución en curso (bloquea Manual). */
+    bool holdsDilutionValve(bool isLocal, const uint8_t* mac, int relay) const;
+    void notifyDilutionRelayAck(uint32_t commandId, bool success, bool actualOn);
+    void notifyDilutionObservedRelay(const uint8_t* mac, int relay, bool state, bool online);
+    /** idle|drain|fill|recirc — telemetría [RES]/[FLOW]. */
+    const char* getDilutionPhaseName() const {
+        switch (dilutionState) {
+            case DILUTION_WAIT_DRAIN_ACK:
+            case DILUTION_DRAINING: return "drain";
+            case DILUTION_WAIT_FILL_ACK:
+            case DILUTION_FILLING: return "fill";
+            case DILUTION_RECIRCULATING: return "recirc";
+            default: return "idle";
+        }
+    }
 
     void setDilutionAutoEnabled(bool enabled, bool saveToNVS = true);
     bool isDilutionAutoEnabled() const { return dilutionAutoEnabled; }
     void setDilutionRelays(int drainRelay, int fillRelay);
     void setDilutionSlaveRelays(const String& drainMac, int drainRelay,
                                 const String& fillMac, int fillRelay);
+    String getDilutionDrainSlaveMac() const { return dilutionDrainSlaveMac; }
+    String getDilutionFillSlaveMac() const { return dilutionFillSlaveMac; }
+    int getDilutionDrainRelay() const { return dilutionDrainRelay; }
+    int getDilutionFillRelay() const { return dilutionFillRelay; }
+    /** YFB5 sesión A→B para ScriptRunner (`wait_liters`). */
+    void resetFlowSession();
+    float getFlowSessionLiters();
+    /** Recirc física para opcode `recirc` (scripts de tanque). */
+    void setProcedureRecircActive(bool active);
     void setDilutionSlaveRelayCallback(DilutionSlaveRelayCallback cb, void* userData);
     void setDilutionMaxVolumeL(float maxL);
     void setDilutionFillFlowLps(float lps);
@@ -282,8 +345,10 @@ public:
 private:
     // Hardware
     LiquidCrystal_I2C lcd;
+#if HIDRO_ENABLE_DS18B20_FALLBACK
     OneWire oneWire;
     DallasTemperature sensors;
+#endif
     PCF8574 pcf1, pcf2;
 #if USE_PH_MODBUS_SENSOR
     PhModbusSensor* phModbusSensor;
@@ -297,10 +362,12 @@ private:
     // Status dos PCF8574
     bool pcf1_ok;
     bool pcf2_ok;
+    bool writeLocalPumpPin(int relay, bool logicalOn);
     
     // Status dos sensores
     bool sensorsOk;
     bool tankLevelOk;
+    LevelInterlockMode levelInterlockMode;
     
     // Leituras dos sensores
     float temperature;
@@ -322,14 +389,29 @@ private:
     // ✅ Controller KP e controle automático de EC
     ECController ecController;
     EcDilutionController ecDilutionController;
-    FlowmeterSensor* flowmeterSensor;
+    FlowSensorBank flowSensorBank;
+    WaterFlowSensor* waterFlowSensor;  // alias slot dilución (bank)
     float ecSetpoint;
     float ecTolerance;
     bool autoECEnabled;
     unsigned long lastECCheck;
     static const unsigned long EC_CHECK_INTERVAL = 30000; // 30 segundos
+    static const unsigned long CONSUMO_24H_MS = 24UL * 60UL * 60UL * 1000UL;
     int autoECIntervalSeconds;
     unsigned long tempoRecirculacaoSeconds;
+    float ecAggressiveness;
+    float ecPulseMl;
+    float ecPulseGapSec;
+    float pulseRemainingMl;
+    float pulseChunkMl;
+    unsigned long pulseOnDurationMs;
+    int pulseIndex;
+    bool consumoEc24hEnabled;
+    bool consumoEc24hWindowOpen;
+    float consumoEc24hT0;
+    unsigned long consumoEc24hStartMs;
+    bool consumoEc24hHungerPending;
+    bool consumoEc24hDilutePending;
     unsigned long lastECCheckAtMs;
     float ecAtLastSequenceStart;
     float ecSetpointAtLastSequence;
@@ -357,13 +439,24 @@ private:
     float mlPerPhUnitAcid;
     float mlPerPhUnitBase;
     float phAggressiveness;
+    float phPulseMl;
+    float phPulseGapSec;
+    float phPulseRemainingMl;
+    float phPulseChunkMl;
+    unsigned long phPulseOnDurationMs;
+    int phPulseIndex;
     float phGainAlpha;
     float phMaxDoseMl;
     int phMaxPulseSec;
     int phMaxConsecutive;
     int phConsecutiveCorrections;
     unsigned long phRecircSeconds;
-    enum PhAutoState { PH_IDLE, PH_DOSING, PH_RECIRCULATING };
+    bool consumoPh24hEnabled;
+    bool consumoPh24hWindowOpen;
+    float consumoPh24hT0;
+    unsigned long consumoPh24hStartMs;
+    bool consumoPh24hForcePending;
+    enum PhAutoState { PH_IDLE, PH_DOSING, PH_PULSE_GAP, PH_RECIRCULATING };
     PhAutoState phAutoState;
     unsigned long phStateStartMs;
     int phActiveRelay;
@@ -397,6 +490,7 @@ private:
     float dilutionTargetL;
     float dilutionProgressL;
     float dilutionDrainMeasuredL;
+    float dilutionProgressPublishedL;  // último progress enviado a telemetría
     unsigned long dilutionStateStartMs;
     unsigned long dilutionDrainStartMs;
     unsigned long dilutionFillStartMs;
@@ -410,10 +504,15 @@ private:
     void* ecDilutionCallbackUserData;
     DilutionSlaveRelayCallback dilutionSlaveRelayCallback;
     void* dilutionSlaveRelayCallbackUserData;
+    volatile uint32_t dilutionPendingCommandId;
+    volatile int8_t dilutionAckResult;  // 0=wait, 1=ok, -1=fail
+    int dilutionPendingRelay;
+    bool dilutionPendingExpectOn;
+    unsigned long dilutionAckDeadlineMs;
     
     // ✅ TEMPO MORTO (recirculação) - Aguardar após dosagem antes de medir EC novamente
     unsigned long lastDosageCompleteTime;  // Timestamp da última dosagem completa
-    unsigned long tankScriptHoldUntilMs;   // P1 interlock: pausa Auto EC/pH até este millis
+    int tankProcedureHoldCount;  // P1: nº de procedimientos tanque activos (sin timer)
     unsigned long tempoRecirculacao;       // Tempo de espera em SEGUNDOS
     
     // ✅ Sistema Sequencial de Dosagem (variáveis privadas)
@@ -436,6 +535,7 @@ private:
         String name;
         int relay;      // Índice do relé (0-15)
         float mlPerLiter;  // ml/L do nutriente
+        float flowRate;    // Vazão desta bomba (ml/s); 0 = usar flow_rate global
         float proportion;  // Proporção calculada (0.0 - 1.0)
         bool active;   // Se está ativo
     };
@@ -445,17 +545,37 @@ private:
     
     // Funções internas
     void updateSensors();
+    /** Poll L1-L4 cada LEVEL_POLL_MS (antes de Modbus/EC). */
+    void pollDiscreteLevels();
+    void refreshTankLevelOkFromAggregate();
+    void loadLevelInterlockModeFromNVS();
     void updateDisplay();
     void checkRelayTimers();
     void checkAutoEC();
     void checkAutoPH();  // ✅ Verificar e ajustar pH automaticamente
+    void tickConsumoEcWindow();
+    void tickConsumoPhWindow();
     void processPhAutoState();
     void processSimpleSequential();  // ✅ Máquina de estados para dosagem sequencial
+    void beginEcNutrientPulses();
+    bool startEcPulseOn();
+    void advanceAfterEcNutrientComplete(unsigned long now);
+    void beginPhDosePulses(float flowMlPerS);
+    bool startPhPulseOn(float flowMlPerS);
     void processDilution();
-    void setDilutionRelay(int relayIndex, bool on);
+    uint32_t setDilutionRelay(int relayIndex, bool on);
+    void beginDilutionValveWait(uint32_t commandId, int relay, bool expectOn);
+    void clearDilutionValveWait();
+    void confirmDilutionValveAck();
+    bool processDilutionValveWait(unsigned long now);
+    bool dilutionUsesSlaveDrain() const { return dilutionDrainSlaveMac.length() > 0; }
+    bool dilutionUsesSlaveFill() const { return dilutionFillSlaveMac.length() > 0; }
+    bool dilutionMacMatches(const uint8_t* mac, const String& configured) const;
     void finishDilutionDrainPhase();
     void finishDilutionSequence(bool success);
     void emitEcDilutionEvent();
+    bool isTankHighCapacitive() const;
+    void applyFlowCalibrationFromPpl(float ppl);
     void emitNutrientDoseEvent(const SimpleNutrient& nutrient);
     void notifyEcOperationChanged();
     void notifyPhOperationChanged();
@@ -477,6 +597,7 @@ private:
     void loadECControllerConfig();  // Carregar configuração do Controller ao iniciar
     void loadPHControllerConfig();  // Carregar SP/auto/interval pH do NVS ao iniciar
     void loadNutrientProportions();  // Carregar proporções nutricionais ao iniciar
+    float nutrientFlowRateMlPerSec(int idx) const;  // Vazão da bomba; fallback flow_rate global
     void loadEcCalibrationFromNVS();
     void saveEcCalibrationToNVS();
 };

@@ -1,0 +1,53 @@
+{
+  "id": "proc_dilution_hydraulic",
+  "name": "Diluição hidráulica (contrato)",
+  "description": "Mesmo contrato da FSM HydroControl: dreno por litros YFB5, fill até L1 alto, recirc sempre. Trigger típico EC overshoot; execução de produção continua na FSM até migração.",
+  "enabled": false,
+  "priority": 90,
+  "rule_json": {
+    "condition": {
+      "type": "sensor_compare",
+      "sensor": "ec",
+      "op": ">",
+      "value_min": 0
+    },
+    "script": {
+      "instructions": [
+        {
+          "type": "relay_action",
+          "role": "drain",
+          "action": "on"
+        },
+        {
+          "type": "wait_liters",
+          "liters": 5
+        },
+        {
+          "type": "relay_action",
+          "role": "drain",
+          "action": "off"
+        },
+        {
+          "type": "relay_action",
+          "role": "fill",
+          "action": "on"
+        },
+        {
+          "type": "wait_level",
+          "sensor": "level_1",
+          "op": "==",
+          "value": "alto"
+        },
+        {
+          "type": "relay_action",
+          "role": "fill",
+          "action": "off"
+        },
+        {
+          "type": "recirc",
+          "seconds": 0
+        }
+      ]
+    }
+  }
+}

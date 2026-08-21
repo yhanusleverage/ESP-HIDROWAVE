@@ -2,7 +2,8 @@
 
 | Tópico | QoS | Ação |
 |--------|-----|------|
-| `hidrowave/+/telemetry` | 0 | INSERT `hydro_measurements` |
+| `hidrowave/+/telemetry` | 0 | INSERT `hydro_measurements` (+ PATCH níveis se presentes) |
+| `hidrowave/+/levels` | 0 | PATCH `device_status` L1–L4 **on-change** (anti-flood 300 ms; **sem** throttle 30 s) |
 | `hidrowave/+/heartbeat` | 0 | PATCH `device_status` (saúde + presença) |
 | `hidrowave/+/status` | 0 | PATCH `device_status.is_online` (LWT `online:false`) |
 | `hidrowave/+/ec_operation` | 0 | PATCH `relay_master.ec_operation_*` |

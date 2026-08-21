@@ -90,7 +90,7 @@ flowchart TB
 
 1. `INSERT relay_commands` **igual** (auditoría intacta)
 2. `notifyDeviceRelayCommand` → skip silencioso o warn en logs Railway
-3. ESP detecta MQTT down → poll **10 s** (`COMMAND_POLL_INTERVAL_MQTT_DOWN_MS`)
+3. ESP detecta MQTT down → poll **20 s** (`COMMAND_POLL_INTERVAL_MQTT_DOWN_MS`)
 4. RPC `get_and_lock_master_commands` / slave → mismo `processRelayCommand(via=https)`
 
 **Dedup:** mismo `id` por MQTT no repite (`MqttCommandDedup` NVS ~32 ids). HTTPS usa lock RPC.

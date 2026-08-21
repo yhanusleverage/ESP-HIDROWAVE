@@ -8,12 +8,16 @@
 
 HydroControl::HydroControl()
     : lcd(0x27, 16, 2)
+#if HIDRO_ENABLE_DS18B20_FALLBACK
     , oneWire(TEMP_PIN)
     , sensors(&oneWire)
+#endif
     , pcf1(0x20)  // Primeiro PCF8574
     , pcf2(0x24)  // Segundo PCF8574
     , pcf1_ok(false)
     , pcf2_ok(false)
+    , tankLevelOk(false)
+    , levelInterlockMode(LEVEL_INTERLOCK_NORMAL)
     , ecController()  // ✅ Inicializar Controller KP
 {
     // Inicializa os estados dos relés
@@ -37,6 +41,19 @@ HydroControl::HydroControl()
     lastECCheckAtMs = 0;
     autoECIntervalSeconds = 30;  // Padrão: 30 segundos
     tempoRecirculacaoSeconds = 60;
+    ecAggressiveness = 0.5f;
+    ecPulseMl = 2.0f;
+    ecPulseGapSec = 2.0f;
+    pulseRemainingMl = 0.0f;
+    pulseChunkMl = 0.0f;
+    pulseOnDurationMs = 0;
+    pulseIndex = 0;
+    consumoEc24hEnabled = false;
+    consumoEc24hWindowOpen = false;
+    consumoEc24hT0 = 0.0f;
+    consumoEc24hStartMs = 0;
+    consumoEc24hHungerPending = false;
+    consumoEc24hDilutePending = false;
     ecAtLastSequenceStart = 0.0f;
     ecSetpointAtLastSequence = 0.0f;
     currentDoseSource = "auto_ec";
@@ -62,12 +79,23 @@ HydroControl::HydroControl()
     mlPerPhUnitAcid = 2.0f;
     mlPerPhUnitBase = 2.0f;
     phAggressiveness = 0.5f;
+    phPulseMl = 2.0f;
+    phPulseGapSec = 2.0f;
+    phPulseRemainingMl = 0.0f;
+    phPulseChunkMl = 0.0f;
+    phPulseOnDurationMs = 0;
+    phPulseIndex = 0;
     phGainAlpha = 0.2f;
     phMaxDoseMl = 50.0f;
     phMaxPulseSec = 120;
     phMaxConsecutive = 5;
     phConsecutiveCorrections = 0;
     phRecircSeconds = 60;
+    consumoPh24hEnabled = false;
+    consumoPh24hWindowOpen = false;
+    consumoPh24hT0 = 0.0f;
+    consumoPh24hStartMs = 0;
+    consumoPh24hForcePending = false;
     phAutoState = PH_IDLE;
     phStateStartMs = 0;
     phActiveRelay = -1;
@@ -85,7 +113,7 @@ HydroControl::HydroControl()
     phMetricCallbackUserData = nullptr;
     phGainLearnedCallback = nullptr;
     phGainLearnedCallbackUserData = nullptr;
-    tankScriptHoldUntilMs = 0;
+    tankProcedureHoldCount = 0;
 #if USE_PH_MODBUS_SENSOR
     phModbusSensor = nullptr;
 #else
@@ -118,13 +146,14 @@ HydroControl::HydroControl()
         dynamicProportions[i].name = "";
         dynamicProportions[i].relay = i;
         dynamicProportions[i].mlPerLiter = 0.0;
+        dynamicProportions[i].flowRate = 0.0;
         dynamicProportions[i].proportion = 0.0;
         dynamicProportions[i].active = false;
     }
 
-    flowmeterSensor = nullptr;
+    waterFlowSensor = nullptr;
     dilutionState = DILUTION_IDLE;
-    dilutionAutoEnabled = false;
+    dilutionAutoEnabled = true;
     dilutionDrainRelay = DILUTION_DRAIN_RELAY_DEFAULT;
     dilutionFillRelay = DILUTION_FILL_RELAY_DEFAULT;
     dilutionMaxVolumeL = DILUTION_MAX_VOLUME_L_DEFAULT;
@@ -132,6 +161,7 @@ HydroControl::HydroControl()
     dilutionTargetL = 0.0f;
     dilutionProgressL = 0.0f;
     dilutionDrainMeasuredL = 0.0f;
+    dilutionProgressPublishedL = -1.0f;
     dilutionStateStartMs = 0;
     dilutionDrainStartMs = 0;
     dilutionFillStartMs = 0;
@@ -144,6 +174,11 @@ HydroControl::HydroControl()
     ecDilutionCallbackUserData = nullptr;
     dilutionSlaveRelayCallback = nullptr;
     dilutionSlaveRelayCallbackUserData = nullptr;
+    dilutionPendingCommandId = 0;
+    dilutionAckResult = 0;
+    dilutionPendingRelay = -1;
+    dilutionPendingExpectOn = false;
+    dilutionAckDeadlineMs = 0;
 }
 
 /**
@@ -154,18 +189,18 @@ HydroControl::HydroControl()
  * 1. Wire.begin() - OBRIGATÓRIO PRIMEIRO (inicializa barramento I2C)
  * 2. Escanear dispositivos I2C (debug)
  * 3. lcd.begin(16, 2) - LCD I2C
- * 4. oneWire.begin(TEMP_PIN) - Barramento OneWire para sensores de temperatura
- * 5. sensors.begin() - Sensores DS18B20
- * 6. pHSensor = new phSensor() - Sensor de pH
+ * 4. DS18/OneWire — OFF permanente (HIDRO_ENABLE_DS18B20_FALLBACK=0); GPIO4 = YF-B5
+ * 5. Temp agua producción = Modbus pH reg0
+ * 6. pHSensor / PhModbusSensor
  * 7. ecSensor = new EcAnalogSensor() - Sensor EC analógico
- * 8. tankSensor = new LevelSensor() - Sensor de nível do tanque
+ * 8. tankSensor / DiscreteLevelBank - Sensor de nível
  * 9. delay(100) - Estabilizar barramento I2C
- * 10. pcf1.begin(false) - PCF8574 #1 (Relés 1-7) - false = não reiniciar I2C
- * 11. pcf2.begin(false) - PCF8574 #2 (Relé 8) - false = não reiniciar I2C
+ * 10. pcf1.begin(0xFF) - PCF8574 #1 (niveles) — NUNCA begin(false) (= write 0x00)
+ * 11. pcf2.begin(0xFF) - PCF8574 #2 (relés)
  * 
  * ⚠️ DEPENDÊNCIAS CRÍTICAS:
  * - Wire.begin() DEVE ser chamado PRIMEIRO
- * - pcf1.begin(false) e pcf2.begin(false) usam false para não reiniciar I2C
+ * - begin(false) en RobTillaart ≡ puerto a 0 → todo MOJADO en entradas
  * - Se PCF8574 falhar, relés não funcionarão
  * 
  * @return true se inicialização bem-sucedida, false caso contrário
@@ -179,12 +214,15 @@ bool HydroControl::begin() {
     static bool i2cInitialized = false;
     
     if (!i2cInitialized) {
-        Wire.begin();
+        Wire.begin(I2C_SDA, I2C_SCL);
+        Wire.setClock(I2C_CLOCK_HZ);
         i2cInitialized = true;
-        Serial.println("🔌 I2C inicializado (primeira vez)");
+        Serial.printf("🔌 I2C inicializado SDA=%d SCL=%d @ %u Hz\n",
+                      I2C_SDA, I2C_SCL, static_cast<unsigned>(I2C_CLOCK_HZ));
         delay(50); // Pequena pausa para estabilizar
     } else {
         Serial.println("ℹ️ I2C já estava inicializado (reutilizando)");
+        Wire.setClock(I2C_CLOCK_HZ);
     }
     
     Serial.println("🔍 Escaneando dispositivos I2C...");
@@ -204,8 +242,13 @@ bool HydroControl::begin() {
     lcd.print("Iniciando...");
 
     // Inicializar sensores
+#if HIDRO_ENABLE_DS18B20_FALLBACK
     oneWire.begin(TEMP_PIN);
     sensors.begin();
+    Serial.printf("[TEMP] DS18 OneWire GPIO%d (legacy; no usar con YFB5 en GPIO4)\n", TEMP_PIN);
+#else
+    Serial.println("[TEMP] DS18/OneWire OFF (permanente) — temp agua = Modbus pH; GPIO4 = YF-B5");
+#endif
 
 #if USE_PH_MODBUS_SENSOR
     phModbusSensor = new PhModbusSensor(PH_RS485_RX_PIN,
@@ -230,16 +273,23 @@ bool HydroControl::begin() {
     ecSensor->begin();
     loadEcCalibrationFromNVS();
 
-    flowmeterSensor = new FlowmeterSensor(FLOWMETER_PULSE_PIN, FLOWMETER_PULSES_PER_LITER);
-    flowmeterSensor->begin();
-    Serial.printf("[DILUTION] Fluxometro GPIO%d %.0f pulsos/L\n",
-                  FLOWMETER_PULSE_PIN, FLOWMETER_PULSES_PER_LITER);
+    // K = 396/ppl (datasheet). ppl se calibra con volumen real (balde), nunca con EC post-dilución.
+    const float nominalPpl = FLOW_PULSES_PER_LITER;
+    const float initialCal = (FLOWMETER_PULSES_PER_LITER > 0.0f)
+        ? (nominalPpl / FLOWMETER_PULSES_PER_LITER)
+        : FLOW_CALIBRATION_FACTOR;
+    flowSensorBank.beginDefaultDilution(
+        FLOW_SENSOR_PIN, FLOW_HZ_PER_LPM, initialCal, FLOW_WINDOW_MS);
+    waterFlowSensor = flowSensorBank.dilutionSensor();
+    Serial.printf("[DILUTION] YF-B5 GPIO%d Hz/Lpm=%.1f K=%.3f (FALLING+debounce; litros=pulsos/396*K)\n",
+                  FLOW_SENSOR_PIN, FLOW_HZ_PER_LPM, initialCal);
 
 #if !HIDRO_SIMULATE_WATER_LEVELS
     if (tankSensor == nullptr) {
         tankSensor = new LevelSensor(TANK_LOW_PIN, TANK_HIGH_PIN);
     }
     tankSensor->begin();
+    Serial.println("[LEVEL] HIDRO_SIMULATE_WATER_LEVELS=0 — L1-L4 vía PCF8574 @ 0x20 (NPN directo)");
 #else
     Serial.println("[LEVEL] HIDRO_SIMULATE_WATER_LEVELS=1 — L1-L4 simulados ON");
 #endif
@@ -261,18 +311,19 @@ bool HydroControl::begin() {
     bool pcf2Present = (Wire.endTransmission() == 0);
     
     // ✅ PCF1 (0x20) - Sensores capacitivos (ENTRADAS)
+    // RobTillaart begin(uint8_t): el arg es el valor del puerto, NO "skip Wire".
+    // begin(false) ≡ begin(0) ≡ write8(0x00) → P0-P3 stuck LOW → siempre MOJADO.
     if (pcf1Present) {
-        pcf1_ok = pcf1.begin(false);  // false para não reiniciar I2C
+        pcf1_ok = pcf1.begin(0xFF);  // todos HIGH = modo entrada + pull-up débil
         if (!pcf1_ok) {
             Serial.println("❌ [PCF1] Falha ao inicializar PCF8574 #1 (0x20)");
             Serial.println("   ⚠️ Verifique conexões I2C e endereço");
         } else {
             Serial.println("✅ [PCF1] PCF8574 #1 inicializado (0x20) - Sensores capacitivos");
-            // Configurar pinos como entrada (ao ler, configura automaticamente)
-            for (int i = 0; i < 8; i++) {
-                pcf1.read(i);  // Configurar como entrada
-            }
-            Serial.println("   📥 P0-P7 configurados como ENTRADAS (sensores)");
+            pcf1.write8(0xFF);  // asegurar pull-ups en P0-P7
+            Serial.println("   📥 P0-P7 HIGH (entradas L1-L4 + reserva)");
+            levelBank.begin();
+            levelBank.dumpRawPins(pcf1);
         }
     } else {
         Serial.println("⚠️ [PCF1] PCF8574 #1 (0x20) não detectado no barramento I2C");
@@ -281,7 +332,7 @@ bool HydroControl::begin() {
     
     // ✅ PCF2 (0x24) - Relés peristálticos (SAÍDAS) - TODOS os relés (0-7)
     if (pcf2Present) {
-        pcf2_ok = pcf2.begin(false);  // false para não reiniciar I2C
+        pcf2_ok = pcf2.begin(0xFF);  // HIGH = relé off; no usar begin(false)
         if (!pcf2_ok) {
             Serial.println("❌ [PCF2] Falha ao inicializar PCF8574 #2 (0x24)");
             Serial.println("   ⚠️ Verifique conexões I2C e endereço");
@@ -302,6 +353,7 @@ bool HydroControl::begin() {
     }
     
     Serial.println("✅ [PCF8574] Inicialização completa");
+    Serial.printf("[PCF] pcf1=%d pcf2=%d\n", pcf1_ok ? 1 : 0, pcf2_ok ? 1 : 0);
     Serial.println("╚════════════════════════════════════════════════════╝\n");
 
     // Resetar estados dos relés
@@ -315,6 +367,7 @@ bool HydroControl::begin() {
                   String(!pcf1_ok || !pcf2_ok ? " com avisos" : " sem erros"));
     
     // ✅ Carregar configuração persistida do Controller KP
+    loadLevelInterlockModeFromNVS();
     loadECControllerConfig();
     loadNutrientProportions();
     loadPHControllerConfig();
@@ -333,10 +386,36 @@ void HydroControl::loop() {
 }
 
 void HydroControl::update() {
+    pollDiscreteLevels();
     updateSensors();
-    if (flowmeterSensor) {
-        flowmeterSensor->tick();
+    flowSensorBank.tickAll();
+    waterFlowSensor = flowSensorBank.dilutionSensor();
+#if FLOW_SERIAL_DEBUG
+    if (waterFlowSensor && dilutionState != DILUTION_IDLE &&
+        waterFlowSensor->consumeWindowReady()) {
+        Serial.printf(
+            "[FLOW] F=%.1f valid=%d lvl=%d pulses=%lu Q=%.2f total=%.3f L rej=%s | dil=%s prog=%.2f/%.2f L\n",
+            waterFlowSensor->freqHz(),
+            waterFlowSensor->valid() ? 1 : 0,
+            waterFlowSensor->pinLevel(),
+            static_cast<unsigned long>(waterFlowSensor->lastWindowPulses()),
+            waterFlowSensor->flowRateLitersPerMin(),
+            waterFlowSensor->totalLiters(),
+            waterFlowSensor->rejectReason(),
+            getDilutionPhaseName(),
+            dilutionProgressL,
+            dilutionTargetL);
+#if FLOW_DEBUG
+        Serial.printf(
+            "[FLOW dbg] why=%s raw=%lu deb=%lu dt_min=%lu us dt_max=%lu us\n",
+            waterFlowSensor->rejectReason(),
+            static_cast<unsigned long>(waterFlowSensor->edgesRaw()),
+            static_cast<unsigned long>(waterFlowSensor->debounceRejects()),
+            static_cast<unsigned long>(waterFlowSensor->minIntervalUs()),
+            static_cast<unsigned long>(waterFlowSensor->maxIntervalUs()));
+#endif
     }
+#endif
     updateDisplay();
     checkRelayTimers();
     processPhAutoState();
@@ -344,6 +423,87 @@ void HydroControl::update() {
     checkAutoEC();
     checkAutoPH();
     processSimpleSequential();
+}
+
+void HydroControl::pollDiscreteLevels() {
+#if HIDRO_SIMULATE_WATER_LEVELS
+    tankLevelOk = true;
+#else
+    static unsigned long lastLevelPollMs = 0;
+    static unsigned long lastLevelLogMs = 0;
+    const unsigned long now = millis();
+
+    if (now - lastLevelPollMs < LEVEL_POLL_MS) {
+        return;
+    }
+    lastLevelPollMs = now;
+
+    if (levelBank.poll(pcf1, pcf1_ok)) {
+        refreshTankLevelOkFromAggregate();
+        if (now - lastLevelLogMs >= LEVEL_LOG_MS) {
+            lastLevelLogMs = now;
+            Serial.printf("LEVEL L1=%s L2=%s L3=%s L4=%s → %s ilock=%s\n",
+                levelBank.isWet(1) ? "MOJADO" : "SECO",
+                levelBank.isWet(2) ? "MOJADO" : "SECO",
+                levelBank.isWet(3) ? "MOJADO" : "SECO",
+                levelBank.isWet(4) ? "MOJADO" : "SECO",
+                levelBank.getWaterLevel(),
+                getLevelInterlockModeName());
+        }
+    } else if (tankSensor) {
+        tankLevelOk = tankSensor->checkWaterLevel();
+    } else {
+        tankLevelOk = false;
+    }
+#endif
+}
+
+void HydroControl::refreshTankLevelOkFromAggregate() {
+#if HIDRO_SIMULATE_WATER_LEVELS
+    tankLevelOk = true;
+    return;
+#endif
+    const char* wl = getWaterLevelAggregate();
+    if (!wl || !wl[0]) {
+        tankLevelOk = false;
+        return;
+    }
+    if (levelInterlockMode == LEVEL_INTERLOCK_CARRERA) {
+        tankLevelOk = (strcmp(wl, "alto") == 0);
+    } else {
+        tankLevelOk = (strcmp(wl, "vazio") != 0);
+    }
+}
+
+const char* HydroControl::getLevelInterlockModeName() const {
+    return levelInterlockMode == LEVEL_INTERLOCK_CARRERA ? "carrera" : "normal";
+}
+
+bool HydroControl::setLevelInterlockMode(LevelInterlockMode mode) {
+    if (mode != LEVEL_INTERLOCK_NORMAL && mode != LEVEL_INTERLOCK_CARRERA) {
+        return false;
+    }
+    levelInterlockMode = mode;
+    PreferencesManager::saveConfig("lvl_ilock", String(getLevelInterlockModeName()));
+    refreshTankLevelOkFromAggregate();
+    Serial.printf("[LEVEL] interlock_mode=%s water_level_ok=%d\n",
+                  getLevelInterlockModeName(), tankLevelOk ? 1 : 0);
+    return true;
+}
+
+void HydroControl::loadLevelInterlockModeFromNVS() {
+    String mode;
+    if (PreferencesManager::loadConfig("lvl_ilock", mode)) {
+        mode.toLowerCase();
+        if (mode == "carrera") {
+            levelInterlockMode = LEVEL_INTERLOCK_CARRERA;
+        } else {
+            levelInterlockMode = LEVEL_INTERLOCK_NORMAL;
+        }
+    } else {
+        levelInterlockMode = LEVEL_INTERLOCK_NORMAL;
+    }
+    Serial.printf("[LEVEL] interlock_mode loaded=%s\n", getLevelInterlockModeName());
 }
 
 bool HydroControl::isPhValidForTelemetry() const {
@@ -372,6 +532,7 @@ void HydroControl::updateSensors() {
     const unsigned long nowMs = millis();
     sensorsOk = true;
 
+#if HIDRO_ENABLE_DS18B20_FALLBACK
     auto readDs18b20Fallback = [this, nowMs]() {
         sensors.requestTemperatures();
         const float tempReading = sensors.getTempCByIndex(0);
@@ -385,9 +546,12 @@ void HydroControl::updateSensors() {
             sensorsOk = false;
         }
     };
+#endif
 
 #if !USE_PH_MODBUS_SENSOR
+#if HIDRO_ENABLE_DS18B20_FALLBACK
     readDs18b20Fallback();
+#endif
     float phReading = pHSensor->readPH(PH_PIN);
     const uint32_t phPinMv = analogReadMilliVolts(PH_PIN);
     if (isfinite(phReading) && isValidPhReading(phReading)) {
@@ -401,9 +565,7 @@ void HydroControl::updateSensors() {
     }
 #else
     const uint32_t phPinMv = 0;
-    if (!tempValid) {
-        readDs18b20Fallback();
-    }
+    // Temp agua = Modbus pH; no OneWire en GPIO4 (YF-B5)
 #endif
 
     if (ecSensor) {
@@ -429,8 +591,9 @@ void HydroControl::updateSensors() {
                     temperature = modbusTempC;
                     tempValid = true;
                     lastTempValidMs = nowMs;
-                } else {
-                    readDs18b20Fallback();
+                } else if (!tempValid) {
+                    tempValid = false;
+                    temperature = NAN;
                 }
             }
 #endif
@@ -517,21 +680,12 @@ void HydroControl::updateSensors() {
         Serial.printf(" valid=%d\n", tempValid ? 1 : 0);
     }
 
+    // Niveles L1-L4: poll en pollDiscreteLevels() (200 ms, antes de Modbus/EC)
 #if HIDRO_SIMULATE_WATER_LEVELS
     tankLevelOk = true;
 #else
-    if (levelBank.poll(pcf1, pcf1_ok)) {
-        tankLevelOk = levelBank.isLevelOk();
-        static unsigned long lastLevelLog = 0;
-        if (millis() - lastLevelLog >= 10000) {
-            lastLevelLog = millis();
-            Serial.printf("LEVEL L1=%s L2=%s L3=%s L4=%s → %s\n",
-                levelBank.isWet(1) ? "MOJADO" : "SECO",
-                levelBank.isWet(2) ? "MOJADO" : "SECO",
-                levelBank.isWet(3) ? "MOJADO" : "SECO",
-                levelBank.isWet(4) ? "MOJADO" : "SECO",
-                levelBank.getWaterLevel());
-        }
+    if (levelBank.isAvailable()) {
+        refreshTankLevelOkFromAggregate();
     } else if (tankSensor) {
         tankLevelOk = tankSensor->checkWaterLevel();
     } else {
@@ -617,88 +771,94 @@ void HydroControl::showMessage(String msg) {
     lcd.print(msg);
 }
 
-// ✅ NOVO: Define o estado do relé diretamente
-void HydroControl::setRelay(int relay, bool desiredState, int seconds) {
-    // ✅ Validação: Relés 0-7 (todos no PCF2)
+static void logPcf8574BusScan() {
+    char line[128];
+    int n = snprintf(line, sizeof(line), "[I2C]");
+    for (uint8_t addr = 0x20; addr <= 0x27; addr++) {
+        Wire.beginTransmission(addr);
+        const uint8_t st = Wire.endTransmission();
+        if (n < (int)sizeof(line) - 20) {
+            n += snprintf(line + n, sizeof(line) - n, " 0x%02X=%s", addr, st == 0 ? "ACK" : "NACK");
+        }
+    }
+    Serial.println(line);
+}
+
+bool HydroControl::writeLocalPumpPin(int relay, bool logicalOn) {
+    if (relay < 0 || relay >= 8) {
+        return false;
+    }
+    const uint8_t physical = logicalOn ? LOW : HIGH;
+    pcf2.write((uint8_t)relay, physical);
+    const int err = pcf2.lastError();
+    if (err != PCF8574_OK) {
+        Serial.printf("[PCF2] write R%d lastError=%d\n", relay + 1, err);
+        logPcf8574BusScan();
+        pcf2_ok = false;
+        return false;
+    }
+    relayStates[relay] = logicalOn;
+    pcf2_ok = true;
+    return true;
+}
+
+bool HydroControl::setRelay(int relay, bool desiredState, int seconds) {
     if (relay < 0 || relay >= 8) {
         Serial.printf("❌ [RELAY] Índice inválido: %d (deve ser 0-7)\n", relay);
-        return;
+        return false;
     }
-    
-    // ✅ Verificar se PCF2 está disponível
-    if (!pcf2_ok) {
-        Serial.printf("❌ [RELAY] PCF8574 #2 (0x24) não conectado!\n");
-        return;
-    }
-    
-    // Se já está no estado desejado, não fazer nada (exceto se tiver timer)
+
     if (relayStates[relay] == desiredState && seconds == 0) {
         Serial.printf("ℹ️ [RELAY] Relé %d já está %s\n", relay + 1, desiredState ? "ON" : "OFF");
-        return;
+        return true;
     }
-    
-    // Atualizar estado do relé
-    relayStates[relay] = desiredState;
-    bool physicalState = !desiredState;  // Invertido: LOW = ligado, HIGH = desligado
-    
-    // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
-    pcf2.write(relay, physicalState);
-    
+
+    if (!writeLocalPumpPin(relay, desiredState)) {
+        return false;
+    }
+
     const char* relayNames[] = {
         "Bomba pH-", "Bomba pH+", "Bomba A (Grow)", "Bomba B (Micro)",
         "Bomba C (Bloom)", "Bomba CalMag", "Luz UV", "Aerador"
     };
-    
-    Serial.printf("🔌 [RELAY %d] %s → %s", 
-        relay + 1,
+
+    Serial.printf("🔌 [R%d] %s → %s",
+        relay,
         relayNames[relay],
         desiredState ? "LIGADO" : "DESLIGADO"
     );
-    
-    // Configurar timer se necessário
+
     if (seconds > 0 && relayStates[relay]) {
         startTimes[relay] = millis();
         timerSeconds[relay] = seconds;
         Serial.printf(" (timer: %d segundos)", seconds);
     }
-    
+
     Serial.println();
+    return true;
 }
 
-void HydroControl::toggleRelay(int relay, int seconds) {
-    // ✅ Validação: Relés 0-7 (todos no PCF2)
+bool HydroControl::toggleRelay(int relay, int seconds) {
     if (relay < 0 || relay >= 8) {
         Serial.printf("❌ [RELAY] Índice inválido: %d (deve ser 0-7)\n", relay);
-        return;
+        return false;
     }
-    
-    // ✅ Verificar se PCF2 está disponível
-    if (!pcf2_ok) {
-        Serial.printf("❌ [RELAY] PCF8574 #2 (0x24) não conectado!\n");
-        return;
+
+    if (!writeLocalPumpPin(relay, !relayStates[relay])) {
+        return false;
     }
-    
-    // Inverter estado
-    relayStates[relay] = !relayStates[relay];
-    
-    // Lógica invertida: LOW = ligado, HIGH = desligado
-    bool pcfState = relayStates[relay] ? LOW : HIGH;
-    
-    // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
-    pcf2.write(relay, pcfState);
-    
+
     const char* relayNames[] = {
         "Bomba pH-", "Bomba pH+", "Bomba A (Grow)", "Bomba B (Micro)",
         "Bomba C (Bloom)", "Bomba CalMag", "Luz UV", "Aerador"
     };
-    
-    Serial.printf("🔌 [RELAY %d] %s → %s", 
-        relay + 1,
+
+    Serial.printf("🔌 [R%d] %s → %s",
+        relay,
         relayNames[relay],
         relayStates[relay] ? "LIGADO" : "DESLIGADO"
     );
-    
-    // Configurar timer se necessário
+
     if (seconds > 0 && relayStates[relay]) {
         startTimes[relay] = millis();
         timerSeconds[relay] = seconds;
@@ -707,22 +867,22 @@ void HydroControl::toggleRelay(int relay, int seconds) {
         startTimes[relay] = 0;
         timerSeconds[relay] = 0;
     }
-    
+
     Serial.println();
+    return true;
 }
 
 void HydroControl::checkRelayTimers() {
     unsigned long currentMillis = millis();
-    
+
     for(int i = 0; i < 8; i++) {  // ✅ Apenas 8 relés (0-7) no PCF2
         if(relayStates[i] && timerSeconds[i] > 0) {
             if((currentMillis - startTimes[i]) / 1000 >= timerSeconds[i]) {
-                relayStates[i] = false;
-                bool state = !relayStates[i];  // Invertido: LOW = ligado, HIGH = desligado
-                
-                // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
-                pcf2.write(i, state);
-                Serial.printf("⏰ [RELAY %d] Timer expirado - desligando automaticamente\n", i + 1);
+                if (writeLocalPumpPin(i, false)) {
+                    Serial.printf("⏰ [R%d] Timer expirado - desligando automaticamente\n", i);
+                } else {
+                    Serial.printf("⏰ [R%d] Timer expirado — write PCF2 falhou\n", i);
+                }
                 
                 timerSeconds[i] = 0;
                 startTimes[i] = 0;
@@ -765,48 +925,46 @@ bool HydroControl::isAutoDosingPausedByInterlock() const {
         return true;
     }
 #endif
-    const unsigned long now = millis();
-    return tankScriptHoldUntilMs > 0 && now < tankScriptHoldUntilMs;
+    if (dilutionState != DILUTION_IDLE) {
+        return true;
+    }
+    return tankProcedureHoldCount > 0;
 }
 
-void HydroControl::holdAutoDosingForTankScript(unsigned long durationMs) {
-    if (durationMs < TANK_SCRIPT_HOLD_MIN_MS) {
-        durationMs = TANK_SCRIPT_HOLD_MIN_MS;
+void HydroControl::setTankProcedureActive(bool active) {
+    if (active) {
+        tankProcedureHoldCount++;
+        if (tankProcedureHoldCount == 1) {
+            Serial.printf(
+                "🔒 [INTERLOCK P1] Auto EC/pH pausados — procedimento tanque ativo (priority >= %d)\n",
+                TANK_SCRIPT_PRIORITY_THRESHOLD);
+        }
+        return;
     }
-    const unsigned long until = millis() + durationMs;
-    if (until > tankScriptHoldUntilMs) {
-        tankScriptHoldUntilMs = until;
-        Serial.printf(
-            "🔒 [INTERLOCK P1] Auto EC/pH pausados ~%lu s (script tanque priority >= %d)\n",
-            durationMs / 1000UL,
-            TANK_SCRIPT_PRIORITY_THRESHOLD
-        );
+    if (tankProcedureHoldCount > 0) {
+        tankProcedureHoldCount--;
+    }
+    if (tankProcedureHoldCount == 0) {
+        Serial.println("🔓 [INTERLOCK P1] Auto EC/pH liberados — procedimento tanque terminou");
     }
 }
 
 // ✅ Função para verificar e ajustar EC automaticamente
 void HydroControl::checkAutoEC() {
-    if (!autoECEnabled && !dilutionAutoEnabled) {
+    if (!autoECEnabled) {
         static unsigned long lastDebugPrint = 0;
         unsigned long now = millis();
         if (now - lastDebugPrint >= 30000) {
             lastDebugPrint = now;
-            Serial.println("⚠️ [AUTO EC] auto_enabled e dilution_auto desativados");
+            Serial.println("⚠️ [AUTO EC] auto_enabled desativado");
         }
         return;
     }
 
-    if (!autoECEnabled) {
-        static unsigned long lastDebugPrint = 0;
-        const unsigned long now = millis();
-        if (now - lastDebugPrint >= 60000UL) {
-            lastDebugPrint = now;
-            Serial.println("ℹ️ [AUTO EC] nutrientes off — só diluição se dilution_auto=1");
-        }
-    } else {
+    {
         static unsigned long lastDebugPrint = 0;
         unsigned long now = millis();
-        if (now - lastDebugPrint >= 30000 && !dilutionAutoEnabled) {
+        if (now - lastDebugPrint >= 30000) {
             lastDebugPrint = now;
             Serial.printf("   💡 Valores: setpoint=%.0f ec=%.0f base_dose=%.2f\n",
                 ecSetpoint, ec, ecController.getBaseDose());
@@ -857,6 +1015,8 @@ void HydroControl::checkAutoEC() {
     lastECCheck = currentMillis;
     lastECCheckAtMs = currentMillis;
 
+    tickConsumoEcWindow();
+
     float ecForControl = ec;
 #if !HIDRO_DEV_RELAX_SENSORS
     if (!isValidEcMicroSiemens(ec)) {
@@ -869,8 +1029,10 @@ void HydroControl::checkAutoEC() {
     }
 #endif
 
-    if (dilutionAutoEnabled &&
-        ecDilutionController.needsDilution(ecSetpoint, ecForControl, ecTolerance)) {
+    if ((autoECEnabled &&
+        ecDilutionController.needsDilution(ecSetpoint, ecForControl, ecTolerance)) ||
+        consumoEc24hDilutePending) {
+        consumoEc24hDilutePending = false;
         float volumeL = ecDilutionController.calculateDrainVolumeLiters(
             ecSetpoint, ecForControl, ecController.getVolume());
         if (volumeL >= 0.1f) {
@@ -883,12 +1045,10 @@ void HydroControl::checkAutoEC() {
         return;
     }
 
-    if (!autoECEnabled) {
-        return;
-    }
-    
     // Verificar se precisa de ajuste (tolerância configurável — default 50 µS/cm)
-    const bool needsAdj = ecController.needsAdjustment(ecSetpoint, ecForControl, ecTolerance);
+    const bool needsAdj = ecController.needsAdjustment(ecSetpoint, ecForControl, ecTolerance)
+        || consumoEc24hHungerPending;
+    consumoEc24hHungerPending = false;
     const float ecError = ecSetpoint - ec;
     float dosageML = 0.0f;
     float dosageTime = 0.0f;
@@ -897,6 +1057,7 @@ void HydroControl::checkAutoEC() {
 
     if (needsAdj) {
         dosageML = ecController.calculateDosage(ecSetpoint, ecForControl);
+        dosageML *= ecAggressiveness;
 
         if (dosageML > 0.1f) {
             dosageTime = ecController.calculateDosageTime(dosageML);
@@ -933,6 +1094,82 @@ void HydroControl::checkAutoEC() {
 }
 
 // ✅ Máquina de estados para dosagem sequencial
+void HydroControl::beginEcNutrientPulses() {
+    if (currentNutrientIndex < 0 || currentNutrientIndex >= totalNutrients) {
+        return;
+    }
+    SimpleNutrient& n = nutrients[currentNutrientIndex];
+    pulseRemainingMl = n.dosageML;
+    pulseIndex = 0;
+    Serial.printf("🚀 [DOSAGEM] Iniciando: %s total=%.3fml pulse_ml=%.2f gap=%.2fs Relé %d\n",
+        n.name.c_str(), n.dosageML, ecPulseMl, ecPulseGapSec, n.relay + 1);
+    String displayMsg = n.name + ": " + String(n.dosageML, 2) + "ml";
+    showMessage(displayMsg);
+    startEcPulseOn();
+}
+
+bool HydroControl::startEcPulseOn() {
+    if (currentNutrientIndex < 0 || currentNutrientIndex >= totalNutrients) {
+        return false;
+    }
+    if (pulseRemainingMl <= 0.001f) {
+        return false;
+    }
+    SimpleNutrient& n = nutrients[currentNutrientIndex];
+    float q = n.flowRateMlPerS;
+    if (q < 0.01f) {
+        q = 1.0f;
+    }
+    pulseChunkMl = (pulseRemainingMl < ecPulseMl) ? pulseRemainingMl : ecPulseMl;
+    pulseOnDurationMs = (unsigned long)((pulseChunkMl / q) * 1000.0f);
+    if (pulseOnDurationMs < 100UL) {
+        pulseOnDurationMs = 100UL;
+    }
+    pulseIndex++;
+    Serial.printf("💉 [PULSO EC] #%d %s chunk=%.3fml restante=%.3f ON=%lums Relé %d\n",
+        pulseIndex, n.name.c_str(), pulseChunkMl, pulseRemainingMl - pulseChunkMl,
+        pulseOnDurationMs, n.relay + 1);
+    if (n.relay >= 0 && n.relay < 8) {
+        writeLocalPumpPin(n.relay, true);
+    }
+    currentState = DOSING;
+    stateStartTime = millis();
+    notifyEcOperationChanged();
+    return true;
+}
+
+void HydroControl::advanceAfterEcNutrientComplete(unsigned long now) {
+    SimpleNutrient& current = nutrients[currentNutrientIndex];
+    emitNutrientDoseEvent(current);
+    currentNutrientIndex++;
+
+    if (currentNutrientIndex >= totalNutrients) {
+        Serial.println("✅ SEQUÊNCIA COMPLETA - TODOS OS NUTRIENTES DOSADOS!");
+        if (tempoRecirculacaoSeconds > 0) {
+            currentState = RECIRCULATING;
+            stateStartTime = now;
+            Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n",
+                tempoRecirculacaoSeconds);
+            showMessage("Recirculando...");
+            notifyPhysicalRecirc(true, "ec");
+            notifyEcOperationChanged();
+        } else {
+            currentState = IDLE;
+            totalNutrients = 0;
+            currentNutrientIndex = 0;
+            currentSequenceId = "";
+            showMessage("Sequencia OK!");
+            notifyEcOperationChanged();
+        }
+    } else {
+        currentState = WAITING;
+        stateStartTime = now;
+        Serial.printf("⏳ Aguardando %ds antes do próximo nutriente...\n", intervalSeconds);
+        showMessage("Aguardando...");
+        notifyEcOperationChanged();
+    }
+}
+
 void HydroControl::processSimpleSequential() {
     if (currentState == IDLE) {
         return;
@@ -956,82 +1193,41 @@ void HydroControl::processSimpleSequential() {
     }
     
     if (currentState == DOSING) {
-        // ===== DOSANDO NUTRIENTE ATUAL =====
-        SimpleNutrient& current = nutrients[currentNutrientIndex];
-        
-        // Verificar tempo decorrido
         unsigned long elapsedTime = currentTime - stateStartTime;
-        
-        // Verificar se terminou a dosagem
-        if (elapsedTime >= current.durationMs) {
-            // ===== DESLIGAR RELÉ IMEDIATAMENTE =====
-            relayStates[current.relay] = false;
-            bool state = !relayStates[current.relay];  // Invertido: LOW = ligado, HIGH = desligado
-            
-            // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
+        if (elapsedTime >= pulseOnDurationMs) {
+            SimpleNutrient& current = nutrients[currentNutrientIndex];
             if (current.relay >= 0 && current.relay < 8) {
-                pcf2.write(current.relay, state);
-                Serial.printf("🔴 [DOSAGEM] Relé %d DESLIGADO após %.3fs\n", current.relay + 1, current.durationMs / 1000.0);
+                writeLocalPumpPin(current.relay, false);
+                Serial.printf("🔴 [PULSO EC] Relé %d OFF após %.3fs (chunk=%.3fml)\n",
+                    current.relay + 1, pulseOnDurationMs / 1000.0, pulseChunkMl);
+            }
+            pulseRemainingMl -= pulseChunkMl;
+            if (pulseRemainingMl < 0.0f) {
+                pulseRemainingMl = 0.0f;
             }
 
-            emitNutrientDoseEvent(current);
-            
-            // ===== PRÓXIMO NUTRIENTE OU INTERVALO =====
-            currentNutrientIndex++;
-            
-            if (currentNutrientIndex >= totalNutrients) {
-                Serial.println("✅ SEQUÊNCIA COMPLETA - TODOS OS NUTRIENTES DOSADOS!");
-                if (tempoRecirculacaoSeconds > 0) {
-                    currentState = RECIRCULATING;
+            if (pulseRemainingMl > 0.001f) {
+                if (ecPulseGapSec > 0.0f) {
+                    currentState = PULSE_GAP;
                     stateStartTime = currentTime;
-                    Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n",
-                        tempoRecirculacaoSeconds);
-                    showMessage("Recirculando...");
-                    notifyPhysicalRecirc(true, "ec");
+                    Serial.printf("⏳ [GAP EC] %.2fs até próximo pulso (restante=%.3fml)\n",
+                        ecPulseGapSec, pulseRemainingMl);
                     notifyEcOperationChanged();
                 } else {
-                    currentState = IDLE;
-                    totalNutrients = 0;
-                    currentNutrientIndex = 0;
-                    currentSequenceId = "";
-                    showMessage("Sequencia OK!");
-                    notifyEcOperationChanged();
+                    startEcPulseOn();
                 }
             } else {
-                // ===== AGUARDAR INTERVALO ANTES DO PRÓXIMO =====
-                currentState = WAITING;
-                stateStartTime = currentTime;
-                Serial.printf("⏳ Aguardando %ds antes do próximo nutriente...\n", intervalSeconds);
-                showMessage("Aguardando...");
-                notifyEcOperationChanged();
+                advanceAfterEcNutrientComplete(currentTime);
             }
         }
-        
+    } else if (currentState == PULSE_GAP) {
+        const unsigned long gapMs = (unsigned long)(ecPulseGapSec * 1000.0f);
+        if (currentTime - stateStartTime >= gapMs) {
+            startEcPulseOn();
+        }
     } else if (currentState == WAITING) {
-        // ===== AGUARDANDO INTERVALO CONFIGURADO =====
-        if (currentTime - stateStartTime >= (intervalSeconds * 1000)) {
-            // ===== INICIAR PRÓXIMO NUTRIENTE =====
-            SimpleNutrient& next = nutrients[currentNutrientIndex];
-            
-            Serial.printf("🚀 [DOSAGEM] Iniciando: %s - %.3fml por %.3fs - Relé %d\n", 
-                next.name.c_str(), next.dosageML, next.durationMs / 1000.0, next.relay + 1);
-            
-            // ===== LIGAR RELÉ =====
-            relayStates[next.relay] = true;
-            bool state = !relayStates[next.relay];  // Invertido: LOW = ligado, HIGH = desligado
-            
-            // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
-            if (next.relay >= 0 && next.relay < 8) {
-                pcf2.write(next.relay, state);
-            }
-            
-            // ===== MUDAR PARA DOSING =====
-            currentState = DOSING;
-            stateStartTime = currentTime;
-            
-            String displayMsg = next.name + ": " + String(next.dosageML, 2) + "ml";
-            showMessage(displayMsg);
-            notifyEcOperationChanged();
+        if (currentTime - stateStartTime >= (intervalSeconds * 1000UL)) {
+            beginEcNutrientPulses();
         }
     }
 }
@@ -1081,7 +1277,7 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
             // dosagemNutriente = u(t) × (mlPerLiter / totalMlPerLiter)
             float proportion = dynamicProportions[i].proportion;
             float nutDosage = totalML * proportion;
-            float nutTime = nutDosage / ecController.getFlowRate();
+            float nutTime = nutDosage / nutrientFlowRateMlPerSec(i);
             int durationMs = (int)(nutTime * 1000);
             
             if (durationMs < 100) durationMs = 100; // Mínimo 100ms
@@ -1098,20 +1294,30 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
 
                 if (existingIdx >= 0) {
                     nutrients[existingIdx].dosageML += nutDosage;
-                    nutrients[existingIdx].durationMs += durationMs;
+                    float q = nutrientFlowRateMlPerSec(i);
+                    if (q < 0.01f) q = 1.0f;
+                    nutrients[existingIdx].flowRateMlPerS = q;
+                    nutrients[existingIdx].durationMs = (int)((nutrients[existingIdx].dosageML / q) * 1000);
+                    if (nutrients[existingIdx].durationMs < 100) {
+                        nutrients[existingIdx].durationMs = 100;
+                    }
                     Serial.printf("⚠️  %s: +%.3fml unificado no relé %d (slot duplicado ignorado)\n",
                         dynamicProportions[i].name.c_str(), nutDosage, dynamicProportions[i].relay + 1);
                 } else {
+                    float q = nutrientFlowRateMlPerSec(i);
+                    if (q < 0.01f) q = 1.0f;
                     nutrients[totalNutrients].name = dynamicProportions[i].name;
                     nutrients[totalNutrients].relay = dynamicProportions[i].relay;
                     nutrients[totalNutrients].dosageML = nutDosage;
                     nutrients[totalNutrients].durationMs = durationMs;
+                    nutrients[totalNutrients].flowRateMlPerS = q;
 
-                    Serial.printf("📝 %s: %.3fml (%.1f%%) [%.2f ml/L] → %dms → Relé %d\n",
+                    Serial.printf("📝 %s: %.3fml (%.1f%%) [%.2f ml/L q=%.3f ml/s] → %dms → Relé %d\n",
                         dynamicProportions[i].name.c_str(),
                         nutDosage,
                         proportion * 100,
                         dynamicProportions[i].mlPerLiter,
+                        nutrientFlowRateMlPerSec(i),
                         durationMs,
                         dynamicProportions[i].relay + 1);
 
@@ -1148,6 +1354,8 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
                 nutrients[totalNutrients].relay = nutrientList[i].relay;
                 nutrients[totalNutrients].dosageML = nutDosage;
                 nutrients[totalNutrients].durationMs = durationMs;
+                nutrients[totalNutrients].flowRateMlPerS = ecController.getFlowRate() > 0.01f
+                    ? (float)ecController.getFlowRate() : 1.0f;
                 
                 Serial.printf("📝 %s: %.3fml (%.0f%%) → %dms → Relé %d\n", 
                     nutrientList[i].name.c_str(), nutDosage, nutrientList[i].ratio * 100, durationMs, nutrientList[i].relay + 1);
@@ -1158,29 +1366,10 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
     }
     
     if (totalNutrients > 0) {
-        // ===== INICIAR PRIMEIRO NUTRIENTE IMEDIATAMENTE =====
         currentNutrientIndex = 0;
-        currentState = DOSING;
-        stateStartTime = millis();
-        
-        SimpleNutrient& first = nutrients[0];
-        Serial.printf("🚀 [DOSAGEM] Iniciando PRIMEIRO: %s - %.3fml por %.3fs - Relé %d\n", 
-            first.name.c_str(), first.dosageML, first.durationMs / 1000.0, first.relay + 1);
-        
-        // ===== LIGAR PRIMEIRO RELÉ =====
-        relayStates[first.relay] = true;
-        bool state = !relayStates[first.relay];  // Invertido: LOW = ligado, HIGH = desligado
-        
-        // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
-        if (first.relay >= 0 && first.relay < 8) {
-            pcf2.write(first.relay, state);
-        }
-        
-        String displayMsg = first.name + ": " + String(first.dosageML, 2) + "ml";
-        showMessage(displayMsg);
-        
-        Serial.printf("✅ [DOSAGEM] SISTEMA SEQUENCIAL INICIADO: %d nutrientes, intervalo %ds\n", totalNutrients, intervalSeconds);
-        notifyEcOperationChanged();
+        Serial.printf("✅ [DOSAGEM] SISTEMA SEQUENCIAL INICIADO: %d nutrientes, intervalo %ds, pulse_ml=%.2f gap=%.2fs\n",
+            totalNutrients, intervalSeconds, ecPulseMl, ecPulseGapSec);
+        beginEcNutrientPulses();
     } else {
         Serial.println("❌ Nenhuma dosagem significativa para executar");
         currentState = IDLE;
@@ -1229,33 +1418,19 @@ void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
         nutrients[totalNutrients].relay = relay;
         nutrients[totalNutrients].dosageML = dosageML;
         nutrients[totalNutrients].durationMs = durationMs;
+        {
+            float q = (durationMs > 0) ? (dosageML / (durationMs / 1000.0f)) : 1.0f;
+            if (q < 0.01f) q = 1.0f;
+            nutrients[totalNutrients].flowRateMlPerS = q;
+        }
         totalNutrients++;
     }
     
     if (totalNutrients > 0) {
-        // ===== INICIAR PRIMEIRO NUTRIENTE =====
         currentNutrientIndex = 0;
-        currentState = DOSING;
-        stateStartTime = millis();
-        
-        SimpleNutrient& first = nutrients[0];
-        Serial.printf("🚀 [DOSAGEM] Iniciando PRIMEIRO (Web): %s - %.3fml por %.3fs - Relé %d\n", 
-            first.name.c_str(), first.dosageML, first.durationMs / 1000.0, first.relay + 1);
-        
-        // ===== LIGAR PRIMEIRO RELÉ =====
-        relayStates[first.relay] = true;
-        bool state = !relayStates[first.relay];  // Invertido: LOW = ligado, HIGH = desligado
-        
-        // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
-        if (first.relay >= 0 && first.relay < 8) {
-            pcf2.write(first.relay, state);
-        }
-        
-        String displayMsg = first.name + ": " + String(first.dosageML, 2) + "ml";
-        showMessage(displayMsg);
-        
-        Serial.printf("✅ [DOSAGEM] SISTEMA WEB INICIADO: %d nutrientes, intervalo %ds\n", totalNutrients, intervalSeconds);
-        notifyEcOperationChanged();
+        Serial.printf("✅ [DOSAGEM] SISTEMA WEB INICIADO: %d nutrientes, intervalo %ds, pulse_ml=%.2f gap=%.2fs\n",
+            totalNutrients, intervalSeconds, ecPulseMl, ecPulseGapSec);
+        beginEcNutrientPulses();
     } else {
         Serial.println("❌ Nenhum nutriente válido recebido da web");
         currentState = IDLE;
@@ -1275,15 +1450,11 @@ void HydroControl::cancelCurrentDosage() {
             notifyPhysicalRecirc(false, "ec");
         }
         
-        if (currentState == DOSING) {
+        if (currentState == DOSING || currentState == PULSE_GAP) {
             // Desligar relé atual imediatamente
             SimpleNutrient& current = nutrients[currentNutrientIndex];
-            relayStates[current.relay] = false;
-            bool state = !relayStates[current.relay];  // Invertido: LOW = ligado, HIGH = desligado
-            
-            // ✅ TODOS os relés estão no PCF2 (0x24) - mapeamento direto
             if (current.relay >= 0 && current.relay < 8) {
-                pcf2.write(current.relay, state);
+                writeLocalPumpPin(current.relay, false);
             }
             
             Serial.printf("🔴 Relé %d CANCELADO (era %s)\n", current.relay + 1, current.name.c_str());
@@ -1337,6 +1508,7 @@ void HydroControl::updateNutrientProportions(JsonArray nutrients) {
         dynamicProportions[i].name = "";
         dynamicProportions[i].relay = i;
         dynamicProportions[i].mlPerLiter = 0.0;
+        dynamicProportions[i].flowRate = 0.0;
         dynamicProportions[i].proportion = 0.0;
         dynamicProportions[i].active = false;
     }
@@ -1357,6 +1529,27 @@ void HydroControl::updateNutrientProportions(JsonArray nutrients) {
         saveNutrientProportions();
         return;
     }
+
+    float flowByRelay[16];
+    for (int i = 0; i < 16; i++) {
+        flowByRelay[i] = 0.0f;
+    }
+    for (JsonVariant nutrient : nutrients) {
+        int relayNumber = nutrient["relayNumber"].as<int>();
+        int relay = relayNumber - 1;
+        if (relay < 0 || relay >= NUM_RELAYS || relay >= 16) {
+            continue;
+        }
+        float q = 0.0f;
+        if (nutrient.containsKey("flowRate")) {
+            q = nutrient["flowRate"].as<float>();
+        } else if (nutrient.containsKey("flow_rate")) {
+            q = nutrient["flow_rate"].as<float>();
+        }
+        if (q > 0.01f) {
+            flowByRelay[relay] = q;
+        }
+    }
     
     // Segundo passo: calcular proporções e armazenar
     for (JsonVariant nutrient : nutrients) {
@@ -1366,6 +1559,18 @@ void HydroControl::updateNutrientProportions(JsonArray nutrients) {
         int relayNumber = nutrient["relayNumber"].as<int>();  // 1-16 do frontend
         int relay = relayNumber - 1;  // Converter para índice 0-15
         float mlPerLiter = nutrient["mlPerLiter"].as<float>();
+        float flowRate = 0.0f;
+        if (nutrient.containsKey("flowRate")) {
+            flowRate = nutrient["flowRate"].as<float>();
+        } else if (nutrient.containsKey("flow_rate")) {
+            flowRate = nutrient["flow_rate"].as<float>();
+        }
+        if (flowRate < 0.0f) {
+            flowRate = 0.0f;
+        }
+        if (flowRate <= 0.01f && relay >= 0 && relay < 16) {
+            flowRate = flowByRelay[relay];
+        }
         
         // Validar relé
         if (relay < 0 || relay >= NUM_RELAYS) {
@@ -1380,11 +1585,12 @@ void HydroControl::updateNutrientProportions(JsonArray nutrients) {
             dynamicProportions[activeNutrientsCount].name = name;
             dynamicProportions[activeNutrientsCount].relay = relay;
             dynamicProportions[activeNutrientsCount].mlPerLiter = mlPerLiter;
+            dynamicProportions[activeNutrientsCount].flowRate = flowRate;
             dynamicProportions[activeNutrientsCount].proportion = proportion;
             dynamicProportions[activeNutrientsCount].active = true;
             
-            Serial.printf("   ✅ %s: %.2f ml/L (%.1f%%) → Relé %d\n", 
-                name.c_str(), mlPerLiter, proportion * 100, relayNumber);
+            Serial.printf("   ✅ %s: %.2f ml/L (%.1f%%) q=%.3f ml/s → Relé %d\n",
+                name.c_str(), mlPerLiter, proportion * 100, flowRate, relayNumber);
             
             activeNutrientsCount++;
         }
@@ -1476,7 +1682,7 @@ void HydroControl::loadECControllerConfig() {
     if (fillRelay >= 0 && fillRelay < 8) dilutionFillRelay = (int)fillRelay;
     if (maxVol > 0.0f) dilutionMaxVolumeL = maxVol;
     if (fillLps > 0.0f) dilutionFillFlowLps = fillLps;
-    if (flowmeterSensor && ppl > 0.0f) flowmeterSensor->setPulsesPerLiter(ppl);
+    if (ppl > 0.0f) applyFlowCalibrationFromPpl(ppl);
     Serial.printf("   • dilution_auto:    %s\n", dilutionAutoEnabled ? "true" : "false");
     Serial.printf("   • dil_drain_relay:  %d\n", dilutionDrainRelay);
     Serial.printf("   • dil_fill_relay:   %d\n", dilutionFillRelay);
@@ -1599,14 +1805,17 @@ void HydroControl::loadNutrientProportions() {
         String nameKey = "nut_" + String(i) + "_name";
         String relayKey = "nut_" + String(i) + "_relay";
         String mlKey = "nut_" + String(i) + "_ml";
+        String qKey = "nut_" + String(i) + "_q";
         
         String name;
         int32_t relayNumber = 0;
         float mlPerLiter = 0.0;
+        float flowRate = 0.0;
         
         if (!PreferencesManager::loadConfig(nameKey, name)) continue;
         if (!PreferencesManager::loadConfigInt(relayKey, relayNumber)) continue;
         if (!PreferencesManager::loadConfigFloat(mlKey, mlPerLiter)) continue;
+        PreferencesManager::loadConfigFloat(qKey, flowRate);
         
         if (mlPerLiter <= 0.0) continue;
         
@@ -1619,16 +1828,25 @@ void HydroControl::loadNutrientProportions() {
         dynamicProportions[activeNutrientsCount].name = name;
         dynamicProportions[activeNutrientsCount].relay = relay;
         dynamicProportions[activeNutrientsCount].mlPerLiter = mlPerLiter;
+        dynamicProportions[activeNutrientsCount].flowRate = flowRate > 0.0f ? flowRate : 0.0f;
         dynamicProportions[activeNutrientsCount].proportion = proportion;
         dynamicProportions[activeNutrientsCount].active = true;
         
-        Serial.printf("   ✅ %s: %.2f ml/L (%.1f%%) → Relé %d\n", 
-            name.c_str(), mlPerLiter, proportion * 100, relayNumber);
+        Serial.printf("   ✅ %s: %.2f ml/L (%.1f%%) q=%.3f ml/s → Relé %d\n",
+            name.c_str(), mlPerLiter, proportion * 100, dynamicProportions[activeNutrientsCount].flowRate, relayNumber);
         
         activeNutrientsCount++;
     }
     
     Serial.printf("✅ %d proporções nutricionais carregadas do NVS\n", activeNutrientsCount);
+}
+
+float HydroControl::nutrientFlowRateMlPerSec(int idx) const {
+    if (idx >= 0 && idx < activeNutrientsCount && dynamicProportions[idx].flowRate > 0.01f) {
+        return dynamicProportions[idx].flowRate;
+    }
+    const float globalQ = ecController.getFlowRate();
+    return globalQ > 0.01f ? globalQ : 1.0f;
 }
 
 // ✅ Implementação dos setters com persistência automática
@@ -1651,6 +1869,7 @@ void HydroControl::setAutoECEnabled(bool enabled, bool saveToNVS) {
         cancelCurrentDosage();
     }
     autoECEnabled = enabled;
+    dilutionAutoEnabled = enabled || dilutionAutoEnabled;
     if (saveToNVS) {
         saveECControllerConfig();
     }
@@ -1664,6 +1883,126 @@ void HydroControl::setAutoECInterval(int intervalSeconds, bool saveToNVS) {
     if (saveToNVS) {
         saveECControllerConfig();
     }
+}
+
+static float clampEcAggressiveness(float fraction) {
+    if (fraction < 0.05f) return 0.05f;
+    if (fraction > 1.0f) return 1.0f;
+    return fraction;
+}
+
+void HydroControl::setMaxStepEcFraction(float fraction) {
+    ecAggressiveness = clampEcAggressiveness(fraction);
+    Serial.printf("📐 [AUTO EC] aggressiveness / maxStep=%.2f\n", ecAggressiveness);
+}
+
+void HydroControl::setEcPulseDosing(float pulseMl, float pulseGapSec) {
+    ecPulseMl = pulseMl;
+    if (ecPulseMl < 0.05f) ecPulseMl = 0.05f;
+    if (ecPulseMl > 50.0f) ecPulseMl = 50.0f;
+    ecPulseGapSec = pulseGapSec;
+    if (ecPulseGapSec < 0.0f) ecPulseGapSec = 0.0f;
+    if (ecPulseGapSec > 120.0f) ecPulseGapSec = 120.0f;
+    Serial.printf("📐 [AUTO EC] pulse_ml=%.2f gap=%.2fs\n", ecPulseMl, ecPulseGapSec);
+}
+
+void HydroControl::setPhPulseDosing(float pulseMl, float pulseGapSec) {
+    phPulseMl = pulseMl;
+    if (phPulseMl < 0.05f) phPulseMl = 0.05f;
+    if (phPulseMl > 50.0f) phPulseMl = 50.0f;
+    phPulseGapSec = pulseGapSec;
+    if (phPulseGapSec < 0.0f) phPulseGapSec = 0.0f;
+    if (phPulseGapSec > 120.0f) phPulseGapSec = 120.0f;
+    Serial.printf("📐 [AUTO PH] pulse_ml=%.2f gap=%.2fs\n", phPulseMl, phPulseGapSec);
+}
+
+void HydroControl::setConsumoEc24hEnabled(bool enabled) {
+    if (enabled && !consumoEc24hEnabled) {
+        consumoEc24hT0 = ec;
+        consumoEc24hStartMs = millis();
+        consumoEc24hWindowOpen = ecValid;
+        consumoEc24hHungerPending = false;
+        consumoEc24hDilutePending = false;
+        Serial.printf("📅 [CONSUMO EC 24h] ON — t0=%.0f µS/cm\n", consumoEc24hT0);
+    }
+    if (!enabled && consumoEc24hEnabled) {
+        consumoEc24hWindowOpen = false;
+        consumoEc24hHungerPending = false;
+        consumoEc24hDilutePending = false;
+        Serial.println("📅 [CONSUMO EC 24h] OFF");
+    }
+    consumoEc24hEnabled = enabled;
+}
+
+void HydroControl::setConsumoPh24hEnabled(bool enabled) {
+    if (enabled && !consumoPh24hEnabled) {
+        consumoPh24hT0 = pH;
+        consumoPh24hStartMs = millis();
+        consumoPh24hWindowOpen = phValid;
+        consumoPh24hForcePending = false;
+        Serial.printf("📅 [CONSUMO pH 24h] ON — t0=%.2f\n", consumoPh24hT0);
+    }
+    if (!enabled && consumoPh24hEnabled) {
+        consumoPh24hWindowOpen = false;
+        consumoPh24hForcePending = false;
+        Serial.println("📅 [CONSUMO pH 24h] OFF");
+    }
+    consumoPh24hEnabled = enabled;
+}
+
+void HydroControl::tickConsumoEcWindow() {
+    if (!consumoEc24hEnabled || !autoECEnabled || !ecValid) {
+        return;
+    }
+    if (!consumoEc24hWindowOpen) {
+        consumoEc24hT0 = ec;
+        consumoEc24hStartMs = millis();
+        consumoEc24hWindowOpen = true;
+        return;
+    }
+    if ((millis() - consumoEc24hStartMs) < CONSUMO_24H_MS) {
+        return;
+    }
+    const float deltaEc = consumoEc24hT0 - ec;
+    Serial.printf("📅 [CONSUMO EC 24h] fim janela Δ=%.0f (t0=%.0f now=%.0f)\n",
+                  deltaEc, consumoEc24hT0, ec);
+    if (deltaEc > ecTolerance) {
+        consumoEc24hHungerPending = true;
+        Serial.println("📅 [CONSUMO EC 24h] fome — nutrientes de período");
+    } else if (deltaEc < -ecTolerance) {
+        consumoEc24hDilutePending = true;
+        Serial.println("📅 [CONSUMO EC 24h] EC subiu — validar diluição");
+    }
+    consumoEc24hT0 = ec;
+    consumoEc24hStartMs = millis();
+}
+
+void HydroControl::tickConsumoPhWindow() {
+    if (!consumoPh24hEnabled || !autoPHEnabled || !phValid) {
+        return;
+    }
+    if (!consumoPh24hWindowOpen) {
+        consumoPh24hT0 = pH;
+        consumoPh24hStartMs = millis();
+        consumoPh24hWindowOpen = true;
+        return;
+    }
+    if ((millis() - consumoPh24hStartMs) < CONSUMO_24H_MS) {
+        return;
+    }
+    const float deltaPh = pH - consumoPh24hT0;
+    Serial.printf("📅 [CONSUMO pH 24h] fim janela Δ=%.2f (t0=%.2f now=%.2f)\n",
+                  deltaPh, consumoPh24hT0, pH);
+    if (fabsf(deltaPh) > phTolerance) {
+        consumoPh24hForcePending = true;
+        if (deltaPh > 0) {
+            Serial.println("📅 [CONSUMO pH 24h] pH subiu — Down");
+        } else {
+            Serial.println("📅 [CONSUMO pH 24h] pH desceu — Up");
+        }
+    }
+    consumoPh24hT0 = pH;
+    consumoPh24hStartMs = millis();
 }
 
 void HydroControl::setTempoRecirculacaoSeconds(unsigned long seconds) {
@@ -1792,6 +2131,12 @@ void HydroControl::emitNutrientDoseEvent(const SimpleNutrient& nutrient) {
 int HydroControl::computeEcOperationRemainingSec() const {
     if (dilutionState != DILUTION_IDLE) {
         const unsigned long elapsedMs = millis() - dilutionStateStartMs;
+        if (dilutionState == DILUTION_WAIT_DRAIN_ACK || dilutionState == DILUTION_WAIT_FILL_ACK) {
+            if (dilutionAckDeadlineMs > millis()) {
+                return (int)((dilutionAckDeadlineMs - millis()) / 1000UL);
+            }
+            return 0;
+        }
         if (dilutionState == DILUTION_DRAINING) {
             if (dilutionFillFlowLps > 0.0f && dilutionTargetL > dilutionProgressL) {
                 const float remL = dilutionTargetL - dilutionProgressL;
@@ -1822,17 +2167,26 @@ int HydroControl::computeEcOperationRemainingSec() const {
         long rem = (long)tempoRecirculacaoSeconds - (long)(elapsedMs / 1000UL);
         return rem > 0 ? (int)rem : 0;
     }
+    if (currentState == PULSE_GAP) {
+        long rem = (long)(ecPulseGapSec * 1000.0f - (float)elapsedMs) / 1000L;
+        return rem > 0 ? (int)rem : 0;
+    }
     if (currentState == DOSING && currentNutrientIndex < totalNutrients) {
-        const SimpleNutrient& current = nutrients[currentNutrientIndex];
-        long rem = (long)(current.durationMs - elapsedMs) / 1000L;
+        long rem = (long)(pulseOnDurationMs - elapsedMs) / 1000L;
         return rem > 0 ? (int)rem : 0;
     }
     return 0;
 }
 
 const char* HydroControl::getEcOperationStateName() const {
+    if (dilutionState == DILUTION_WAIT_DRAIN_ACK) {
+        return "diluting_draining";
+    }
     if (dilutionState == DILUTION_DRAINING) {
         return "diluting_draining";
+    }
+    if (dilutionState == DILUTION_WAIT_FILL_ACK) {
+        return "diluting_filling";
     }
     if (dilutionState == DILUTION_FILLING) {
         return "diluting_filling";
@@ -1845,8 +2199,9 @@ const char* HydroControl::getEcOperationStateName() const {
     }
     switch (currentState) {
         case DOSING:
+        case PULSE_GAP:
         case WAITING:
-            // WAITING (~3s entre nutrientes) — mesma secuencia; UI só mostra "Dosando"
+            // WAITING / PULSE_GAP — mesma secuencia; UI só mostra "Dosando"
             return "dosing";
         case RECIRCULATING:
             return "recirculating";
@@ -1871,7 +2226,7 @@ int HydroControl::getEcNextCheckInSec() const {
     if (dilutionState != DILUTION_IDLE || currentState != IDLE) {
         return 0;
     }
-    if (!autoECEnabled && !dilutionAutoEnabled) {
+    if (!autoECEnabled) {
         return 0;
     }
     unsigned long checkInterval = autoECIntervalSeconds > 0 ?
@@ -1903,10 +2258,12 @@ void HydroControl::saveNutrientProportions() {
         String nameKey = "nut_" + String(i) + "_name";
         String relayKey = "nut_" + String(i) + "_relay";
         String mlKey = "nut_" + String(i) + "_ml";
+        String qKey = "nut_" + String(i) + "_q";
         
         success &= PreferencesManager::saveConfig(nameKey, dynamicProportions[i].name);
         success &= PreferencesManager::saveConfigInt(relayKey, dynamicProportions[i].relay + 1);  // Salvar como 1-16
         success &= PreferencesManager::saveConfigFloat(mlKey, dynamicProportions[i].mlPerLiter);
+        success &= PreferencesManager::saveConfigFloat(qKey, dynamicProportions[i].flowRate);
     }
     
     // Salvar totalMlPerLiter também
@@ -1931,6 +2288,12 @@ void HydroControl::setPHSetpoint(float setpoint, bool saveToNVS) {
 void HydroControl::setAutoPHEnabled(bool enabled, bool saveToNVS) {
     autoPHEnabled = enabled;
     if (!enabled && phAutoState != PH_IDLE) {
+        if (phActiveRelay >= 0 && phActiveRelay < 8) {
+            writeLocalPumpPin(phActiveRelay, false);
+        }
+        if (phAutoState == PH_RECIRCULATING) {
+            notifyPhysicalRecirc(false, "ph");
+        }
         phAutoState = PH_IDLE;
         phActiveRelay = -1;
         notifyPhOperationChanged();
@@ -2004,6 +2367,36 @@ void HydroControl::notifyPhOperationChanged() {
     }
 }
 
+void HydroControl::beginPhDosePulses(float flowMlPerS) {
+    float q = flowMlPerS > 0.01f ? flowMlPerS : 1.0f;
+    phPulseRemainingMl = phCycleMlApplied;
+    phPulseIndex = 0;
+    startPhPulseOn(q);
+}
+
+bool HydroControl::startPhPulseOn(float flowMlPerS) {
+    float q = flowMlPerS > 0.01f ? flowMlPerS : 1.0f;
+    if (phPulseRemainingMl <= 0.001f) {
+        return false;
+    }
+    phPulseChunkMl = (phPulseRemainingMl < phPulseMl) ? phPulseRemainingMl : phPulseMl;
+    phPulseOnDurationMs = (unsigned long)((phPulseChunkMl / q) * 1000.0f);
+    if (phPulseOnDurationMs < 100UL) {
+        phPulseOnDurationMs = 100UL;
+    }
+    phPulseIndex++;
+    Serial.printf("💉 [PULSO pH] #%d chunk=%.3fml restante=%.3f ON=%lums Relé %d\n",
+        phPulseIndex, phPulseChunkMl, phPulseRemainingMl - phPulseChunkMl,
+        phPulseOnDurationMs, phActiveRelay + 1);
+    if (phActiveRelay >= 0 && phActiveRelay < 8) {
+        writeLocalPumpPin(phActiveRelay, true);
+    }
+    phAutoState = PH_DOSING;
+    phStateStartMs = millis();
+    notifyPhOperationChanged();
+    return true;
+}
+
 void HydroControl::startPhAutoDosage(int relay, float durationSec, PhCorrectionPath path,
                                      float mlApplied, float hBefore, float phBefore) {
 #if PH_PROTOTYPE_RELAX_GUARDS
@@ -2017,7 +2410,6 @@ void HydroControl::startPhAutoDosage(int relay, float durationSec, PhCorrectionP
 #endif
     const char* pathLabel = (path == PH_PATH_BASE) ? "pH+" : (path == PH_PATH_ACID) ? "pH-" : "pH";
 
-    phAutoState = PH_DOSING;
     phActiveRelay = relay;
     phActivePath = path;
     phCycleHBefore = hBefore;
@@ -2032,21 +2424,12 @@ void HydroControl::startPhAutoDosage(int relay, float durationSec, PhCorrectionP
     phConsecutiveCorrections++;
     phStateStartMs = millis();
 
-    Serial.printf("🚀 [DOSAGEM pH] Iniciando: %s - %.3fml por %.3fs - Relé %d\n",
-        pathLabel, mlApplied, phCycleDurationMs / 1000.0, relay + 1);
+    const float flow = (path == PH_PATH_BASE) ? flowRatePhUp : flowRatePhDown;
+    Serial.printf("🚀 [DOSAGEM pH] Iniciando: %s - %.3fml (pulsos %.2fml / gap %.2fs) - Relé %d\n",
+        pathLabel, mlApplied, phPulseMl, phPulseGapSec, relay + 1);
 
-    relayStates[relay] = true;
-    bool state = !relayStates[relay];
-    if (relay >= 0 && relay < 8) {
-        if (pcf2_ok) {
-            pcf2.write(relay, state);
-        } else {
-            Serial.println("❌ [RELAY] PCF8574 #2 (0x24) não conectado!");
-        }
-    }
-
+    beginPhDosePulses(flow);
     Serial.printf("✅ [DOSAGEM pH] Ciclo iniciado: %.3f ml, relé %d\n", mlApplied, relay + 1);
-    notifyPhOperationChanged();
 }
 
 void HydroControl::finishPhRecirculation() {
@@ -2104,26 +2487,46 @@ void HydroControl::processPhAutoState() {
 
     const unsigned long now = millis();
     const unsigned long elapsedMs = now - phStateStartMs;
+    const float flow = (phActivePath == PH_PATH_BASE) ? flowRatePhUp : flowRatePhDown;
 
     if (phAutoState == PH_DOSING) {
-        if (elapsedMs >= phCycleDurationMs) {
+        if (elapsedMs >= phPulseOnDurationMs) {
             if (phActiveRelay >= 0 && phActiveRelay < 8) {
-                relayStates[phActiveRelay] = false;
-                bool state = !relayStates[phActiveRelay];
-                if (pcf2_ok) {
-                    pcf2.write(phActiveRelay, state);
-                }
-                Serial.printf("🔴 [DOSAGEM pH] Relé %d DESLIGADO após %.3fs\n",
-                    phActiveRelay + 1, phCycleDurationMs / 1000.0);
+                writeLocalPumpPin(phActiveRelay, false);
+                Serial.printf("🔴 [PULSO pH] Relé %d OFF após %.3fs (chunk=%.3fml)\n",
+                    phActiveRelay + 1, phPulseOnDurationMs / 1000.0, phPulseChunkMl);
+            }
+            phPulseRemainingMl -= phPulseChunkMl;
+            if (phPulseRemainingMl < 0.0f) {
+                phPulseRemainingMl = 0.0f;
             }
 
-            emitPhDoseEvent();
+            if (phPulseRemainingMl > 0.001f) {
+                if (phPulseGapSec > 0.0f) {
+                    phAutoState = PH_PULSE_GAP;
+                    phStateStartMs = now;
+                    Serial.printf("⏳ [GAP pH] %.2fs até próximo pulso (restante=%.3fml)\n",
+                        phPulseGapSec, phPulseRemainingMl);
+                    notifyPhOperationChanged();
+                } else {
+                    startPhPulseOn(flow);
+                }
+            } else {
+                emitPhDoseEvent();
+                phAutoState = PH_RECIRCULATING;
+                phStateStartMs = now;
+                Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n", phRecircSeconds);
+                notifyPhysicalRecirc(true, "ph");
+                notifyPhOperationChanged();
+            }
+        }
+        return;
+    }
 
-            phAutoState = PH_RECIRCULATING;
-            phStateStartMs = now;
-            Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n", phRecircSeconds);
-            notifyPhysicalRecirc(true, "ph");
-            notifyPhOperationChanged();
+    if (phAutoState == PH_PULSE_GAP) {
+        const unsigned long gapMs = (unsigned long)(phPulseGapSec * 1000.0f);
+        if (elapsedMs >= gapMs) {
+            startPhPulseOn(flow);
         }
         return;
     }
@@ -2176,6 +2579,8 @@ void HydroControl::checkAutoPH() {
     lastPHCheck = now;
     lastPHCheckAtMs = now;
 
+    tickConsumoPhWindow();
+
     float phForControl = pH;
 #if !HIDRO_DEV_RELAX_SENSORS
     if (!isPhValidForTelemetry()) {
@@ -2193,11 +2598,13 @@ void HydroControl::checkAutoPH() {
     }
 #endif
 
-    if (!adaptivePhController.needsAdjustment(phSetpoint, phForControl, phTolerance)) {
+    if (!adaptivePhController.needsAdjustment(phSetpoint, phForControl, phTolerance)
+        && !consumoPh24hForcePending) {
         phConsecutiveCorrections = 0;
         emitPhControllerMetric(false, false, PH_PATH_NONE, nullptr, "");
         return;
     }
+    consumoPh24hForcePending = false;
 
 #if !PH_PROTOTYPE_RELAX_GUARDS
     if (phConsecutiveCorrections >= phMaxConsecutive) {
@@ -2243,7 +2650,9 @@ void HydroControl::checkAutoPH() {
 const char* HydroControl::getPhOperationStateName() const {
     if (!autoPHEnabled && phAutoState == PH_IDLE) return "idle";
     switch (phAutoState) {
-        case PH_DOSING: return "dosing";
+        case PH_DOSING:
+        case PH_PULSE_GAP:
+            return "dosing";
         case PH_RECIRCULATING: return "recirculating";
         case PH_IDLE:
         default:
@@ -2258,7 +2667,11 @@ int HydroControl::computePhOperationRemainingSec() const {
     }
     const unsigned long elapsedMs = millis() - phStateStartMs;
     if (phAutoState == PH_DOSING) {
-        long rem = (long)(phCycleDurationMs - elapsedMs) / 1000L;
+        long rem = (long)(phPulseOnDurationMs - elapsedMs) / 1000L;
+        return rem > 0 ? (int)rem : 0;
+    }
+    if (phAutoState == PH_PULSE_GAP) {
+        long rem = (long)(phPulseGapSec * 1000.0f - (float)elapsedMs) / 1000L;
         return rem > 0 ? (int)rem : 0;
     }
     if (phAutoState == PH_RECIRCULATING) {
@@ -2377,7 +2790,7 @@ float HydroControl::getTDSVRef() const {
 // ===== Diluição EC modo A =====
 
 void HydroControl::setDilutionAutoEnabled(bool enabled, bool saveToNVS) {
-    dilutionAutoEnabled = enabled;
+    dilutionAutoEnabled = enabled || autoECEnabled;
     if (!enabled && dilutionState != DILUTION_IDLE) {
         finishDilutionSequence(false);
     }
@@ -2417,6 +2830,24 @@ void HydroControl::setDilutionSlaveRelayCallback(DilutionSlaveRelayCallback cb, 
     dilutionSlaveRelayCallbackUserData = userData;
 }
 
+void HydroControl::resetFlowSession() {
+    if (waterFlowSensor) {
+        waterFlowSensor->reset();
+    }
+}
+
+float HydroControl::getFlowSessionLiters() {
+    if (!waterFlowSensor) {
+        return 0.0f;
+    }
+    waterFlowSensor->tick();
+    return waterFlowSensor->sessionLiters();
+}
+
+void HydroControl::setProcedureRecircActive(bool active) {
+    notifyPhysicalRecirc(active, "script");
+}
+
 void HydroControl::setDilutionMaxVolumeL(float maxL) {
     if (maxL > 0.0f) {
         dilutionMaxVolumeL = maxL;
@@ -2432,10 +2863,28 @@ void HydroControl::setDilutionFillFlowLps(float lps) {
 }
 
 void HydroControl::setFlowmeterPulsesPerLiter(float ppl) {
-    if (ppl > 0.0f && flowmeterSensor) {
-        flowmeterSensor->setPulsesPerLiter(ppl);
+    if (ppl > 0.0f) {
+        applyFlowCalibrationFromPpl(ppl);
         PreferencesManager::saveConfigFloat("dil_ppl", ppl);
     }
+}
+
+void HydroControl::applyFlowCalibrationFromPpl(float ppl) {
+    // Solo volumen real (balde): K = FLOW_PULSES_PER_LITER / ppl.
+    // No recalibrar desde EC_esperado vs EC_obtenido (física distinta: mezcla/sonda/recirc).
+    if (ppl <= 0.0f || !waterFlowSensor) {
+        return;
+    }
+    waterFlowSensor->setCalibrationFactor(FLOW_PULSES_PER_LITER / ppl);
+}
+
+bool HydroControl::isTankHighCapacitive() const {
+#if HIDRO_SIMULATE_WATER_LEVELS
+    return false;
+#else
+    // V2: nivel alto = L4 (topo / P0) — ver LEVEL_LOGIC_VERSIONS.md
+    return levelBank.isAvailable() && levelBank.isWet(4);
+#endif
 }
 
 void HydroControl::setEcDilutionCallback(EcDilutionCallback cb, void* userData) {
@@ -2443,34 +2892,164 @@ void HydroControl::setEcDilutionCallback(EcDilutionCallback cb, void* userData) 
     ecDilutionCallbackUserData = userData;
 }
 
-void HydroControl::setDilutionRelay(int relayIndex, bool on) {
-    auto invokeSlave = [&](const String& mac) -> bool {
+bool HydroControl::dilutionMacMatches(const uint8_t* mac, const String& configured) const {
+    if (!mac || configured.length() < 11) {
+        return false;
+    }
+    char buf[18];
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    String cfg = configured;
+    cfg.toUpperCase();
+    cfg.replace("-", ":");
+    return cfg.equals(buf);
+}
+
+bool HydroControl::holdsDilutionValve(bool isLocal, const uint8_t* mac, int relay) const {
+    if (!isDilutionActive()) {
+        return false;
+    }
+    if (isLocal) {
+        if (!dilutionUsesSlaveDrain() && relay == dilutionDrainRelay) {
+            return true;
+        }
+        if (!dilutionUsesSlaveFill() && relay == dilutionFillRelay) {
+            return true;
+        }
+        return false;
+    }
+    if (!mac) {
+        return false;
+    }
+    if (relay == dilutionDrainRelay && dilutionMacMatches(mac, dilutionDrainSlaveMac)) {
+        return true;
+    }
+    if (relay == dilutionFillRelay && dilutionMacMatches(mac, dilutionFillSlaveMac)) {
+        return true;
+    }
+    return false;
+}
+
+void HydroControl::beginDilutionValveWait(uint32_t commandId, int relay, bool expectOn) {
+    dilutionPendingCommandId = commandId;
+    dilutionPendingRelay = relay;
+    dilutionPendingExpectOn = expectOn;
+    dilutionAckResult = 0;
+    dilutionAckDeadlineMs = millis() + DILUTION_VALVE_ACK_TIMEOUT_MS;
+}
+
+void HydroControl::clearDilutionValveWait() {
+    dilutionPendingCommandId = 0;
+    dilutionPendingRelay = -1;
+    dilutionAckResult = 0;
+    dilutionAckDeadlineMs = 0;
+}
+
+void HydroControl::notifyDilutionRelayAck(uint32_t commandId, bool success, bool actualOn) {
+    const uint32_t pending = dilutionPendingCommandId;
+    if (pending == 0 || commandId != pending) {
+        return;
+    }
+    if (success && actualOn == dilutionPendingExpectOn) {
+        dilutionAckResult = 1;
+    } else {
+        dilutionAckResult = -1;
+    }
+}
+
+void HydroControl::notifyDilutionObservedRelay(const uint8_t* mac, int relay, bool state, bool online) {
+    if (dilutionPendingCommandId == 0 || !online) {
+        return;
+    }
+    if (relay != dilutionPendingRelay) {
+        return;
+    }
+    if (!holdsDilutionValve(false, mac, relay)) {
+        return;
+    }
+    if (state == dilutionPendingExpectOn) {
+        dilutionAckResult = 1;
+    }
+}
+
+void HydroControl::confirmDilutionValveAck() {
+    clearDilutionValveWait();
+    const unsigned long now = millis();
+    if (dilutionState == DILUTION_WAIT_DRAIN_ACK) {
+        dilutionState = DILUTION_DRAINING;
+        dilutionStateStartMs = now;
+        dilutionDrainStartMs = now;
+        Serial.println("✅ [DILUTION] ACK dreno ON — contando litros");
+        showMessage("Drenando...");
+    } else if (dilutionState == DILUTION_WAIT_FILL_ACK) {
+        dilutionState = DILUTION_FILLING;
+        dilutionStateStartMs = now;
+        dilutionFillStartMs = now;
+        Serial.println("✅ [DILUTION] ACK fill ON — repondo até L4");
+        showMessage("Repondo agua");
+    }
+    notifyEcOperationChanged();
+}
+
+bool HydroControl::processDilutionValveWait(unsigned long now) {
+    if (!isDilutionAwaitingValve()) {
+        return false;
+    }
+
+    const int8_t ack = dilutionAckResult;
+    if (ack == 1) {
+        confirmDilutionValveAck();
+        return false;
+    }
+
+    const bool timedOut = (int32_t)(now - dilutionAckDeadlineMs) >= 0;
+    if (ack != -1 && !timedOut) {
+        return true;
+    }
+
+    if (dilutionState == DILUTION_WAIT_DRAIN_ACK) {
+        Serial.println("❌ [DILUTION] dreno sin ACK — abortado (tanque intacto)");
+        finishDilutionSequence(false);
+        return true;
+    }
+
+    // Fill: nunca abortar a OFF si el dreno ya salió. Reenviar ON.
+    Serial.println("⚠️ [DILUTION] fill sin ACK — reintento ON (no abortar)");
+    const uint32_t retryId = setDilutionRelay(dilutionFillRelay, true);
+    if (retryId == 0) {
+        beginDilutionValveWait(1, dilutionFillRelay, true);
+    } else {
+        beginDilutionValveWait(retryId, dilutionFillRelay, true);
+    }
+    return true;
+}
+
+uint32_t HydroControl::setDilutionRelay(int relayIndex, bool on) {
+    auto invokeSlave = [&](const String& mac) -> uint32_t {
         if (mac.length() == 0 || !dilutionSlaveRelayCallback) {
-            return false;
+            return 0;
         }
         unsigned int b0, b1, b2, b3, b4, b5;
         if (sscanf(mac.c_str(), "%x:%x:%x:%x:%x:%x", &b0, &b1, &b2, &b3, &b4, &b5) != 6) {
-            return false;
+            return 0;
         }
         uint8_t macBytes[6] = {
             (uint8_t)b0, (uint8_t)b1, (uint8_t)b2, (uint8_t)b3, (uint8_t)b4, (uint8_t)b5
         };
-        dilutionSlaveRelayCallback(macBytes, relayIndex, on, dilutionSlaveRelayCallbackUserData);
-        return true;
+        return dilutionSlaveRelayCallback(macBytes, relayIndex, on, dilutionSlaveRelayCallbackUserData);
     };
 
-    if (relayIndex == dilutionDrainRelay && invokeSlave(dilutionDrainSlaveMac)) {
-        return;
+    if (relayIndex == dilutionDrainRelay && dilutionDrainSlaveMac.length() > 0) {
+        return invokeSlave(dilutionDrainSlaveMac);
     }
-    if (relayIndex == dilutionFillRelay && invokeSlave(dilutionFillSlaveMac)) {
-        return;
+    if (relayIndex == dilutionFillRelay && dilutionFillSlaveMac.length() > 0) {
+        return invokeSlave(dilutionFillSlaveMac);
     }
 
-    if (relayIndex < 0 || relayIndex >= 8 || !pcf2_ok) {
-        return;
+    if (relayIndex < 0 || relayIndex >= 8) {
+        return 0;
     }
-    relayStates[relayIndex] = on;
-    pcf2.write(relayIndex, !on);
+    return writeLocalPumpPin(relayIndex, on) ? 1u : 0u;
 }
 
 static String makeDilutionSequenceId() {
@@ -2516,57 +3095,91 @@ bool HydroControl::startEcDilution(float volumeLiters, const char* source) {
     dilutionTargetL = volumeLiters;
     dilutionProgressL = 0.0f;
     dilutionDrainMeasuredL = 0.0f;
+    dilutionProgressPublishedL = 0.0f;
     dilutionEcBefore = ec;
     dilutionSource = source ? source : "manual";
     dilutionSequenceId = makeDilutionSequenceId();
-    dilutionState = DILUTION_DRAINING;
     dilutionStateStartMs = millis();
     dilutionDrainStartMs = dilutionStateStartMs;
     dilutionLastPulseMs = dilutionDrainStartMs;
-    dilutionLastPulseCount = flowmeterSensor ? flowmeterSensor->pulseCount() : 0;
-    if (flowmeterSensor) {
-        flowmeterSensor->reset();
+    if (waterFlowSensor) {
+        waterFlowSensor->enable();
+        waterFlowSensor->reset();
+    }
+    dilutionLastPulseCount = waterFlowSensor ? waterFlowSensor->lastWindowPulses() : 0;
+
+    setDilutionRelay(dilutionFillRelay, false);
+    const uint32_t drainCmd = setDilutionRelay(dilutionDrainRelay, true);
+    if (drainCmd == 0) {
+        Serial.println("[DILUTION] slave dreno no aceptó comando");
+        if (waterFlowSensor) {
+            waterFlowSensor->disable();
+        }
+        dilutionTargetL = 0.0f;
+        dilutionSequenceId = "";
+        return false;
     }
 
-    setDilutionRelay(dilutionDrainRelay, true);
-    setDilutionRelay(dilutionFillRelay, false);
+    if (dilutionUsesSlaveDrain()) {
+        dilutionState = DILUTION_WAIT_DRAIN_ACK;
+        beginDilutionValveWait(drainCmd, dilutionDrainRelay, true);
+        Serial.println("⏳ [DILUTION] esperando ACK dreno ON");
+        showMessage("Ack dreno");
+    } else {
+        dilutionState = DILUTION_DRAINING;
+        showMessage("Drenando...");
+    }
 
     Serial.println("\n💧 === DILUIÇÃO EC (modo A) ===");
     Serial.printf("📊 EC: %.0f µS/cm | SP: %.0f\n", ec, ecSetpoint);
     Serial.printf("🎯 Volume dreno+reposição: %.2f L | fonte: %s\n", volumeLiters, dilutionSource);
     Serial.println("================================\n");
 
-    showMessage("Drenando...");
     notifyEcOperationChanged();
     return true;
 }
 
 void HydroControl::finishDilutionDrainPhase() {
     setDilutionRelay(dilutionDrainRelay, false);
-    dilutionDrainMeasuredL = flowmeterSensor ? flowmeterSensor->consumedLiters() : dilutionProgressL;
+    dilutionDrainMeasuredL = waterFlowSensor ? waterFlowSensor->totalLiters() : dilutionProgressL;
     if (dilutionDrainMeasuredL < 0.05f) {
         dilutionDrainMeasuredL = dilutionTargetL;
     }
     dilutionProgressL = 0.0f;
-    dilutionState = DILUTION_FILLING;
+    dilutionProgressPublishedL = 0.0f;
     dilutionStateStartMs = millis();
     dilutionFillStartMs = dilutionStateStartMs;
-    if (flowmeterSensor) {
-        flowmeterSensor->reset();
+    if (waterFlowSensor) {
+        waterFlowSensor->reset();
     }
     if (dilutionFillFlowLps > 0.0f) {
-        dilutionFillDurationMs = (unsigned long)((dilutionDrainMeasuredL / dilutionFillFlowLps) * 1000.0f);
+        dilutionFillDurationMs = (unsigned long)((dilutionDrainMeasuredL / dilutionFillFlowLps) * 2000.0f);
         if (dilutionFillDurationMs < 1000UL) {
             dilutionFillDurationMs = 1000UL;
         }
     } else {
         dilutionFillDurationMs = 60000UL;
     }
-    setDilutionRelay(dilutionFillRelay, true);
-    Serial.printf("💧 [DILUTION] Dreno OK %.2f L — repondo ~%.0f s\n",
-                  dilutionDrainMeasuredL,
-                  dilutionFillDurationMs / 1000UL);
-    showMessage("Repondo agua");
+
+    const uint32_t fillCmd = setDilutionRelay(dilutionFillRelay, true);
+    Serial.printf("💧 [DILUTION] Dreno OK %.2f L — repondo até nível alto\n",
+                  dilutionDrainMeasuredL);
+
+    if (dilutionUsesSlaveFill()) {
+        if (fillCmd == 0) {
+            Serial.println("❌ [DILUTION] fill ON rechazado — reintento en loop");
+            dilutionState = DILUTION_WAIT_FILL_ACK;
+            beginDilutionValveWait(1, dilutionFillRelay, true);
+        } else {
+            dilutionState = DILUTION_WAIT_FILL_ACK;
+            beginDilutionValveWait(fillCmd, dilutionFillRelay, true);
+            Serial.println("⏳ [DILUTION] esperando ACK fill ON");
+        }
+        showMessage("Ack fill");
+    } else {
+        dilutionState = DILUTION_FILLING;
+        showMessage("Repondo agua");
+    }
     notifyEcOperationChanged();
 }
 
@@ -2591,28 +3204,31 @@ void HydroControl::emitEcDilutionEvent() {
 }
 
 void HydroControl::finishDilutionSequence(bool success) {
+    clearDilutionValveWait();
     setDilutionRelay(dilutionDrainRelay, false);
     setDilutionRelay(dilutionFillRelay, false);
     if (success) {
         emitEcDilutionEvent();
-        if (tempoRecirculacaoSeconds > 0) {
-            dilutionState = DILUTION_RECIRCULATING;
-            dilutionStateStartMs = millis();
-            notifyPhysicalRecirc(true, "ec");
-            Serial.printf("⏳ [DILUTION] Recirc %lu s pós-diluição\n", tempoRecirculacaoSeconds);
-            showMessage("Recirc dil");
-        } else {
-            dilutionState = DILUTION_IDLE;
-            dilutionTargetL = 0.0f;
-            dilutionProgressL = 0.0f;
-            dilutionSequenceId = "";
-            showMessage("Diluicao OK");
+        // Recirculação pós-reposição: sempre (mínimo 1 s se config=0).
+        const unsigned long recircSec =
+            tempoRecirculacaoSeconds > 0 ? tempoRecirculacaoSeconds : 60UL;
+        dilutionState = DILUTION_RECIRCULATING;
+        dilutionStateStartMs = millis();
+        notifyPhysicalRecirc(true, "ec");
+        Serial.printf("⏳ [DILUTION] Recirc %lu s pós-diluição (obrigatório)\n", recircSec);
+        showMessage("Recirc dil");
+        // Guardar segundos efectivos en el countdown (si era 0, usar 60).
+        if (tempoRecirculacaoSeconds == 0) {
+            tempoRecirculacaoSeconds = recircSec;
         }
     } else {
         dilutionState = DILUTION_IDLE;
         dilutionTargetL = 0.0f;
         dilutionProgressL = 0.0f;
         dilutionSequenceId = "";
+        if (waterFlowSensor) {
+            waterFlowSensor->disable();
+        }
         showMessage("Dil cancel");
         Serial.println("🛑 [DILUTION] Sequência abortada");
     }
@@ -2625,46 +3241,42 @@ void HydroControl::processDilution() {
     }
 
     const unsigned long now = millis();
+    const float publishDeltaL = 0.1f;
+
+    if (processDilutionValveWait(now)) {
+        return;
+    }
 
     if (dilutionState == DILUTION_DRAINING) {
-        if (flowmeterSensor) {
-            dilutionProgressL = flowmeterSensor->consumedLiters();
-            const uint32_t pulses = flowmeterSensor->pulseCount();
-            if (pulses != dilutionLastPulseCount) {
-                dilutionLastPulseCount = pulses;
-                dilutionLastPulseMs = now;
-            }
+        if (waterFlowSensor) {
+            waterFlowSensor->tick();
+            dilutionProgressL = waterFlowSensor->totalLiters();
         }
-        const bool targetReached = dilutionProgressL >= (dilutionTargetL - 0.05f);
-        const bool stall = (now - dilutionLastPulseMs) > DILUTION_FLOWMETER_STALL_MS &&
-                           dilutionProgressL < 0.05f;
-        const unsigned long maxDrainMs = dilutionFillFlowLps > 0.0f
-            ? (unsigned long)((dilutionTargetL / dilutionFillFlowLps) * 2000.0f)
-            : 120000UL;
-        const bool timeFallback = (now - dilutionDrainStartMs) > maxDrainMs;
-
-        if (targetReached) {
-            finishDilutionDrainPhase();
-        } else if (stall && !timeFallback) {
-            Serial.println("⚠️ [DILUTION] Fluxometro sem pulsos — abort");
-            finishDilutionSequence(false);
-        } else if (timeFallback && dilutionProgressL < 0.05f) {
-            Serial.println("⚠️ [DILUTION] Timeout dreno — estimativa por tempo");
-            dilutionProgressL = dilutionTargetL;
+        if (fabsf(dilutionProgressL - dilutionProgressPublishedL) >= publishDeltaL) {
+            dilutionProgressPublishedL = dilutionProgressL;
+            notifyEcOperationChanged();
+        }
+        // Dreno: solo cierra por litros (YFB5). Válvula → flujo es secuencia; sin stall por “no flow”.
+        if (dilutionProgressL >= (dilutionTargetL - 0.05f)) {
             finishDilutionDrainPhase();
         }
         return;
     }
 
     if (dilutionState == DILUTION_FILLING) {
-        const unsigned long elapsed = now - dilutionFillStartMs;
-        dilutionProgressL = dilutionFillFlowLps > 0.0f
-            ? (elapsed / 1000.0f) * dilutionFillFlowLps
-            : 0.0f;
-        if (elapsed >= dilutionFillDurationMs) {
+        // Reposição: fin solo por nivel alto (L4). Sin timeout de aborto.
+        bool tankHigh = isTankHighCapacitive();
+#if HIDRO_SIMULATE_WATER_LEVELS
+        if (!tankHigh && (now - dilutionFillStartMs) >= DILUTION_FILL_SIM_HIGH_MS) {
+            tankHigh = true;
+            Serial.println(
+                "✅ [DILUTION] Reposição — HIGH simulado (HIDRO_SIMULATE_WATER_LEVELS)");
+        }
+#endif
+        if (tankHigh) {
             setDilutionRelay(dilutionFillRelay, false);
             dilutionProgressL = dilutionDrainMeasuredL;
-            Serial.println("✅ [DILUTION] Reposição concluída");
+            Serial.println("✅ [DILUTION] Reposição — nível alto alcançado");
             finishDilutionSequence(true);
         }
         return;
@@ -2679,6 +3291,10 @@ void HydroControl::processDilution() {
             dilutionTargetL = 0.0f;
             dilutionProgressL = 0.0f;
             dilutionSequenceId = "";
+            clearDilutionValveWait();
+            if (waterFlowSensor) {
+                waterFlowSensor->disable();
+            }
             lastECCheck = now;
             lastECCheckAtMs = now;
             showMessage("Diluicao OK");

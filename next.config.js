@@ -1,7 +1,12 @@
 /** @type {import('next').NextConfig} */
+const path = require('path')
+
 const nextConfig = {
   reactStrictMode: true,
-  swcMinify: true,
+  outputFileTracingRoot: path.join(__dirname),
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
 }
- 
-module.exports = nextConfig 
+
+module.exports = nextConfig

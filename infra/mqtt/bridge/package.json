@@ -12,7 +12,8 @@
     "test:pub:ec-metric": "node scripts/test-publish-ec-metric.js",
     "test:pub:ph-metric": "node scripts/test-publish-ph-metric.js",
     "test:pub:slave-command": "node scripts/test-publish-slave-command.js",
-    "monitor": "node scripts/monitor-mqtt-realtime.js"
+    "monitor": "node scripts/monitor-mqtt-realtime.js",
+    "verify:pump-quantity": "node verify-pump-quantity.js"
   },
   "engines": {
     "node": ">=18"

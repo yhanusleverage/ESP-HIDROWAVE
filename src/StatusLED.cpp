@@ -91,12 +91,11 @@ void StatusLED::updatePattern() {
             }
             break;
             
-        case LED_PULSE: // Efeito respiração
+        case LED_PULSE: // Heartbeat lento (sin PWM — GPIO2 más estable en DevKit)
             {
-                float phase = (currentTime % 2000) / 2000.0; // Ciclo de 2 segundos
-                float intensity = (sin(phase * 2 * PI) + 1) / 2; // 0 a 1
-                int pwmValue = intensity * brightness;
-                setLEDPWM(pwmValue);
+                // Ciclo 3 s: 80 ms ON, resto OFF — “vivo” sin saturar el ojo.
+                const unsigned long cycle = currentTime % 3000UL;
+                setLED(cycle < 80UL);
             }
             break;
             

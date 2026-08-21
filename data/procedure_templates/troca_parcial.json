@@ -1,0 +1,53 @@
+{
+  "id": "proc_partial_change",
+  "name": "Troca parcial de água",
+  "description": "Drena N litros (YFB5), repõe até nível alto (L1), recircula. Pausa Auto EC/pH (priority P1).",
+  "enabled": true,
+  "priority": 90,
+  "rule_json": {
+    "condition": {
+      "type": "sensor_compare",
+      "sensor": "water_level_ok",
+      "op": "==",
+      "value_min": 1
+    },
+    "script": {
+      "instructions": [
+        {
+          "type": "relay_action",
+          "role": "drain",
+          "action": "on"
+        },
+        {
+          "type": "wait_liters",
+          "liters": 10
+        },
+        {
+          "type": "relay_action",
+          "role": "drain",
+          "action": "off"
+        },
+        {
+          "type": "relay_action",
+          "role": "fill",
+          "action": "on"
+        },
+        {
+          "type": "wait_level",
+          "sensor": "level_1",
+          "op": "==",
+          "value": "alto"
+        },
+        {
+          "type": "relay_action",
+          "role": "fill",
+          "action": "off"
+        },
+        {
+          "type": "recirc",
+          "seconds": 0
+        }
+      ]
+    }
+  }
+}

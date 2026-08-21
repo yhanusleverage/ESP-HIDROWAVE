@@ -50,9 +50,12 @@ struct RelayCommand {
     
     // ✅ FORK: Tipo de comando (bifurcação)
     String command_type;      // "manual" | "rule" | "peristaltic"
-    String triggered_by;      // "manual" | "automation" | "rule" | "peristaltic"
+    String triggered_by;      // "manual" | "automation" | "rule" | "peristaltic" | "calibragem_test" | …
     String rule_id;           // ID da regra (se command_type = "rule")
     String rule_name;         // Nome da regra (se command_type = "rule")
+
+    // ml a contabilizar em pump_quantity (0 = não contar; cebar não envia)
+    float dosageMl;
     
     // ✅ PRIORIDADE: Prioridade numérica (0-100). Maior = mais importante
     int priority;             // Default: 50 (média prioridade)
@@ -92,6 +95,10 @@ struct ECConfig {
     double dilution_max_volume_l;
     double flowmeter_pulses_per_liter;
     double dilution_fill_flow_lps;
+    double aggressiveness;
+    bool consumo_24h;
+    double pulse_ml;
+    double pulse_gap_sec;
     
     bool isValid;
 };
@@ -118,6 +125,9 @@ struct PHConfig {
     int max_pulse_seconds;
     int max_consecutive_corrections;
     bool reset_k_gains;
+    bool consumo_24h;
+    double pulse_ml;
+    double pulse_gap_sec;
     bool isValid;
 };
 
@@ -276,6 +286,7 @@ private:
     void setError(const String& error);
     String buildEnvironmentPayload(const EnvironmentReading& reading);
     String buildHydroPayload(const HydroReading& reading);
+    bool patchDeviceLevelFromHydro(const HydroReading& reading);
     String buildDeviceStatusPayload(const DeviceStatusData& status);
     
 public:

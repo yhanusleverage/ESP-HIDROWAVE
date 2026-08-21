@@ -113,7 +113,7 @@ La cadena existente ya funciona si `pH` y `temperature` entran por `HydroControl
 
 | # | Tarea | Detalle |
 |---|-------|---------|
-| 4 | **Niveles reales PCF8574** | Instalar L1–L4 en P0–P3; poner `HIDRO_SIMULATE_WATER_LEVELS=0`; reactivar `levelBank.poll()` e interlock real. |
+| 4 | **Niveles reales PCF8574** | ✅ Cutover: `HIDRO_SIMULATE_WATER_LEVELS=0`; `DiscreteLevelBank` + PCF @ 0x20 NPN directo (sin PC817). Ver [`LEVEL_SENSORS_PCF8574_CAT6.md`](../hydraulics/LEVEL_SENSORS_PCF8574_CAT6.md). |
 | 5 | **`PH_PROTOTYPE_RELAX_GUARDS=0`** | Cuando Auto pH esté calibrado en producción. |
 | 6 | **`HIDRO_DEV_RELAX_SENSORS=0`** | Telemetría estricta (omitir campos stale). |
 | 7 | **Comandos serial diagnóstico pH Modbus** | Paridad con `processEcSerialCommand()` — ej. `PH STATUS`, error 0xE0. |
@@ -151,7 +151,7 @@ ORDEM_PROCEDURAL_HYDROSYSTEMCORE.md — actualizado
 | Flag | Valor actual | Cuándo cambiar |
 |------|--------------|----------------|
 | `USE_PH_MODBUS_SENSOR` | 1 | 0 solo si volver a pH ADC GPIO35 |
-| `HIDRO_SIMULATE_WATER_LEVELS` | 1 | 0 cuando L1–L4 estén cableados |
+| `HIDRO_SIMULATE_WATER_LEVELS` | 0 (producción) | 1 solo si bancada sin sondas |
 | `HIDRO_DEV_RELAX_SENSORS` | 1 | 0 en producción |
 | `PH_PROTOTYPE_RELAX_GUARDS` | 1 | 0 en producción Auto pH |
 

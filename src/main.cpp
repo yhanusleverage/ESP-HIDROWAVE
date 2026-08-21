@@ -17,6 +17,7 @@
 #include "MasterSlaveManager.h"     // 🎯 Sistema inteligente Master (Core 0)
 #include "WebServerTask.h"          // 🌐 WebServer Task (Core 1)
 #include "ObjectPoolManager.h"      // ✅ Object Pool Pattern (SSL, HTTP, JSON)
+#include "ResourceTelemetry.h"
 #include <vector>
 #include <nvs_flash.h>              // Para initializeNVS()
 
@@ -2539,6 +2540,7 @@ void setup() {
         Serial.println("   ✓ Stack: 8KB");
         Serial.println("   ✓ Prioridade: 2");
         Serial.println("   ✓ Handle: " + String((uint32_t)espNowTaskHandle, HEX));
+        ResourceTelemetry::setEspNowTaskHandle(espNowTaskHandle);
     } else {
         Serial.println("❌ Erro ao criar ESP-NOW Task");
         Serial.println("⚠️ Continuando sem task dedicada...");

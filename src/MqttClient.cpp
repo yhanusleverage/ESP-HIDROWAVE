@@ -1,4 +1,4 @@
-﻿#include "MqttClient.h"
+#include "MqttClient.h"
 #include "SensorSanitize.h"
 
 #if ENABLE_MQTT
@@ -23,7 +23,9 @@ MqttClientWrapper* MqttClientWrapper::callbackInstance = nullptr;
 MqttClientWrapper::MqttClientWrapper()
     : mqtt(wifiClient),
       lastReconnectAttempt(0),
-      reconnectIntervalMs(5000),
+      reconnectIntervalMs(30000),
+      lastFailLogMs(0),
+      consecutiveFailCount(0),
       commandHandler(nullptr),
       commandHandlerUserData(nullptr) {
     mqtt.setBufferSize(512);
@@ -60,6 +62,7 @@ bool MqttClientWrapper::subscribeCommandTopic() {
 bool MqttClientWrapper::begin(const String& id) {
     deviceId = id;
     telemetryTopic = String("hidrowave/") + deviceId + "/telemetry";
+    levelsTopic = String("hidrowave/") + deviceId + "/levels";
     heartbeatTopic = String("hidrowave/") + deviceId + "/heartbeat";
     statusTopic = String("hidrowave/") + deviceId + "/status";
     commandTopic = String("hidrowave/") + deviceId + "/command";
@@ -76,8 +79,10 @@ bool MqttClientWrapper::begin(const String& id) {
     callbackInstance = this;
     mqtt.setCallback(mqttMessageCallback);
 
+    mqttUsername = String("mqtt_") + deviceId;
+
     if (strlen(MQTT_HOST) == 0) {
-        Serial.println("[MQTT] MQTT_HOST vazio â€” desabilitado");
+        Serial.println("[MQTT] MQTT_HOST vazio — desabilitado");
         return false;
     }
 
@@ -87,9 +92,9 @@ bool MqttClientWrapper::begin(const String& id) {
     lwtDoc["online"] = false;
     serializeJson(lwtDoc, lwtPayload, sizeof(lwtPayload));
 
-    Serial.printf("[MQTT] Broker %s:%d\n", MQTT_HOST, MQTT_PORT);
-    Serial.printf("[MQTT] topics telemetry=%s heartbeat=%s status=%s command=%s ec_op=%s dose=%s ph_op=%s ph_dose=%s ec_metric=%s ph_metric=%s\n",
-                  telemetryTopic.c_str(), heartbeatTopic.c_str(), statusTopic.c_str(),
+    Serial.printf("[MQTT] Broker %s:%d user=%s\n", MQTT_HOST, MQTT_PORT, mqttUsername.c_str());
+    Serial.printf("[MQTT] topics telemetry=%s levels=%s heartbeat=%s status=%s command=%s ec_op=%s dose=%s ph_op=%s ph_dose=%s ec_metric=%s ph_metric=%s\n",
+                  telemetryTopic.c_str(), levelsTopic.c_str(), heartbeatTopic.c_str(), statusTopic.c_str(),
                   commandTopic.c_str(), ecOperationTopic.c_str(), doseTopic.c_str(),
                   phOperationTopic.c_str(), phDoseTopic.c_str(),
                   ecMetricTopic.c_str(), phMetricTopic.c_str());
@@ -103,16 +108,28 @@ void MqttClientWrapper::loop() {
     if (!mqtt.connected()) {
         unsigned long now = millis();
         if (now - lastReconnectAttempt >= reconnectIntervalMs) {
-            lastReconnectAttempt = now;
             ensureConnected();
-            if (reconnectIntervalMs < 30000) {
-                reconnectIntervalMs += 5000;
-            }
         }
     } else {
-        reconnectIntervalMs = 5000;
+        reconnectIntervalMs = 30000;
+        consecutiveFailCount = 0;
     }
     mqtt.loop();
+}
+
+void MqttClientWrapper::bumpReconnectBackoff() {
+    // 30s ? 60s ? 120s ? ? ? m?x 5 min (evita cascata TCP+HTTPS)
+    if (reconnectIntervalMs < 300000UL) {
+        unsigned long next = reconnectIntervalMs * 2UL;
+        if (next < 30000UL) {
+            next = 30000UL;
+        }
+        if (next > 300000UL) {
+            next = 300000UL;
+        }
+        reconnectIntervalMs = next;
+    }
+    consecutiveFailCount = consecutiveFailCount < 255 ? consecutiveFailCount + 1 : 255;
 }
 
 bool MqttClientWrapper::publishOnlineStatus() {
@@ -139,12 +156,19 @@ bool MqttClientWrapper::ensureConnected() {
         return false;
     }
 
+    unsigned long now = millis();
+    if (lastReconnectAttempt != 0 && (now - lastReconnectAttempt) < reconnectIntervalMs) {
+        return false;
+    }
+    lastReconnectAttempt = now;
+
     String clientId = deviceId.length() ? deviceId : "ESP32_HIDRO";
-    Serial.printf("[MQTT] Connecting clientId=%s...\n", clientId.c_str());
+    Serial.printf("[MQTT] Connecting clientId=%s user=%s (backoff=%lus)...\n",
+                  clientId.c_str(), mqttUsername.c_str(), reconnectIntervalMs / 1000UL);
 
     bool ok = mqtt.connect(
         clientId.c_str(),
-        MQTT_USER,
+        mqttUsername.c_str(),
         MQTT_PASS,
         statusTopic.c_str(),
         1,
@@ -152,16 +176,24 @@ bool MqttClientWrapper::ensureConnected() {
         lwtPayload);
     if (ok) {
         Serial.println("[MQTT] Connected (LWT on status topic)");
+        reconnectIntervalMs = 30000;
+        consecutiveFailCount = 0;
         publishOnlineStatus();
         subscribeCommandTopic();
     } else {
-        Serial.printf("[MQTT] Failed rc=%d\n", mqtt.state());
+        bumpReconnectBackoff();
+        // Rate-limit: 1? fail + depois no m?ximo a cada 60s
+        if (consecutiveFailCount <= 1 || (now - lastFailLogMs) >= 60000UL) {
+            lastFailLogMs = now;
+            Serial.printf("[MQTT] Failed rc=%d ? pr?ximo retry em %lus\n",
+                          mqtt.state(), reconnectIntervalMs / 1000UL);
+        }
     }
     return ok;
 }
 
 bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -171,7 +203,7 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
 
 #if !HIDRO_DEV_RELAX_SENSORS
     if (isnan(waterTemp) || isnan(ph) || isnan(ecUsCm)) {
-        Serial.println("[MQTT] telemetry skipped — lecturas hidro inválidas");
+        Serial.println("[MQTT] telemetry skipped ? lecturas hidro inv?lidas");
         return false;
     }
 #endif
@@ -183,19 +215,19 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
     if (reading.tempValid && isValidWaterTempReading(reading.temperature)) {
         doc["temperature"] = reading.temperature;
     } else if (!reading.tempValid) {
-        Serial.println("[MQTT] temperature omitted — invalid or stale");
+        Serial.println("[MQTT] temperature omitted ? invalid or stale");
     }
     if (reading.phValid && isValidPhReading(reading.ph)) {
         doc["ph"] = reading.ph;
     } else if (!reading.phValid) {
-        Serial.printf("[MQTT] ph omitted — valid=%d value=%.3f\n",
+        Serial.printf("[MQTT] ph omitted ? valid=%d value=%.3f\n",
                       reading.phValid ? 1 : 0, reading.ph);
     }
     if (reading.ecValid && isValidEcMicroSiemens(reading.ec)) {
         const float ecRounded = round(reading.ec * 100.0) / 100.0;
         doc["ec"] = ecRounded;
     } else if (!reading.ecValid) {
-        Serial.printf("[MQTT] ec omitted — valid=%d value=%.0f\n",
+        Serial.printf("[MQTT] ec omitted ? valid=%d value=%.0f\n",
                       reading.ecValid ? 1 : 0, reading.ec);
     }
 #else
@@ -218,6 +250,14 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
     if (reading.waterLevel && reading.waterLevel[0]) {
         doc["water_level"] = reading.waterLevel;
     }
+#if HIDRO_SIMULATE_WATER_LEVELS
+    doc["levels_simulated"] = true;
+#else
+    doc["levels_simulated"] = false;
+#endif
+    if (reading.interlockMode && reading.interlockMode[0]) {
+        doc["interlock_mode"] = reading.interlockMode;
+    }
     if (isValidEnvironmentReading(reading.airTemperature, reading.humidity)) {
         doc["air_temp"] = reading.airTemperature;
         doc["humidity"] = reading.humidity;
@@ -236,8 +276,52 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
     return published;
 }
 
+bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
+    if (!mqtt.connected()) {
+        return false;
+    }
+
+    StaticJsonDocument<320> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["water_level_ok"] = reading.waterLevelOk;
+    doc["level_1"] = reading.level1Wet;
+    doc["level_2"] = reading.level2Wet;
+    doc["level_3"] = reading.level3Wet;
+    doc["level_4"] = reading.level4Wet;
+    if (reading.waterLevel && reading.waterLevel[0]) {
+        doc["water_level"] = reading.waterLevel;
+    }
+    doc["levels_simulated"] = reading.levelsSimulated;
+    if (reading.interlockMode && reading.interlockMode[0]) {
+        doc["interlock_mode"] = reading.interlockMode;
+    }
+
+    char payload[320];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(levelsTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] levels L1=%d L2=%d L3=%d L4=%d wl=%s ok=%d sim=%d ilock=%s\n",
+                      reading.level1Wet ? 1 : 0,
+                      reading.level2Wet ? 1 : 0,
+                      reading.level3Wet ? 1 : 0,
+                      reading.level4Wet ? 1 : 0,
+                      reading.waterLevel ? reading.waterLevel : "-",
+                      reading.waterLevelOk ? 1 : 0,
+                      reading.levelsSimulated ? 1 : 0,
+                      reading.interlockMode ? reading.interlockMode : "-");
+    } else {
+        Serial.println("[MQTT] levels publish failed");
+    }
+    return published;
+}
+
 bool MqttClientWrapper::publishHeartbeat(const MqttHeartbeatReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -269,7 +353,7 @@ bool MqttClientWrapper::publishHeartbeat(const MqttHeartbeatReading& reading) {
 }
 
 bool MqttClientWrapper::publishEcOperation(const MqttEcOperationReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -306,7 +390,7 @@ bool MqttClientWrapper::publishEcOperation(const MqttEcOperationReading& reading
 }
 
 bool MqttClientWrapper::publishEcDilution(const MqttEcDilutionReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -336,7 +420,7 @@ bool MqttClientWrapper::publishEcDilution(const MqttEcDilutionReading& reading) 
 }
 
 bool MqttClientWrapper::publishDose(const MqttDoseReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -358,12 +442,12 @@ bool MqttClientWrapper::publishDose(const MqttDoseReading& reading) {
         return false;
     }
 
-    bool published = mqtt.publish(doseTopic.c_str(), payload, true);
+    bool published = mqtt.publish(doseTopic.c_str(), payload, false);
     if (published) {
-        Serial.printf("[MQTT] dose %s %.2f ml relÃ© %d\n",
+        Serial.printf("[MQTT] dose %s %.2f ml relay_index=%d\n",
                       reading.nutrientName ? reading.nutrientName : "?",
                       reading.dosageMl,
-                      reading.relayNumber + 1);
+                      reading.relayNumber);
     } else {
         Serial.println("[MQTT] dose publish failed");
     }
@@ -371,7 +455,7 @@ bool MqttClientWrapper::publishDose(const MqttDoseReading& reading) {
 }
 
 bool MqttClientWrapper::publishPhOperation(const MqttPhOperationReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -401,7 +485,7 @@ bool MqttClientWrapper::publishPhOperation(const MqttPhOperationReading& reading
 }
 
 bool MqttClientWrapper::publishPhDose(const MqttPhDoseReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -423,12 +507,12 @@ bool MqttClientWrapper::publishPhDose(const MqttPhDoseReading& reading) {
         return false;
     }
 
-    bool published = mqtt.publish(phDoseTopic.c_str(), payload, true);
+    bool published = mqtt.publish(phDoseTopic.c_str(), payload, false);
     if (published) {
-        Serial.printf("[MQTT] ph_dose %s %.2f ml relÃ© %d\n",
+        Serial.printf("[MQTT] ph_dose %s %.2f ml relay_index=%d\n",
                       reading.direction ? reading.direction : "?",
                       reading.dosageMl,
-                      reading.relayNumber + 1);
+                      reading.relayNumber);
     } else {
         Serial.println("[MQTT] ph_dose publish failed");
     }
@@ -436,7 +520,7 @@ bool MqttClientWrapper::publishPhDose(const MqttPhDoseReading& reading) {
 }
 
 bool MqttClientWrapper::publishEcMetric(const MqttEcMetricReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -478,7 +562,7 @@ bool MqttClientWrapper::publishEcMetric(const MqttEcMetricReading& reading) {
 }
 
 bool MqttClientWrapper::publishPhMetric(const MqttPhMetricReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 
@@ -534,7 +618,7 @@ bool MqttClientWrapper::publishPhMetric(const MqttPhMetricReading& reading) {
 }
 
 bool MqttClientWrapper::publishCommandAck(const MqttCommandAckReading& reading) {
-    if (!ensureConnected() || reading.commandId <= 0) {
+    if (!mqtt.connected() || reading.commandId <= 0) {
         return false;
     }
 
@@ -571,8 +655,9 @@ bool MqttClientWrapper::publishCommandAck(const MqttCommandAckReading& reading) 
 
     bool published = mqtt.publish(commandAckTopic.c_str(), payload, false);
     if (published) {
-        Serial.printf("[MQTT] command_ack id=%d relay=%d state=%d\n",
-                      reading.commandId, reading.relayIndex, reading.currentState ? 1 : 0);
+        Serial.printf("[MQTT] command_ack id=%d relay=%d state=%d status=%s\n",
+                      reading.commandId, reading.relayIndex, reading.currentState ? 1 : 0,
+                      reading.status ? reading.status : "completed");
     } else {
         Serial.println("[MQTT] command_ack publish failed");
     }
@@ -580,7 +665,7 @@ bool MqttClientWrapper::publishCommandAck(const MqttCommandAckReading& reading) 
 }
 
 bool MqttClientWrapper::publishRelayState(const MqttRelayStateReading& reading) {
-    if (!ensureConnected()) {
+    if (!mqtt.connected()) {
         return false;
     }
 

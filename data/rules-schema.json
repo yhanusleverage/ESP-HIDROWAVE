@@ -285,6 +285,254 @@
       },
       "required": ["name", "condition", "error_message"],
       "additionalProperties": false
+    },
+    "RuleProcedure": {
+      "type": "object",
+      "description": "Procedimento procedural (Rule Builder / timeline P1)",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "minLength": 3, "maxLength": 50 },
+        "name": { "type": "string", "minLength": 3, "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 500 },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "layer": { "type": "string", "enum": ["P1", "P2", "P3", "P4", "general"] },
+        "enabled": { "type": "boolean", "default": true },
+        "triggers": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ProcedureTrigger" },
+          "minItems": 1,
+          "maxItems": 10
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ProcedureStep" },
+          "minItems": 1,
+          "maxItems": 20
+        },
+        "chain": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ProcedureChainLink" },
+          "maxItems": 5
+        },
+        "safety": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ProcedureSafety" },
+          "maxItems": 5
+        }
+      },
+      "required": ["id", "name", "priority", "layer", "enabled", "triggers", "steps"],
+      "additionalProperties": false
+    },
+    "ProcedureTrigger": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["time_window", "interval", "cycle_week", "manual"]
+        }
+      },
+      "required": ["type"],
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "time_window" } } },
+          "then": {
+            "required": ["start", "end"],
+            "properties": {
+              "start": { "type": "string", "pattern": "^([01]?[0-9]|2[0-3]):[0-5][0-9]$" },
+              "end": { "type": "string", "pattern": "^([01]?[0-9]|2[0-3]):[0-5][0-9]$" },
+              "timezone": { "type": "string" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "interval" } } },
+          "then": {
+            "required": ["everyMs"],
+            "properties": { "everyMs": { "type": "integer", "minimum": 1000 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "cycle_week" } } },
+          "then": {
+            "required": ["weekIndex"],
+            "properties": { "weekIndex": { "type": "integer", "minimum": 0, "maximum": 52 } }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "ActuatorRef": {
+      "type": "object",
+      "properties": {
+        "target": { "type": "string", "enum": ["master", "slave"] },
+        "relayIndex": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "slaveMac": { "type": "string" },
+        "label": { "type": "string", "maxLength": 100 }
+      },
+      "required": ["target", "relayIndex"],
+      "additionalProperties": false
+    },
+    "SensorCondition": {
+      "type": "object",
+      "properties": {
+        "sensor": { "type": "string", "minLength": 1 },
+        "operator": { "type": "string", "enum": [">", "<", ">=", "<=", "==", "!="] },
+        "value": { "oneOf": [{ "type": "string" }, { "type": "number" }] }
+      },
+      "required": ["sensor", "operator", "value"],
+      "additionalProperties": false
+    },
+    "ProcedureStep": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "maxLength": 200 },
+        "type": {
+          "type": "string",
+          "enum": ["sensor_valve", "set_relay", "wait", "hold_chemical", "invoke_rule"]
+        }
+      },
+      "required": ["id", "type"],
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "sensor_valve" } } },
+          "then": {
+            "required": ["actuator", "sensor", "valveStart", "valveFinish", "maxDurationMs"],
+            "properties": {
+              "actuator": { "$ref": "#/definitions/ActuatorRef" },
+              "sensor": { "$ref": "#/definitions/SensorCondition" },
+              "valveStart": { "type": "string", "enum": ["open", "closed"] },
+              "valveFinish": { "type": "string", "enum": ["open", "closed"] },
+              "maxDurationMs": { "type": "integer", "minimum": 1000, "maximum": 86400000 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "set_relay" } } },
+          "then": {
+            "required": ["actuator", "state"],
+            "properties": {
+              "actuator": { "$ref": "#/definitions/ActuatorRef" },
+              "state": { "type": "string", "enum": ["on", "off"] },
+              "durationSeconds": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "wait" } } },
+          "then": {
+            "required": ["durationMs"],
+            "properties": { "durationMs": { "type": "integer", "minimum": 1000 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "hold_chemical" } } },
+          "then": {
+            "required": ["enabled"],
+            "properties": { "enabled": { "type": "boolean" } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "invoke_rule" } } },
+          "then": {
+            "required": ["targetRuleId", "on"],
+            "properties": {
+              "targetRuleId": { "type": "string" },
+              "on": { "type": "string", "enum": ["success", "failure"] },
+              "delayMs": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "ProcedureChainLink": {
+      "type": "object",
+      "properties": {
+        "targetRuleId": { "type": "string" },
+        "on": { "type": "string", "enum": ["success", "failure"] },
+        "delayMs": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["targetRuleId", "on", "delayMs"],
+      "additionalProperties": false
+    },
+    "ProcedureSafety": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "description": { "type": "string", "maxLength": 300 }
+      },
+      "required": ["id", "description"],
+      "additionalProperties": false
+    },
+    "ScriptInstruction": {
+      "type": "object",
+      "description": "Instrução compilada para ScriptRunner",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["while", "relay_action", "delay"]
+        },
+        "condition": { "$ref": "#/definitions/SensorCondition" },
+        "body": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ScriptInstruction" },
+          "maxItems": 10
+        },
+        "relay_number": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "action": { "type": "string", "enum": ["on", "off", "toggle"] },
+        "target": { "type": "string", "enum": ["master", "slave"] },
+        "slave_mac": { "type": "string" },
+        "duration_seconds": { "type": "integer", "minimum": 0 },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "delay_ms": { "type": "integer", "minimum": 0 },
+        "max_iterations": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    "ProcedureRuleJson": {
+      "type": "object",
+      "description": "rule_json com script procedural (Supabase decision_rules)",
+      "properties": {
+        "priority": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "procedure_ref": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "layer": { "type": "string", "enum": ["P1", "P2", "P3", "P4", "general"] }
+          },
+          "required": ["id", "layer"]
+        },
+        "procedure_canonical": { "$ref": "#/definitions/RuleProcedure" },
+        "script": {
+          "type": "object",
+          "properties": {
+            "instructions": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/ScriptInstruction" },
+              "maxItems": 50
+            },
+            "loop_interval_ms": { "type": "integer", "minimum": 100 },
+            "max_iterations": { "type": "integer", "minimum": 0 },
+            "chained_events": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "target_rule_id": { "type": "string" },
+                  "trigger_on": { "type": "string", "enum": ["success", "failure"] },
+                  "delay_ms": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["target_rule_id", "trigger_on", "delay_ms"]
+              },
+              "maxItems": 5
+            }
+          },
+          "required": ["instructions", "loop_interval_ms"]
+        }
+      },
+      "required": ["script"],
+      "additionalProperties": true
     }
   }
 }

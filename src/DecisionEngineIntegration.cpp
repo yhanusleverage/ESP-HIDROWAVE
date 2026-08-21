@@ -1,5 +1,6 @@
 #include "DecisionEngineIntegration.h"
 #include "RelayCoordinator.h"
+#include "ScriptRunner.h"
 #include "Config.h"
 #include <ArduinoJson.h>
 
@@ -49,11 +50,52 @@ bool DecisionEngineIntegration::begin() {
         this->handleLogEvent(event, data);
     });
 
-    engine->setTankScriptHoldCallback([this](unsigned long holdMs) {
+    engine->setTankProcedureGateCallback([this](bool active) {
         if (hydroControl) {
-            hydroControl->holdAutoDosingForTankScript(holdMs);
+            hydroControl->setTankProcedureActive(active);
         }
     });
+
+    // ScriptRunner: YFB5 + recirc + roles drain/fill (sin EventBus).
+    ScriptRunnerManager::instance().setFlowSessionCallbacks(
+        [this]() {
+            if (hydroControl) {
+                hydroControl->resetFlowSession();
+            }
+        },
+        [this]() -> float {
+            return hydroControl ? hydroControl->getFlowSessionLiters() : 0.0f;
+        });
+    ScriptRunnerManager::instance().setRecircCallbacks(
+        [this](bool starting) {
+            if (hydroControl) {
+                hydroControl->setProcedureRecircActive(starting);
+            }
+        },
+        [this]() -> unsigned long {
+            if (!hydroControl) {
+                return 60UL;
+            }
+            const unsigned long sec = hydroControl->getTempoRecirculacaoSeconds();
+            return sec > 0 ? sec : 60UL;
+        });
+    ScriptRunnerManager::instance().setHydraulicRoleResolver(
+        [this](const String& role, String& outMac, int& outRelay) -> bool {
+            if (!hydroControl) {
+                return false;
+            }
+            if (role == "drain") {
+                outMac = hydroControl->getDilutionDrainSlaveMac();
+                outRelay = hydroControl->getDilutionDrainRelay();
+                return outMac.length() > 0 && outRelay >= 0;
+            }
+            if (role == "fill") {
+                outMac = hydroControl->getDilutionFillSlaveMac();
+                outRelay = hydroControl->getDilutionFillRelay();
+                return outMac.length() > 0 && outRelay >= 0;
+            }
+            return false;
+        });
     
     // ✅ INTEGRAÇÃO ESP-NOW: Configurar MasterSlaveManager no DecisionEngine
     if (masterManager) {

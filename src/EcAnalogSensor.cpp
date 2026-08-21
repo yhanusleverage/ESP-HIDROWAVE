@@ -13,6 +13,7 @@ EcAnalogSensor::EcAnalogSensor(uint8_t analogPin, float fullScaleVolts, float ca
     , lastPinVoltsLin_(0)
     , lastPinVoltsCal_(0)
     , ecMean_uScm_(0)
+    , lastSampleMv_(0)
     , pendingWindow_(false)
 {
 }
@@ -61,6 +62,7 @@ void EcAnalogSensor::tick() {
     nextSampleDueMs_ = now + EC_SAMPLE_INTERVAL_MS;
 
     const uint32_t mv = analogReadMilliVolts(analogPin_);
+    lastSampleMv_ = mv;
     windowSumMv_ += static_cast<uint64_t>(mv);
     ++windowCount_;
 
@@ -157,4 +159,13 @@ float EcAnalogSensor::calibrationFactor() const {
 
 float EcAnalogSensor::fullScaleVolts() const {
     return fullScaleVolts_;
+}
+
+float EcAnalogSensor::instantEcMicrosiemensPerCm() const {
+    const float vPin = static_cast<float>(lastSampleMv_) / 1000.0f;
+    float rawEc = (EC_SENSOR_RANGE_US_CM / fullScaleVolts_) * vPin * calibrationFactor_;
+    if (rawEc < 0.0f) {
+        rawEc = 0.0f;
+    }
+    return rawEc;
 }

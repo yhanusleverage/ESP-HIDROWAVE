@@ -44,6 +44,7 @@ else
   cat > "$ACL_FILE" <<'EOF'
 user bridge_internal
 topic read hidrowave/+/telemetry
+topic read hidrowave/+/levels
 topic read hidrowave/+/heartbeat
 topic read hidrowave/+/status
 topic read hidrowave/+/ec_operation

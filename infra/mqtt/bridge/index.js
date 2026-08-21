@@ -1,15 +1,16 @@
 ﻿/**
  * HIDROWAVE Bridge â€” telemetria + heartbeat + presenÃ§a + Auto EC UX
  * Subscribe:
- *   hidrowave/+/telemetry     â†’ INSERT hydro_measurements + environment_data
- *   hidrowave/+/heartbeat       â†’ PATCH device_status
- *   hidrowave/+/status          â†’ PATCH device_status.is_online (LWT)
- *   hidrowave/+/ec_operation    â†’ PATCH relay_master.ec_operation_*
- *   hidrowave/+/dose            â†’ INSERT nutrient_dosages
- *   hidrowave/+/ph_operation    â†’ PATCH relay_master.ph_operation_*
- *   hidrowave/+/ph_dose         â†’ INSERT ph_dosages
- *   hidrowave/+/ec_metric       â†’ INSERT ec_controller_metrics
- *   hidrowave/+/ph_metric       â†’ INSERT ph_controller_metrics
+ *   hidrowave/+/telemetry     → INSERT hydro_measurements + environment_data
+ *   hidrowave/+/levels          → PATCH device_status level_* (on-change, sin throttle 30s)
+ *   hidrowave/+/heartbeat       → PATCH device_status
+ *   hidrowave/+/status          → PATCH device_status.is_online (LWT)
+ *   hidrowave/+/ec_operation    → PATCH relay_master.ec_operation_*
+ *   hidrowave/+/dose            → INSERT nutrient_dosages
+ *   hidrowave/+/ph_operation    → PATCH relay_master.ph_operation_*
+ *   hidrowave/+/ph_dose         → INSERT ph_dosages
+ *   hidrowave/+/ec_metric       → INSERT ec_controller_metrics
+ *   hidrowave/+/ph_metric       → INSERT ph_controller_metrics
  */
 import 'dotenv/config';
 import mqtt from 'mqtt';
@@ -21,6 +22,7 @@ const SLAVE_MAC_RE = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
 const TOPICS = [
   'hidrowave/+/telemetry',
+  'hidrowave/+/levels',
   'hidrowave/+/heartbeat',
   'hidrowave/+/status',
   'hidrowave/+/ec_operation',
@@ -47,7 +49,30 @@ const EC_OPERATION_STATES = new Set([
 const EC_DILUTION_SOURCES = new Set(['auto', 'manual', 'web']);
 
 const DOSE_SOURCES = new Set(['auto_ec', 'manual', 'web']);
-const WATER_LEVEL_VALUES = new Set(['vazio', 'baixo', 'medio', 'alto']);
+const WATER_LEVEL_VALUES = new Set([
+  'vazio',
+  'baixo',
+  'medio',
+  'medio_alto',
+  'alto',
+  'medio_baixo', // aceptado → normaliza a medio
+]);
+const INTERLOCK_MODE_VALUES = new Set(['normal', 'carrera']);
+
+/** Canonical: 2/4=medio, 3/4=medio_alto. medio_baixo → medio. */
+function normalizeWaterLevel(raw) {
+  if (raw == null) return null;
+  const s = String(raw);
+  if (s === 'medio_baixo') return 'medio';
+  if (WATER_LEVEL_VALUES.has(s) && s !== 'medio_baixo') return s;
+  return null;
+}
+
+function normalizeInterlockMode(raw) {
+  if (raw == null) return null;
+  const s = String(raw).toLowerCase();
+  return INTERLOCK_MODE_VALUES.has(s) ? s : null;
+}
 
 const PH_OPERATION_STATES = new Set([
   'idle',
@@ -60,6 +85,7 @@ const PH_DOSE_SOURCES = new Set(['auto_ph', 'manual', 'web']);
 const PH_DOSE_DIRECTIONS = new Set(['up', 'down']);
 
 const telemetryThrottleMs = parseInt(process.env.TELEMETRY_THROTTLE_MS || '30000', 10);
+const levelsEventThrottleMs = parseInt(process.env.LEVELS_EVENT_THROTTLE_MS || '300', 10);
 const heartbeatThrottleMs = parseInt(process.env.HEARTBEAT_THROTTLE_MS || '55000', 10);
 const heartbeatStaleMs = parseInt(process.env.HEARTBEAT_STALE_MS || '120000', 10);
 const ecOperationThrottleMs = parseInt(process.env.EC_OPERATION_THROTTLE_MS || '2000', 10);
@@ -76,7 +102,11 @@ const ENV_TEMP_MAX = 50;
 const ENV_HUMIDITY_MIN = 0;
 const ENV_HUMIDITY_MAX = 100;
 
+const RETAIN_SUBSCRIBE_GRACE_MS = parseInt(process.env.RETAIN_SUBSCRIBE_GRACE_MS || '3000', 10);
+let subscribedAt = 0;
+
 const lastTelemetryInsertByDevice = new Map();
+const lastLevelsEventByDevice = new Map();
 const lastHeartbeatUpsertByDevice = new Map();
 const lastHeartbeatAtByDevice = new Map();
 const lastEcOperationSnapshotByDevice = new Map();
@@ -291,9 +321,11 @@ function validateTelemetry(deviceId, payload) {
     ...(typeof payload.level_2 === 'boolean' ? { level_2: payload.level_2 } : {}),
     ...(typeof payload.level_3 === 'boolean' ? { level_3: payload.level_3 } : {}),
     ...(typeof payload.level_4 === 'boolean' ? { level_4: payload.level_4 } : {}),
-    ...(payload.water_level != null &&
-    WATER_LEVEL_VALUES.has(String(payload.water_level))
-      ? { water_level: String(payload.water_level) }
+    ...(normalizeWaterLevel(payload.water_level)
+      ? { water_level: normalizeWaterLevel(payload.water_level) }
+      : {}),
+    ...(typeof payload.levels_simulated === 'boolean'
+      ? { levels_simulated: payload.levels_simulated }
       : {}),
   };
 
@@ -341,15 +373,16 @@ function buildLevelDeviceStatusPatch(payload) {
   if (typeof payload.level_2 === 'boolean') patch.level_2 = payload.level_2;
   if (typeof payload.level_3 === 'boolean') patch.level_3 = payload.level_3;
   if (typeof payload.level_4 === 'boolean') patch.level_4 = payload.level_4;
-  if (
-    payload.water_level != null &&
-    WATER_LEVEL_VALUES.has(String(payload.water_level))
-  ) {
-    patch.water_level = String(payload.water_level);
-  }
+  const wl = normalizeWaterLevel(payload.water_level);
+  if (wl) patch.water_level = wl;
   if (typeof payload.water_level_ok === 'boolean') {
     patch.water_level_ok = payload.water_level_ok;
   }
+  if (typeof payload.levels_simulated === 'boolean') {
+    patch.levels_simulated = payload.levels_simulated;
+  }
+  const im = normalizeInterlockMode(payload.interlock_mode);
+  if (im) patch.level_interlock_mode = im;
   return Object.keys(patch).length > 0 ? patch : null;
 }
 
@@ -760,6 +793,23 @@ function shouldThrottleEcOperation(deviceId, row) {
   if (Math.abs(prev.remaining - row.ec_operation_remaining_sec) > 2) {
     return false;
   }
+  // Volumen A→B: no ahogar progreso de dilución (litros de sesión).
+  const prevProgress = Number(prev.progressL);
+  const nextProgress = Number(row.ec_dilution_progress_l);
+  if (
+    Number.isFinite(nextProgress) &&
+    (!Number.isFinite(prevProgress) || Math.abs(nextProgress - prevProgress) >= 0.05)
+  ) {
+    return false;
+  }
+  const prevTarget = Number(prev.targetL);
+  const nextTarget = Number(row.ec_dilution_target_l);
+  if (
+    Number.isFinite(nextTarget) &&
+    (!Number.isFinite(prevTarget) || Math.abs(nextTarget - prevTarget) >= 0.01)
+  ) {
+    return false;
+  }
   return now - prev.at < ecOperationThrottleMs;
 }
 
@@ -767,6 +817,8 @@ function rememberEcOperation(deviceId, row) {
   lastEcOperationSnapshotByDevice.set(deviceId, {
     state: row.ec_operation_state,
     remaining: row.ec_operation_remaining_sec,
+    progressL: row.ec_dilution_progress_l,
+    targetL: row.ec_dilution_target_l,
     at: Date.now(),
   });
 }
@@ -808,6 +860,7 @@ const HYDRO_INSERT_COLUMNS = new Set([
   'ph_raw',
   'ph_display_clamped',
   'ec',
+  'levels_simulated',
 ]);
 
 function pickHydroInsertRow(row) {
@@ -819,6 +872,12 @@ function pickHydroInsertRow(row) {
     }
   }
   return out;
+}
+
+function hasHydroRowPayload(hydroRow, sensorFields) {
+  if (!hydroRow) return false;
+  if (typeof hydroRow.water_level_ok === 'boolean') return true;
+  return hasHydroSensorPayload(hydroRow, sensorFields);
 }
 
 function hasHydroSensorPayload(hydroRow, sensorFields) {
@@ -847,10 +906,6 @@ function applyLegacyHydroNotNullDefaults(row, sensorFields) {
   } else if (out.ph == null && out.ph_raw != null) {
     const clamped = clampPhDisplay(out.ph_raw);
     if (clamped != null) out.ph = clamped;
-  }
-  const hasTemp = sensorFields?.hasTemp;
-  if (out.temperature == null && out.temperature_raw == null && hasTemp) {
-    out.temperature = 0;
   }
   return out;
 }
@@ -986,6 +1041,43 @@ async function patchRelayMasterOperation(deviceId, patch, logLabel, retryAfterSe
   return true;
 }
 
+async function insertFlowSessionReading(row) {
+  if (row.ec_dilution_progress_l == null && row.ec_dilution_target_l == null) {
+    return true;
+  }
+  const isDiluting =
+    row.ec_operation_state === 'diluting_draining' ||
+    row.ec_operation_state === 'diluting_filling';
+  if (!isDiluting && row.ec_dilution_progress_l == null) {
+    return true;
+  }
+
+  const payload = {
+    device_id: row.device_id,
+    sensor_id: 0,
+    role: 'dilution',
+    phase: isDiluting ? row.ec_operation_state : null,
+    session_liters: Number.isFinite(Number(row.ec_dilution_progress_l))
+      ? Number(row.ec_dilution_progress_l)
+      : 0,
+    target_liters: Number.isFinite(Number(row.ec_dilution_target_l))
+      ? Number(row.ec_dilution_target_l)
+      : null,
+    active: isDiluting,
+  };
+
+  const { error } = await supabase.from('hydro_flow_readings').insert(payload);
+  if (error) {
+    // Tabla puede no existir aún — no bloquear ec_operation.
+    console.warn(
+      `[bridge] hydro_flow_readings insert skipped (${row.device_id}):`,
+      error.message
+    );
+    return false;
+  }
+  return true;
+}
+
 async function patchEcOperation(row) {
   const patch = {
     ec_operation_state: row.ec_operation_state,
@@ -1001,6 +1093,9 @@ async function patchEcOperation(row) {
 
   const ok = await patchRelayMasterOperation(row.device_id, patch, 'ec_operation');
   if (!ok) return false;
+
+  // Historial volumen A→B (no bloquea si falla).
+  await insertFlowSessionReading(row);
 
   console.log(
     `[bridge] PATCH relay_master ${row.device_id} ec_operation=${row.ec_operation_state} rem=${row.ec_operation_remaining_sec}s`
@@ -1024,6 +1119,32 @@ async function patchPhOperation(row) {
   return true;
 }
 
+async function incrementPumpQuantity({ deviceId, relayIndex, ml, sequenceId, role }) {
+  const dosageMl = Number(ml);
+  if (!Number.isFinite(dosageMl) || dosageMl <= 0) return true;
+  if (!sequenceId) return true;
+  if (!Number.isInteger(relayIndex) || relayIndex < 0 || relayIndex > 7) return true;
+
+  const { error } = await supabase.rpc('increment_pump_quantity', {
+    p_device_id: deviceId,
+    p_relay_index: relayIndex,
+    p_ml: dosageMl,
+    p_sequence_id: String(sequenceId),
+    p_role: role || 'other',
+  });
+  if (error) {
+    console.error(
+      `[bridge] increment_pump_quantity failed (${deviceId} r${relayIndex}):`,
+      error.message
+    );
+    return false;
+  }
+  console.log(
+    `[bridge] pump_quantity +${dosageMl}ml ${deviceId} r${relayIndex} seq=${sequenceId}`
+  );
+  return true;
+}
+
 async function insertDose(row) {
   const { error } = await supabase.from('nutrient_dosages').upsert(row, {
     onConflict: 'device_id,sequence_id,nutrient_name,relay_number',
@@ -1036,6 +1157,13 @@ async function insertDose(row) {
   console.log(
     `[bridge] INSERT nutrient_dosages ${row.device_id} ${row.nutrient_name} ${row.dosage_ml}ml seq=${row.sequence_id}`
   );
+  await incrementPumpQuantity({
+    deviceId: row.device_id,
+    relayIndex: Number(row.relay_number),
+    ml: row.dosage_ml,
+    sequenceId: row.sequence_id,
+    role: 'ec',
+  });
   return true;
 }
 
@@ -1051,6 +1179,15 @@ async function insertPhDose(row) {
   console.log(
     `[bridge] INSERT ph_dosages ${row.device_id} ${row.direction} ${row.dosage_ml}ml seq=${row.sequence_id}`
   );
+  const dir = String(row.direction || '').toLowerCase();
+  const role = dir === 'up' || dir === 'ph_up' ? 'ph_up' : dir === 'down' || dir === 'ph_down' ? 'ph_down' : 'other';
+  await incrementPumpQuantity({
+    deviceId: row.device_id,
+    relayIndex: Number(row.relay_number),
+    ml: row.dosage_ml,
+    sequenceId: row.sequence_id,
+    role,
+  });
   return true;
 }
 
@@ -1083,10 +1220,9 @@ async function insertPhMetric(row) {
 }
 
 async function patchOnline(deviceId, online) {
-  const patch = {
-    is_online: online,
-    last_seen: new Date().toISOString(),
-  };
+  const patch = online
+    ? { is_online: true, last_seen: new Date().toISOString() }
+    : { is_online: false };
 
   const { error } = await supabase
     .from('device_status')
@@ -1131,10 +1267,10 @@ async function handleTelemetry(topic, message) {
     return;
   }
 
-  if (hasHydroSensorPayload(validated.hydroRow, validated.sensorFields)) {
+  if (hasHydroRowPayload(validated.hydroRow, validated.sensorFields)) {
     await insertHydro(validated.hydroRow, validated.sensorFields);
   } else {
-    console.log(`[bridge] telemetry ${deviceId} levels-only â€” skip hydro_measurements INSERT`);
+    console.log(`[bridge] telemetry ${deviceId} — skip hydro (sem niveles/sensores)`);
   }
   if (validated.deviceStatusPatch) {
     await patchDeviceLevel(deviceId, validated.deviceStatusPatch);
@@ -1149,6 +1285,45 @@ async function handleTelemetry(topic, message) {
   if (validated.envRow) {
     await insertEnvironment(validated.envRow);
   }
+}
+
+/** Evento on-change L1–L4 — solo PATCH device_status (sin throttle 30s de hydro). */
+async function handleLevels(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'levels');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  if (payload.device_id && String(payload.device_id) !== deviceId) {
+    console.warn(`[bridge] Rejected ${topic}: device_id mismatch`);
+    return;
+  }
+
+  const patch = buildLevelDeviceStatusPatch(payload);
+  if (!patch) {
+    console.warn(`[bridge] Rejected ${topic}: no level fields`);
+    return;
+  }
+
+  if (typeof payload.water_level_ok !== 'boolean') {
+    console.warn(`[bridge] Rejected ${topic}: water_level_ok must be boolean`);
+    return;
+  }
+
+  if (shouldThrottle(lastLevelsEventByDevice, deviceId, levelsEventThrottleMs)) {
+    console.log(
+      `[bridge] Throttled levels ${deviceId} (< ${levelsEventThrottleMs}ms anti-flood)`
+    );
+    return;
+  }
+
+  await patchDeviceLevel(deviceId, patch);
 }
 
 async function handleHeartbeat(topic, message) {
@@ -1481,6 +1656,28 @@ async function rpcCompleteRelayCommand(row) {
     return true;
   }
 
+  if (row.status === 'failed') {
+    const { error } = await supabase
+      .from('relay_commands')
+      .update({
+        status: 'failed',
+        error_message: 'device reported failed',
+        completed_at: new Date().toISOString(),
+      })
+      .eq('id', row.commandId)
+      .eq('device_id', row.deviceId)
+      .in('status', ['pending', 'sent', 'processing']);
+    if (error) {
+      console.error(`[bridge] command_ack FAILED id=${row.commandId}:`, error.message);
+      return false;
+    }
+    completedCommandAckIds.set(dedupeKey, Date.now());
+    console.log(
+      `[bridge] command_ack FAILED id=${row.commandId} relay=${row.relayIndex} state=${row.currentState}`
+    );
+    return true;
+  }
+
   const args = {
     p_command_id: row.commandId,
     p_device_id: row.deviceId,
@@ -1805,22 +2002,29 @@ const client = mqtt.connect(mqttUrl, {
 
 client.on('connect', () => {
   console.log(`[bridge] Connected to ${mqttUrl}`);
+  subscribedAt = Date.now();
   client.subscribe(TOPICS, { qos: 0 }, (err) => {
     if (err) {
       console.error('[bridge] Subscribe failed:', err.message);
       process.exit(1);
     }
     console.log(
-      `[bridge] Subscribed ${TOPICS.join(', ')} | telemetry ${telemetryThrottleMs}ms | heartbeat ${heartbeatThrottleMs}ms | ec_operation ${ecOperationThrottleMs}ms | ph_operation ${phOperationThrottleMs}ms | stale ${heartbeatStaleMs}ms`
+      `[bridge] Subscribed ${TOPICS.join(', ')} | telemetry ${telemetryThrottleMs}ms | levels ${levelsEventThrottleMs}ms | heartbeat ${heartbeatThrottleMs}ms | ec_operation ${ecOperationThrottleMs}ms | ph_operation ${phOperationThrottleMs}ms | stale ${heartbeatStaleMs}ms | retain-grace ${RETAIN_SUBSCRIBE_GRACE_MS}ms`
     );
   });
 });
 
-client.on('message', (topic, message) => {
+client.on('message', (topic, message, packet) => {
+  if (packet && packet.retain && subscribedAt > 0 && Date.now() - subscribedAt < RETAIN_SUBSCRIBE_GRACE_MS) {
+    console.log(`[bridge] ignore retained on subscribe ${topic}`);
+    return;
+  }
   const suffix = topicSuffix(topic);
   const run = async () => {
     if (suffix === 'telemetry') {
       await handleTelemetry(topic, message);
+    } else if (suffix === 'levels') {
+      await handleLevels(topic, message);
     } else if (suffix === 'heartbeat') {
       await handleHeartbeat(topic, message);
     } else if (suffix === 'status') {

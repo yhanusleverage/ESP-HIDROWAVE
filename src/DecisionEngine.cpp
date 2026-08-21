@@ -2,24 +2,10 @@
 #include "Config.h"
 #include "MasterSlaveManager.h"
 #include "RelayCoordinator.h"
+#include "ScriptRunner.h"
 #include <LittleFS.h>
 
 namespace {
-
-unsigned long tankHoldMsFromRule(const DecisionRule& rule) {
-    unsigned long holdMs = TANK_SCRIPT_HOLD_DEFAULT_MS;
-    for (const auto& action : rule.actions) {
-        if (action.type == RELAY_ON || action.type == RELAY_PULSE || action.type == RELAY_PWM) {
-            if (action.duration_ms > 0) {
-                const unsigned long d = action.duration_ms + TANK_SCRIPT_HOLD_BUFFER_MS;
-                if (d > holdMs) {
-                    holdMs = d;
-                }
-            }
-        }
-    }
-    return holdMs;
-}
 
 bool levelLabelExpectsWet(const String& label) {
     if (label == "alto" || label == "mojado" || label == "cheio" || label == "on" || label == "true") {
@@ -57,16 +43,21 @@ bool evaluateDiscreteLevelCondition(const RuleCondition& condition, const System
 }
 
 bool evaluateWaterLevelCondition(const RuleCondition& condition, const SystemState& state) {
-    const String actual = String(state.water_level);
-    const String expected = condition.string_value.length() > 0
+    String actual = String(state.water_level);
+    String expected = condition.string_value.length() > 0
         ? condition.string_value
         : String("medio");
+    actual.toLowerCase();
+    expected.toLowerCase();
+    // Compat breve: medio_baixo ≡ medio (2/4)
+    if (actual == "medio_baixo") actual = "medio";
+    if (expected == "medio_baixo") expected = "medio";
 
     switch (condition.op) {
         case OP_EQUAL:
-            return actual.equalsIgnoreCase(expected);
+            return actual == expected;
         case OP_NOT_EQUAL:
-            return !actual.equalsIgnoreCase(expected);
+            return actual != expected;
         default:
             return false;
     }
@@ -112,6 +103,13 @@ bool DecisionEngine::begin() {
     Serial.printf("🔄 Intervalo de avaliação: %lu ms\n", evaluation_interval);
     Serial.printf("🧪 Modo dry-run: %s\n", dry_run_mode ? "ATIVADO" : "DESATIVADO");
     
+    ScriptRunnerManager::instance().setTankProcedureGateCallback(
+        [this](bool active) {
+            if (tank_procedure_gate_callback) {
+                tank_procedure_gate_callback(active);
+            }
+        });
+    
     return true;
 }
 
@@ -124,6 +122,21 @@ void DecisionEngine::loop() {
         last_evaluation = now;
         total_evaluations++;
     }
+
+    ScriptRunnerManager::instance().tickAll(current_state,
+        [this](int relay, bool on, const String& targetDeviceId, unsigned long durationMs) {
+            if (dry_run_mode) {
+                Serial.printf("🧪 [SCRIPT DRY-RUN] relay=%d %s device=%s %lu ms\n",
+                    relay, on ? "ON" : "OFF", targetDeviceId.c_str(), durationMs);
+                return;
+            }
+            RuleAction action;
+            action.type = on ? RELAY_ON : RELAY_OFF;
+            action.target_relay = relay;
+            action.target_device_id = targetDeviceId;
+            action.duration_ms = durationMs;
+            executeRelayAction(action, "script");
+        });
 }
 
 void DecisionEngine::end() {
@@ -156,6 +169,7 @@ bool DecisionEngine::loadRulesFromFile(const String& filename) {
     }
     
     rules.clear();
+    ScriptRunnerManager::instance().clear();
     
     JsonArray rules_array = doc["rules"].as<JsonArray>();
     for (JsonObject rule_json : rules_array) {
@@ -300,7 +314,10 @@ void DecisionEngine::evaluateAllRules() {
             continue;
         }
         
-        // Executar ações
+        // Executar ações (scripts sequenciais são tratados pelo ScriptRunner)
+        if (rule.has_script) {
+            continue;
+        }
         if (dry_run_mode) {
             Serial.printf("🧪 [DRY-RUN] Executaria regra: %s\n", rule.name.c_str());
             for (const auto& action : rule.actions) {
@@ -311,9 +328,8 @@ void DecisionEngine::evaluateAllRules() {
             executeActions(rule.actions, rule.id);
             updateExecutionCounts(rule);
             total_actions_executed++;
-            if (rule.priority >= TANK_SCRIPT_PRIORITY_THRESHOLD && tank_script_hold_callback) {
-                tank_script_hold_callback(tankHoldMsFromRule(rule));
-            }
+            // Scripts secuenciales: gate lo maneja ScriptRunner (inicio→fin).
+            // Reglas one-shot high-pri: no usar timer; dilución ya tiene su propio gate.
         }
         
         logRuleExecution(rule.id, "EXECUTED", true);
@@ -601,7 +617,7 @@ bool DecisionEngine::validateRule(const DecisionRule& rule, String& error_messag
         return false;
     }
     
-    if (rule.actions.empty()) {
+    if (rule.actions.empty() && !rule.has_script) {
         error_message = "Regra deve ter pelo menos uma ação";
         return false;
     }
@@ -919,6 +935,13 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
         if (!parseConditionFromJSON(json_rule["condition"].as<JsonObject>(), rule.condition)) {
             return false;
         }
+    } else if (rule_body.containsKey("script")) {
+        JsonObject scriptCheck = rule_body["script"].as<JsonObject>();
+        if (scriptCheck.isNull() || !scriptCheck.containsKey("instructions")) {
+            return false;
+        }
+        rule.condition.type = TIME_WINDOW;
+        rule.condition.sensor_name = "time_window";
     } else {
         return false;
     }
@@ -966,7 +989,31 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
         rule.priority = rule_body["priority"];
     }
 
-    return !rule.id.isEmpty() && !rule.actions.empty();
+    rule.has_script = false;
+    JsonObject scriptObj = rule_body["script"].as<JsonObject>();
+    if (!scriptObj.isNull() && scriptObj.containsKey("instructions")) {
+        JsonArray scriptInstr = scriptObj["instructions"].as<JsonArray>();
+        if (!scriptInstr.isNull() && scriptInstr.size() > 0) {
+            rule.has_script = true;
+            rule.condition.type = TIME_WINDOW;
+            rule.condition.sensor_name = "time_window";
+            if (rule.trigger_type.isEmpty()) {
+                rule.trigger_type = "scheduled";
+            }
+            JsonVariant triggers;
+            if (json_rule.containsKey("procedure_triggers")) {
+                triggers = json_rule["procedure_triggers"];
+            } else if (rule_body.containsKey("procedure_triggers")) {
+                triggers = rule_body["procedure_triggers"];
+            } else if (rule_body.containsKey("triggers")) {
+                triggers = rule_body["triggers"];
+            }
+            ScriptRunnerManager::instance().loadFromRuleJson(
+                rule.id, rule.priority, rule_body, triggers);
+        }
+    }
+
+    return !rule.id.isEmpty() && (!rule.actions.empty() || rule.has_script);
 }
 
 void DecisionEngine::ruleToJSON(const DecisionRule& rule, JsonObject& out, JsonDocument& doc) {

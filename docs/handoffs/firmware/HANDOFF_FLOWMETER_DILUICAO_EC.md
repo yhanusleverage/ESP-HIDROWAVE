@@ -305,6 +305,8 @@ Parser: `src/MqttCommandParser.cpp` → `parseMqttEcDilutionCommand()`.
 
 ### 7.1 Calibrar `flowmeter_pulses_per_liter`
 
+**Importante:** ppl/K se calibran con **volumen real (balde)**. La EC post-dilución valida la fórmula de dilución (`volume_target_l` vs `volume_measured_l` + EC), **nunca** auto-escribe K del Hall.
+
 1. Configurar relé dreno na UI (**Automação → Diluição EC**).
 2. Abrir **só** válvula de dreno (manual ou comando de teste).
 3. Drenar volume **medido** (ex.: balde graduado 10.0 L).

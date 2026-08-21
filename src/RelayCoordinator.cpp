@@ -231,22 +231,15 @@ bool RelayCoordinator::executeLocalRelay(int relay, const String& action, int du
         return false;
     }
 
-    bool* relayStates = hydroControl->getRelayStates();
-    if (action == "on") {
-        if (!relayStates[relay]) {
-            hydroControl->toggleRelay(relay, durationSec);
-        }
-        return true;
+    if (action == "on" || action == "on_forever" || action == "timed_on") {
+        const int seconds = (action == "on_forever") ? 0 : durationSec;
+        return hydroControl->setRelay(relay, true, seconds);
     }
-    if (action == "off") {
-        if (relayStates[relay]) {
-            hydroControl->toggleRelay(relay, 0);
-        }
-        return true;
+    if (action == "off" || action == "cycle_stop") {
+        return hydroControl->setRelay(relay, false, 0);
     }
     if (action == "toggle") {
-        hydroControl->toggleRelay(relay, durationSec > 0 ? durationSec : 0);
-        return true;
+        return hydroControl->toggleRelay(relay, durationSec > 0 ? durationSec : 0);
     }
     return false;
 }
@@ -276,6 +269,12 @@ uint32_t RelayCoordinator::requestActuation(
     const String& commandMode) {
     const bool turningOn = (action == RelayActuationAction::On || action == RelayActuationAction::Toggle);
     const bool turningOff = (action == RelayActuationAction::Off);
+
+    if (owner == RelayOwner::Manual && hydroControl &&
+        hydroControl->holdsDilutionValve(target.isLocal, target.slaveMac, target.relay)) {
+        Serial.printf("[COORD] Manual denied — dilución activa R%d\n", target.relay + 1);
+        return 0;
+    }
 
     if (isCirculationTarget(target)) {
         if (turningOff && circulationRefCount > 0 &&

@@ -129,11 +129,12 @@ struct DecisionRule {
     unsigned long execution_count_hour;
     unsigned long hour_reset_time;
     bool currently_active;
+    bool has_script;
     
     DecisionRule() : enabled(true), priority(50), trigger_interval_ms(30000),
                     cooldown_ms(0), max_executions_per_hour(0),
                     last_execution(0), execution_count_hour(0),
-                    hour_reset_time(0), currently_active(false) {}
+                    hour_reset_time(0), currently_active(false), has_script(false) {}
 };
 
 /**
@@ -152,7 +153,7 @@ struct SystemState {
     bool level_2;
     bool level_3;
     bool level_4;
-    char water_level[8];
+    char water_level[16];
     
     // Estados dos relés
     bool relay_states[MAX_RELAYS];
@@ -248,12 +249,14 @@ public:
     typedef std::function<void(int relay, bool state, unsigned long duration)> RelayControlCallback;
     typedef std::function<void(const String& message, bool is_critical)> AlertCallback;
     typedef std::function<void(const String& event, const String& data)> LogCallback;
-    typedef std::function<void(unsigned long holdMs)> TankScriptHoldCallback;
+    typedef std::function<void(bool active)> TankProcedureGateCallback;
     
     void setRelayControlCallback(RelayControlCallback callback) { relay_control_callback = callback; }
     void setAlertCallback(AlertCallback callback) { alert_callback = callback; }
     void setLogCallback(LogCallback callback) { log_callback = callback; }
-    void setTankScriptHoldCallback(TankScriptHoldCallback callback) { tank_script_hold_callback = callback; }
+    void setTankProcedureGateCallback(TankProcedureGateCallback callback) {
+        tank_procedure_gate_callback = callback;
+    }
     
     // ✅ INTEGRAÇÃO ESP-NOW - Normalizado: usar MasterSlaveManager
     void setMasterManager(MasterSlaveManager* mgr) { masterManager = mgr; }
@@ -264,7 +267,7 @@ private:
     RelayControlCallback relay_control_callback;
     AlertCallback alert_callback;
     LogCallback log_callback;
-    TankScriptHoldCallback tank_script_hold_callback;
+    TankProcedureGateCallback tank_procedure_gate_callback;
     
     // ✅ INTEGRAÇÃO ESP-NOW - Normalizado: usar MasterSlaveManager
     MasterSlaveManager* masterManager;

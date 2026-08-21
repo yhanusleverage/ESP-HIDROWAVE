@@ -13,7 +13,8 @@ struct MqttTelemetryReading {
     bool level2Wet;
     bool level3Wet;
     bool level4Wet;
-    const char* waterLevel;  // vazio|baixo|medio|alto
+    const char* waterLevel;  // vazio|baixo|medio|medio_alto|alto
+    const char* interlockMode;  // normal|carrera (nullable ok)
     float airTemperature;  // ambiente (environment_data)
     float humidity;
     bool phValid;      // lectura fresca y plausible (no caché stale)
@@ -66,6 +67,18 @@ struct MqttPhOperationReading {
     const char* state;
     int operationRemainingSec;
     int nextCheckInSec;
+};
+
+/** hidrowave/{id}/levels — evento on-change L1–L4 (PATCH device_status) */
+struct MqttLevelsReading {
+    bool waterLevelOk;
+    bool level1Wet;
+    bool level2Wet;
+    bool level3Wet;
+    bool level4Wet;
+    const char* waterLevel;
+    bool levelsSimulated;
+    const char* interlockMode;  // normal|carrera
 };
 
 struct MqttPhDoseReading {
@@ -161,6 +174,7 @@ public:
 
     bool isConnected() const { return mqtt.connected(); }
     bool publishTelemetry(const MqttTelemetryReading& reading);
+    bool publishLevels(const MqttLevelsReading& reading);
     bool publishHeartbeat(const MqttHeartbeatReading& reading);
     bool publishEcOperation(const MqttEcOperationReading& reading);
     bool publishEcDilution(const MqttEcDilutionReading& reading);
@@ -178,7 +192,9 @@ private:
     WiFiClient wifiClient;
     mutable PubSubClient mqtt;
     String deviceId;
+    String mqttUsername;
     String telemetryTopic;
+    String levelsTopic;
     String heartbeatTopic;
     String statusTopic;
     String commandTopic;
@@ -194,15 +210,21 @@ private:
     char lwtPayload[128];
     unsigned long lastReconnectAttempt;
     unsigned long reconnectIntervalMs;
+    unsigned long lastFailLogMs;
+    uint8_t consecutiveFailCount;
     MqttCommandPayloadHandler commandHandler;
     void* commandHandlerUserData;
 
     static void mqttMessageCallback(char* topic, byte* payload, unsigned int length);
     static MqttClientWrapper* callbackInstance;
 
+    /** Reconecta só se backoff permitir (não forçar em cada publish). */
     bool ensureConnected();
+    /** true se já conectado — sem tentativa de TCP/MQTT. */
+    bool isConnectedCached() const { return mqtt.connected(); }
     bool subscribeCommandTopic();
     bool publishOnlineStatus();
+    void bumpReconnectBackoff();
 };
 
 #else
@@ -213,6 +235,7 @@ public:
     void loop() {}
     bool isConnected() const { return false; }
     bool publishTelemetry(const MqttTelemetryReading&) { return false; }
+    bool publishLevels(const MqttLevelsReading&) { return false; }
     bool publishHeartbeat(const MqttHeartbeatReading&) { return false; }
     bool publishEcOperation(const MqttEcOperationReading&) { return false; }
     bool publishEcDilution(const MqttEcDilutionReading&) { return false; }

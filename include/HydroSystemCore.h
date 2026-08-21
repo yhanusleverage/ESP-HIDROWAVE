@@ -21,6 +21,7 @@
 #include "DecisionEngineIntegration.h"
 #include "StateCacheTypes.h"
 #include "StatePersistenceManager.h"
+#include "StatusLED.h"
 
 // Forward declarations para evitar dependencias circulares
 class WebServerTask;
@@ -59,6 +60,11 @@ private:
     unsigned long lastMqttTelemetrySend;
     unsigned long lastMqttHeartbeatSend;
     unsigned long lastMqttCloudLastSeen;
+    unsigned long lastMqttLevelsPublishMs;
+    bool mqttLevelsFingerprintValid;
+    uint8_t lastMqttLevelsMask;
+    char lastMqttWaterLevel[16];
+    char lastMqttInterlockMode[12];
     unsigned long lastEcOperationSync;
     unsigned long lastEcOperationIdleSync;
     unsigned long lastPhOperationSync;
@@ -70,6 +76,13 @@ private:
     DecisionEngineIntegration decisionIntegration;
     bool bootOperationInterrupted;
     bool decisionEngineReady;
+
+    StatusLED statusLed;
+    unsigned long statusLedSendUntilMs;
+    int lastWifiLedState;  // wl_status_t cached; -1 = unset
+    void updateStatusLedFromWifi();
+    void notifyCloudSend();
+    void finishStatusLedSendPulseIfDue();
 
     /** Cola de respaldo HTTPS para dose EC (evita pérdida silenciosa quando MQTT OK mas bridge falha). */
     struct PendingNutrientDoseExport {
@@ -122,8 +135,11 @@ private:
     uint8_t pendingCloudAckCount;
     
     // Intervalos otimizados para resposta mais rápida
-    static const unsigned long SENSOR_SEND_INTERVAL = 30000;      // 30s
+    static const unsigned long SENSOR_SEND_INTERVAL = 30000;      // 30s (MQTT OK → hydro via broker)
+    /** HTTPS hydro quando MQTT offline — mais lento para não saturar TLS/heap */
+    static const unsigned long SENSOR_SEND_INTERVAL_MQTT_OFFLINE = 90000;  // 90s
     static const unsigned long STATUS_SEND_INTERVAL = 60000;      // 1 min (mantido para device_status)
+    static const unsigned long STATUS_SEND_INTERVAL_MQTT_OFFLINE = 120000; // 2 min fallback HTTPS
     static const unsigned long RELAY_STATES_SYNC_INTERVAL = 30000; // 30s — espelho relay_master/slaves
     static const unsigned long RELAY_STATES_SYNC_FORCE_RF_MS = 60000; // backup ALL_RELAYS RF a cada 60s
     static const unsigned long SLAVE_RELAY_HEARTBEAT_INTERVAL = 45000; // relay/state periódico p/ cloud
@@ -146,8 +162,12 @@ private:
         #define MEMORY_CHECK_INTERVAL 10000
     #endif
     
-    // Proteção de memória específica para HTTPS
-    static const uint32_t MIN_HEAP_FOR_HTTPS = 30000;  // 30KB mínimo para SSL
+    // Proteção de memória específica para HTTPS / mbedTLS
+    // 30KB era insuficiente: logs bancada falhavam SSL com ~90KB free (fragmentação).
+    static const uint32_t MIN_HEAP_FOR_HTTPS = 80000;           // 80KB livre total
+    static const uint32_t MIN_CONTIGUOUS_FOR_HTTPS = 40960;     // bloco contíguo p/ TLS
+    static const uint32_t HEAP_SUPABASE_DISABLE = 50000;        // desliga client se crítico
+    static const uint32_t HEAP_SUPABASE_REENABLE = 90000;       // histerese reabilitar
     
     // ✅ NOVO: Sistema de mapeamento commandId (ESP-NOW) → supabaseCommandId
     struct CommandMapping {
@@ -191,7 +211,10 @@ private:
     void flushPendingCloudAcks();
     bool hasPendingCloudAcks() const { return pendingCloudAckCount > 0; }
     bool hasPendingSlaveAcks();
+    /** Colas ESP-NOW / ACK cloud — para defer de sync no crítico. */
     bool isSslHotPathBusy();
+    /** Solo transporte HTTPS real — poll EC/pH config no debe morir por slave offline. */
+    bool isSslTransportBusy();
 
     static const size_t RECENTLY_CLOSED_ACK_CAP = 16;
     static const unsigned long RECENTLY_CLOSED_ACK_TTL_MS = 15000;
@@ -204,7 +227,8 @@ private:
     unsigned long mqttConnectedSinceMs;
     bool isMqttCommandPathStable() const;
     bool tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
-                                   const uint8_t* slaveMac, int relayNumber, bool currentState);
+                                   const uint8_t* slaveMac, int relayNumber, bool currentState,
+                                   const char* status = "completed");
     void publishSlaveRelayStateMqtt(const uint8_t* slaveMac, int fallbackRelay = -1,
                                     bool fallbackState = false, bool heartbeat = false);
     void forceSlaveRelayMqttFullSync();
@@ -285,7 +309,8 @@ private:
     void processPeristalticCommand(const RelayCommand& cmd, bool isSlave); // Comando de dosagem proporcional
     
     // ✅ Função auxiliar para executar comando local
-    void executeLocalRelayCommand(const RelayCommand& cmd);
+    bool executeLocalRelayCommand(const RelayCommand& cmd);
+    void maybePublishManualPumpDose(const RelayCommand& cmd);
     
     // ✅ NOVO: Funções auxiliares para atualizar estados
     void updateRelayMasterState(const RelayCommand& cmd);
@@ -299,7 +324,7 @@ private:
     void syncPhOperationStateToSupabase();
     void handleNutrientDoseEvent(const NutrientDoseEvent* event);
     void handleEcDilutionEvent(const EcDilutionEvent* event);
-    void handleDilutionSlaveRelay(const uint8_t* mac, int relay, bool on);
+    uint32_t handleDilutionSlaveRelay(const uint8_t* mac, int relay, bool on);
     void handlePhDoseEvent(const PhDoseEvent* event);
     void handleEcMetricEvent(const EcControllerMetricEvent* event);
     void handlePhMetricEvent(const PhControllerMetricEvent* event);
@@ -315,7 +340,7 @@ private:
     static void onPhGainLearnedStatic(void* userData);
     static void onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData);
     static void onEcDilutionStatic(const EcDilutionEvent* event, void* userData);
-    static void onDilutionSlaveRelayStatic(const uint8_t* mac, int relay, bool on, void* userData);
+    static uint32_t onDilutionSlaveRelayStatic(const uint8_t* mac, int relay, bool on, void* userData);
     static void onPhDoseStatic(const PhDoseEvent* event, void* userData);
     static void onEcMetricStatic(const EcControllerMetricEvent* event, void* userData);
     static void onPhMetricStatic(const PhControllerMetricEvent* event, void* userData);
@@ -325,6 +350,8 @@ private:
     static RelayOwner resolveCommandOwner(const RelayCommand& cmd);
     void publishMqttTelemetry();
     void publishMqttHeartbeat();
+    void publishMqttLevels();
+    void maybePublishMqttLevelsOnChange();
     void performMemoryProtection();
     
     // ✅ TÓPICO 4: Procesar comandos de queue (Core 0)

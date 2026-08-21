@@ -36,6 +36,8 @@ public:
     int lastAdcRaw() const { return adcMeanRaw_; }
     float lastPinVolts() const { return lastPinVoltsCal_; }
     float lastPinVoltsFromRaw() const { return lastPinVoltsLin_; }
+    uint32_t lastSampleMilliVolts() const { return lastSampleMv_; }
+    float instantEcMicrosiemensPerCm() const;
     unsigned long lastWindowSampleCount() const { return static_cast<unsigned long>(EC_SAMPLES_PER_WINDOW); }
 
     bool isBufferReady() const;
@@ -63,6 +65,7 @@ private:
     float lastPinVoltsLin_;
     float lastPinVoltsCal_;
     float ecMean_uScm_;
+    uint32_t lastSampleMv_;
 
     bool pendingWindow_;
 };

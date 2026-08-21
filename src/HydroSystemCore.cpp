@@ -1,4 +1,5 @@
 #include "HydroSystemCore.h"
+#include "ResourceTelemetry.h"
 #include "HydroControl.h"
 #include "SupabaseClient.h"
 #include "SensorSanitize.h"
@@ -22,6 +23,8 @@
 #include "WebServerTask.h"      // ✅ Include completo para usar métodos
 #include "ESPNowController.h"   // ✅ Include completo para usar métodos
 #include "MasterSlaveManager.h" // ✅ Para integración ESP-NOW
+#include <math.h>
+#include <cstdio>
 // ✅ NÃO incluir ESPNowTypes.h aqui - master relays são LOCAIS, não ESP-NOW
 
 namespace {
@@ -73,6 +76,10 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     lastMemoryProtection(0),
     lastMqttTelemetrySend(0),
     lastMqttHeartbeatSend(0),
+    lastMqttCloudLastSeen(0),
+    lastMqttLevelsPublishMs(0),
+    mqttLevelsFingerprintValid(false),
+    lastMqttLevelsMask(0xFF),
     lastEcOperationSync(0),
     lastEcOperationIdleSync(0),
     lastPhOperationSync(0),
@@ -90,13 +97,18 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     decisionEngine(),
     decisionIntegration(&decisionEngine, &hydroControl, &supabase, masterMgr),
     bootOperationInterrupted(false),
-    decisionEngineReady(false) {
+    decisionEngineReady(false),
+    statusLed(STATUS_LED_PIN),
+    statusLedSendUntilMs(0),
+    lastWifiLedState(-1) {
     
     memset(pendingNutrientDoseQueue, 0, sizeof(pendingNutrientDoseQueue));
     memset(pendingPhDoseQueue, 0, sizeof(pendingPhDoseQueue));
     memset(pendingCloudAckQueue, 0, sizeof(pendingCloudAckQueue));
     memset(recentlyClosedSupabaseIds, 0, sizeof(recentlyClosedSupabaseIds));
     memset(recentlyClosedAtMs, 0, sizeof(recentlyClosedAtMs));
+    lastMqttWaterLevel[0] = '\0';
+    lastMqttInterlockMode[0] = '\0';
     // Log de dependências injetadas
     if (webServerTask) {
         Serial.println("✅ HydroSystemCore: WebServerTask injetado");
@@ -121,6 +133,8 @@ void HydroSystemCore::wireMasterManagerIntegration() {
                       (unsigned)commandId, findSupabaseCommandId(commandId), relayNumber,
                       currentState ? "ON" : "OFF");
 
+        hydroControl.notifyDilutionRelayAck(commandId, success, currentState != 0);
+
         int supabaseCommandId = findSupabaseCommandId(commandId);
 
         if (supabaseCommandId > 0 && success) {
@@ -129,7 +143,7 @@ void HydroSystemCore::wireMasterManagerIntegration() {
         } else if (supabaseCommandId > 0 && !success) {
             supabase.markCommandFailed(supabaseCommandId, "Slave não confirmou", true);
             Serial.println("❌ [CALLBACK] Comando marcado como failed");
-        } else if (supabaseCommandId == 0) {
+        } else if (supabaseCommandId == 0 && !hydroControl.isDilutionAwaitingValve()) {
             Serial.println("⚠️ [CALLBACK] Mapeamento não encontrado para commandId=" + String(commandId));
             Serial.println("💡 Comando pode ter sido processado antes do mapeamento ser criado");
         }
@@ -172,6 +186,12 @@ void HydroSystemCore::wireMasterManagerIntegration() {
 
     masterManager->setAllRelaysSnapshotCallback([this](const uint8_t* mac, const bool states[8], uint8_t numRelays) {
         reconcilePendingSlaveAcks(mac, states, numRelays);
+        if (hydroControl.isDilutionAwaitingValve() && mac && states) {
+            const uint8_t n = numRelays > 8 ? 8 : numRelays;
+            for (uint8_t i = 0; i < n; i++) {
+                hydroControl.notifyDilutionObservedRelay(mac, i, states[i], true);
+            }
+        }
 #if ENABLE_MQTT
         publishSlaveRelayStateMqtt(mac, -1, false, false);
 #endif
@@ -215,6 +235,10 @@ bool HydroSystemCore::begin() {
         return true;
     }
     
+    // ===== LED STATUS (GPIO2) — no bloqueante =====
+    statusLed.begin();
+    updateStatusLedFromWifi();
+
     startTime = millis();
 
     if (mappingsMutex == nullptr) {
@@ -373,6 +397,11 @@ void HydroSystemCore::loop() {
     if (!systemReady) return;
     
     unsigned long now = millis();
+
+    // LED: solo update() + eventos (WiFi / nube) — nunca blink por iteración.
+    finishStatusLedSendPulseIfDue();
+    updateStatusLedFromWifi();
+    statusLed.update();
     
     // ===== PROTEÇÃO DE MEMÓRIA (10s) =====
     if (now - lastMemoryProtection >= MEMORY_CHECK_INTERVAL) {
@@ -400,28 +429,42 @@ void HydroSystemCore::loop() {
         publishMqttTelemetry();
         lastMqttTelemetrySend = now;
     }
+    maybePublishMqttLevelsOnChange();
     if (now - lastMqttHeartbeatSend >= MQTT_HEARTBEAT_INTERVAL_MS) {
         publishMqttHeartbeat();
         lastMqttHeartbeatSend = now;
     }
 #endif
     
-    // ===== SENSORES → SUPABASE (30s) — skip HTTPS hydro si MQTT conectado (evita duplicar pipeline) =====
+    // ===== SENSORES → SUPABASE — skip se MQTT OK; se offline, intervalo maior + sem SSL hot path =====
     {
         bool sendHydroHttps = true;
+        unsigned long hydroInterval = SENSOR_SEND_INTERVAL;
 #if ENABLE_MQTT
         sendHydroHttps = !mqttClient.isConnected();
+        if (sendHydroHttps) {
+            hydroInterval = SENSOR_SEND_INTERVAL_MQTT_OFFLINE;
+        }
 #endif
-        if (sendHydroHttps && !doseCycleBusy && now - lastSensorSend >= SENSOR_SEND_INTERVAL) {
+        if (sendHydroHttps && !doseCycleBusy && !isSslHotPathBusy() &&
+            now - lastSensorSend >= hydroInterval) {
             sendSensorDataToSupabase();
             lastSensorSend = now;
         }
     }
     
-    // ===== STATUS DEVICE → SUPABASE (60s) =====
-    if (now - lastStatusSend >= STATUS_SEND_INTERVAL) {
-        sendDeviceStatusToSupabase();
-        lastStatusSend = now;
+    // ===== STATUS DEVICE → SUPABASE (60s / 120s se MQTT offline) =====
+    {
+        unsigned long statusInterval = STATUS_SEND_INTERVAL;
+#if ENABLE_MQTT
+        if (!mqttClient.isConnected()) {
+            statusInterval = STATUS_SEND_INTERVAL_MQTT_OFFLINE;
+        }
+#endif
+        if (!isSslHotPathBusy() && now - lastStatusSend >= statusInterval) {
+            sendDeviceStatusToSupabase();
+            lastStatusSend = now;
+        }
     }
     
     // ===== SINCRONIZAÇÃO UNIFICADA DE RELAY STATES (30s) — adia se ACK cloud pendente =====
@@ -582,7 +625,8 @@ void HydroSystemCore::loop() {
         phPollMs = CONFIG_POLL_INTERVAL_MQTT_OK_MS;
     }
 #endif
-    if (supabaseConnected && !doseCycleBusy && !isSslHotPathBusy()) {
+    // Config Auto EC/pH: solo defer si HTTPS real ocupado (no por slave ACK offline)
+    if (supabaseConnected && !doseCycleBusy && !isSslTransportBusy()) {
         if (now - lastECConfigCheck >= ecPollMs) {
             Serial.println("[SYNC] EC config poll");
             esp_task_wdt_reset();
@@ -596,10 +640,11 @@ void HydroSystemCore::loop() {
             checkPHConfigFromSupabase();
             lastPHConfigCheck = now;
         }
-    } else if (supabaseConnected && isSslHotPathBusy()) {
+    } else if (supabaseConnected && isSslTransportBusy()) {
         static unsigned long lastDeferLog = 0;
         if (now - lastDeferLog >= 60000) {
-            Serial.println("[SSL] defer EC/PH poll (hot path busy)");
+            Serial.printf("[SSL] defer EC/PH poll reason=%s\n",
+                supabase.isRequestInProgress() ? "requestInProgress" : "relaySyncInProgress");
             lastDeferLog = now;
         }
     }
@@ -755,6 +800,23 @@ void HydroSystemCore::loop() {
     
     // ===== LOOP DOS SENSORES/RELÉS =====
     hydroControl.loop();
+
+#if RESOURCE_SERIAL_DEBUG
+    {
+        bool mqttUp = false;
+#if ENABLE_MQTT
+        mqttUp = mqttClient.isConnected();
+#endif
+        const int slavesOnline = masterManager ? masterManager->getOnlineSlaveCount() : 0;
+        ResourceTelemetry::setContext(
+            mqttUp,
+            isSslHotPathBusy(),
+            hydroControl.getDilutionPhaseName(),
+            WiFi.status() == WL_CONNECTED,
+            slavesOnline);
+        ResourceTelemetry::tick();
+    }
+#endif
 }
 
 void HydroSystemCore::end() {
@@ -802,6 +864,7 @@ void HydroSystemCore::printSensorReadings() {
     reading.level3Wet = hydroControl.isLevelWet(3);
     reading.level4Wet = hydroControl.isLevelWet(4);
     reading.waterLevel = hydroControl.getWaterLevelAggregate();
+    reading.interlockMode = hydroControl.getLevelInterlockModeName();
     reading.airTemperature = NAN;
     reading.humidity = NAN;
     printTelemetrySerialLine(reading);
@@ -901,7 +964,7 @@ void HydroSystemCore::checkECConfigFromSupabase() {
         return;
     }
 
-    if (isSslHotPathBusy()) {
+    if (isSslTransportBusy()) {
         return;
     }
     
@@ -924,6 +987,10 @@ void HydroSystemCore::checkECConfigFromSupabase() {
         bool auto_enabled = false;
         int intervalo_auto_ec = -1;
         unsigned long tempo_recirculacao = 0;
+        double aggressiveness = -1;
+        bool consumo_24h = false;
+        double pulse_ml = -1;
+        double pulse_gap_sec = -1;
         String nutrientsJson;
         bool initialized = false;
     } lastAppliedEcConfig;
@@ -942,6 +1009,10 @@ void HydroSystemCore::checkECConfigFromSupabase() {
                lastAppliedEcConfig.auto_enabled == config.auto_enabled &&
                lastAppliedEcConfig.intervalo_auto_ec == config.intervalo_auto_ec &&
                lastAppliedEcConfig.tempo_recirculacao == config.tempo_recirculacao &&
+               lastAppliedEcConfig.aggressiveness == config.aggressiveness &&
+               lastAppliedEcConfig.consumo_24h == config.consumo_24h &&
+               lastAppliedEcConfig.pulse_ml == config.pulse_ml &&
+               lastAppliedEcConfig.pulse_gap_sec == config.pulse_gap_sec &&
                lastAppliedEcConfig.nutrientsJson == config.nutrientsJson;
     };
 
@@ -956,6 +1027,10 @@ void HydroSystemCore::checkECConfigFromSupabase() {
         lastAppliedEcConfig.auto_enabled = config.auto_enabled;
         lastAppliedEcConfig.intervalo_auto_ec = config.intervalo_auto_ec;
         lastAppliedEcConfig.tempo_recirculacao = config.tempo_recirculacao;
+        lastAppliedEcConfig.aggressiveness = config.aggressiveness;
+        lastAppliedEcConfig.consumo_24h = config.consumo_24h;
+        lastAppliedEcConfig.pulse_ml = config.pulse_ml;
+        lastAppliedEcConfig.pulse_gap_sec = config.pulse_gap_sec;
         lastAppliedEcConfig.nutrientsJson = config.nutrientsJson;
         lastAppliedEcConfig.initialized = true;
     };
@@ -978,7 +1053,11 @@ void HydroSystemCore::checkECConfigFromSupabase() {
             }
             hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);
             hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
-            hydroControl.setDilutionAutoEnabled(config.dilution_auto_enabled, false);
+            hydroControl.setMaxStepEcFraction((float)config.aggressiveness);
+            hydroControl.setEcPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
+            hydroControl.setConsumoEc24hEnabled(config.consumo_24h);
+            hydroControl.setDilutionAutoEnabled(
+                config.dilution_auto_enabled || config.auto_enabled, false);
             hydroControl.setDilutionSlaveRelays(
                 config.dilution_drain_slave_mac,
                 config.dilution_drain_relay,
@@ -1013,14 +1092,20 @@ void HydroSystemCore::checkECConfigFromSupabase() {
                         adaptedNutrient["name"] = nutrient["name"].as<String>();
                         adaptedNutrient["mlPerLiter"] = nutrient["mlPerLiter"].as<float>();
                         adaptedNutrient["active"] = nutrient["active"].as<bool>();
+                        if (nutrient.containsKey("flowRate")) {
+                            adaptedNutrient["flowRate"] = nutrient["flowRate"].as<float>();
+                        } else if (nutrient.containsKey("flow_rate")) {
+                            adaptedNutrient["flowRate"] = nutrient["flow_rate"].as<float>();
+                        }
                         
                         // Converter relay (0-15) para relayNumber (1-16)
                         int relay = nutrient["relay"].as<int>();
                         adaptedNutrient["relayNumber"] = relay + 1;  // Converter para 1-16
                         
-                        Serial.printf("   ✅ %s: %.2f ml/L → Relé %d\n", 
-                            nutrient["name"].as<const char*>(), 
+                        Serial.printf("   ✅ %s: %.2f ml/L q=%.3f ml/s → Relé %d\n",
+                            nutrient["name"].as<const char*>(),
                             nutrient["mlPerLiter"].as<float>(),
+                            adaptedNutrient["flowRate"] | 0.0f,
                             relay + 1);
                     }
                     
@@ -1188,12 +1273,26 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
     } else {
         // ===== COMANDO MASTER (LOCAL - PCF8574) =====
         Serial.println("🏠 [MASTER] Processando comando local");
-        
-        // ✅ Usar código existente (NÃO TOCAR PCF8574)
-        executeLocalRelayCommand(cmd);
-        
+
+        const bool success = executeLocalRelayCommand(cmd);
+        if (!success) {
+            if (supabaseConnected && cmd.id > 0) {
+                supabase.markCommandFailed(cmd.id, "PCF2 write failed", false);
+#if ENABLE_MQTT
+                const bool actualOn = (cmd.relayNumber >= 0 && cmd.relayNumber < 8)
+                    ? hydroControl.getRelayStates()[cmd.relayNumber]
+                    : false;
+                tryPublishCloudAckViaMqtt(
+                    cmd.id, 0, nullptr, cmd.relayNumber, actualOn, "failed");
+#endif
+            }
+            return;
+        }
+
         if (supabaseConnected) {
-            const bool currentState = (cmd.action == "on");
+            const bool currentState = (cmd.relayNumber >= 0 && cmd.relayNumber < 16)
+                ? hydroControl.getRelayStates()[cmd.relayNumber]
+                : false;
             bool cloudClosed = false;
             if (hasEnoughMemoryForHTTPS() && !supabase.isRequestInProgress()) {
                 cloudClosed = tryCloseCloudRelayCommand(cmd.id, nullptr, cmd.relayNumber, currentState);
@@ -1203,11 +1302,52 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
             }
             logCmdCloudAckResult("master", cmd.id, 0, cmd.relayNumber, currentState, cloudClosed);
         }
-        
+
         if (supabaseConnected && !hasPendingCloudAcks()) {
             updateRelayMasterState(cmd);
         }
+
+        maybePublishManualPumpDose(cmd);
     }
+}
+
+// Conta dosagem manual timed (não cebar) → MQTT dose → bridge → pump_quantity
+void HydroSystemCore::maybePublishManualPumpDose(const RelayCommand& cmd) {
+#if ENABLE_MQTT
+    if (cmd.action != "on") {
+        return;
+    }
+    if (cmd.durationSeconds <= 0) {
+        return;
+    }
+    if (cmd.relayNumber < 0 || cmd.relayNumber > 7) {
+        return;
+    }
+    if (!(cmd.dosageMl > 0.0f) || !isfinite(cmd.dosageMl)) {
+        return;
+    }
+    if (cmd.triggered_by.indexOf("calibragem_prime") >= 0) {
+        return;
+    }
+
+    NutrientDoseEvent event = {};
+    snprintf(event.sequenceId, sizeof(event.sequenceId), "m%d-%lu", cmd.id, (unsigned long)(millis() % 1000000UL));
+    const String name =
+        cmd.rule_name.length() > 0 ? cmd.rule_name : String("manual_r") + String(cmd.relayNumber);
+    name.toCharArray(event.nutrientName, sizeof(event.nutrientName));
+    event.nutrientName[sizeof(event.nutrientName) - 1] = '\0';
+    event.relayNumber = cmd.relayNumber;
+    event.dosageMl = cmd.dosageMl;
+    event.dosageTimeSeconds = (float)cmd.durationSeconds;
+    event.ecBefore = hydroControl.getEC();
+    event.ecSetpoint = 0.0f;
+    event.source = "manual";
+    handleNutrientDoseEvent(&event);
+    Serial.printf("📊 [QTY] manual dose MQTT %.3f ml R%d seq=%s\n",
+                  cmd.dosageMl, cmd.relayNumber, event.sequenceId);
+#else
+    (void)cmd;
+#endif
 }
 
 // ✅ FORK: Processar comando de regra (automação)
@@ -1216,11 +1356,9 @@ void HydroSystemCore::processRuleCommand(const RelayCommand& cmd, bool isSlave) 
     Serial.printf("   Regra: %s (%s) priority=%d\n", cmd.rule_name.c_str(), cmd.rule_id.c_str(), cmd.priority);
 
     if (cmd.priority >= TANK_SCRIPT_PRIORITY_THRESHOLD) {
-        unsigned long holdMs = TANK_SCRIPT_HOLD_DEFAULT_MS;
-        if (cmd.durationSeconds > 0) {
-            holdMs = (unsigned long)cmd.durationSeconds * 1000UL + TANK_SCRIPT_HOLD_BUFFER_MS;
-        }
-        hydroControl.holdAutoDosingForTankScript(holdMs);
+        // Gate lo controla ScriptRunner secuencial / dilución — no timer aquí.
+        Serial.printf("🤖 [RULE] P1 priority=%d (Auto EC/pH via procedimento ativo, sem hold por tempo)\n",
+                      cmd.priority);
     }
     
     // ✅ Validações específicas para comandos de regra
@@ -1261,18 +1399,58 @@ void HydroSystemCore::processPeristalticCommand(const RelayCommand& cmd, bool is
 }
 
 // ✅ Função auxiliar para executar comando local
-void HydroSystemCore::executeLocalRelayCommand(const RelayCommand& cmd) {
+bool HydroSystemCore::executeLocalRelayCommand(const RelayCommand& cmd) {
     Serial.println("🏠 [LOCAL] Comando para relés locais via RelayCoordinator");
-    
+
     const RelayOwner owner = resolveCommandOwner(cmd);
     bool success = relayCoordinator.actuateLocal(
         owner, cmd.relayNumber, cmd.action, cmd.durationSeconds);
-    
+
     if (success) {
         Serial.println("✅ Comando local executado com sucesso");
     } else {
         Serial.println("❌ Erro ao executar comando local");
     }
+    return success;
+}
+
+void HydroSystemCore::updateStatusLedFromWifi() {
+    if (statusLedSendUntilMs != 0 && millis() < statusLedSendUntilMs) {
+        return;  // pulse de envío tiene prioridad
+    }
+    const int st = static_cast<int>(WiFi.status());
+    if (st == lastWifiLedState && statusLedSendUntilMs == 0) {
+        return;
+    }
+    lastWifiLedState = st;
+    if (st == WL_CONNECTED) {
+        statusLed.setConnected();
+    } else if (st == WL_IDLE_STATUS || st == WL_DISCONNECTED || st == WL_NO_SSID_AVAIL ||
+               st == WL_CONNECTION_LOST) {
+        statusLed.setConnecting();
+    } else if (st == WL_CONNECT_FAILED) {
+        statusLed.setError();
+    } else {
+        statusLed.setConnecting();
+    }
+}
+
+void HydroSystemCore::notifyCloudSend() {
+    statusLed.setSendingData();
+    statusLedSendUntilMs = millis() + 1500UL;
+    lastWifiLedState = -1;  // forzar re-aplicar WiFi al terminar pulse
+}
+
+void HydroSystemCore::finishStatusLedSendPulseIfDue() {
+    if (statusLedSendUntilMs == 0) {
+        return;
+    }
+    if (millis() < statusLedSendUntilMs) {
+        return;
+    }
+    statusLedSendUntilMs = 0;
+    lastWifiLedState = -1;
+    updateStatusLedFromWifi();
 }
 
 void HydroSystemCore::publishMqttTelemetry() {
@@ -1293,11 +1471,92 @@ void HydroSystemCore::publishMqttTelemetry() {
     reading.level3Wet = hydroControl.isLevelWet(3);
     reading.level4Wet = hydroControl.isLevelWet(4);
     reading.waterLevel = hydroControl.getWaterLevelAggregate();
+    reading.interlockMode = hydroControl.getLevelInterlockModeName();
     // Sin DHT cableado: no enviar ambiente simulado (evita environment_data basura)
     reading.airTemperature = NAN;
     reading.humidity = NAN;
     printTelemetrySerialLine(reading);
-    mqttClient.publishTelemetry(reading);
+    if (mqttClient.publishTelemetry(reading)) {
+        notifyCloudSend();
+    }
+#endif
+}
+
+void HydroSystemCore::publishMqttLevels() {
+#if ENABLE_MQTT
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    MqttLevelsReading reading;
+    reading.waterLevelOk = hydroControl.isWaterLevelOk();
+    reading.level1Wet = hydroControl.isLevelWet(1);
+    reading.level2Wet = hydroControl.isLevelWet(2);
+    reading.level3Wet = hydroControl.isLevelWet(3);
+    reading.level4Wet = hydroControl.isLevelWet(4);
+    reading.waterLevel = hydroControl.getWaterLevelAggregate();
+    reading.interlockMode = hydroControl.getLevelInterlockModeName();
+#if HIDRO_SIMULATE_WATER_LEVELS
+    reading.levelsSimulated = true;
+#else
+    reading.levelsSimulated = false;
+#endif
+    if (mqttClient.publishLevels(reading)) {
+        notifyCloudSend();
+        lastMqttLevelsPublishMs = millis();
+        lastMqttLevelsMask = static_cast<uint8_t>(
+            (reading.level1Wet ? 1 : 0) |
+            (reading.level2Wet ? 2 : 0) |
+            (reading.level3Wet ? 4 : 0) |
+            (reading.level4Wet ? 8 : 0) |
+            (reading.waterLevelOk ? 16 : 0));
+        const char* wl = reading.waterLevel ? reading.waterLevel : "vazio";
+        strncpy(lastMqttWaterLevel, wl, sizeof(lastMqttWaterLevel) - 1);
+        lastMqttWaterLevel[sizeof(lastMqttWaterLevel) - 1] = '\0';
+        const char* im = reading.interlockMode ? reading.interlockMode : "normal";
+        strncpy(lastMqttInterlockMode, im, sizeof(lastMqttInterlockMode) - 1);
+        lastMqttInterlockMode[sizeof(lastMqttInterlockMode) - 1] = '\0';
+        mqttLevelsFingerprintValid = true;
+    }
+#endif
+}
+
+void HydroSystemCore::maybePublishMqttLevelsOnChange() {
+#if ENABLE_MQTT
+    if (!mqttClient.isConnected() || WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    const bool l1 = hydroControl.isLevelWet(1);
+    const bool l2 = hydroControl.isLevelWet(2);
+    const bool l3 = hydroControl.isLevelWet(3);
+    const bool l4 = hydroControl.isLevelWet(4);
+    const bool ok = hydroControl.isWaterLevelOk();
+    const char* wl = hydroControl.getWaterLevelAggregate();
+    if (!wl) {
+        wl = "vazio";
+    }
+    const char* im = hydroControl.getLevelInterlockModeName();
+
+    const uint8_t mask = static_cast<uint8_t>(
+        (l1 ? 1 : 0) | (l2 ? 2 : 0) | (l3 ? 4 : 0) | (l4 ? 8 : 0) | (ok ? 16 : 0));
+
+    const bool changed =
+        !mqttLevelsFingerprintValid ||
+        mask != lastMqttLevelsMask ||
+        strncmp(lastMqttWaterLevel, wl, sizeof(lastMqttWaterLevel)) != 0 ||
+        strncmp(lastMqttInterlockMode, im, sizeof(lastMqttInterlockMode)) != 0;
+
+    if (!changed) {
+        return;
+    }
+
+    // Anti-flood curto (debounce hardware já é LEVEL_DEBOUNCE_MS)
+    const unsigned long now = millis();
+    if (mqttLevelsFingerprintValid && (now - lastMqttLevelsPublishMs) < 300UL) {
+        return;
+    }
+
+    publishMqttLevels();
 #endif
 }
 
@@ -1322,14 +1581,22 @@ void HydroSystemCore::sendSensorDataToSupabase() {
     Serial.printf("   supabaseConnected: %s\n", supabaseConnected ? "SIM" : "NÃO");
     Serial.printf("   hasEnoughMemory: %s\n", hasEnoughMemoryForHTTPS() ? "SIM" : "NÃO");
     Serial.printf("   supabase.isReady(): %s\n", supabase.isReady() ? "SIM" : "NÃO");
+    Serial.printf("   heap=%u maxAlloc=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     
     if (!supabaseConnected) {
         Serial.println("❌ [SENSORES] Supabase não conectado - abortando envio");
         return;
     }
+
+    if (isSslHotPathBusy()) {
+        Serial.println("[SSL] defer hydro HTTPS (hot path busy)");
+        return;
+    }
     
     if (!hasEnoughMemoryForHTTPS()) {
-        Serial.printf("❌ [SENSORES] Memória insuficiente: %d bytes\n", ESP.getFreeHeap());
+        Serial.printf("❌ [SENSORES] Memória insuficiente p/ TLS: free=%u maxAlloc=%u (min %u/%u)\n",
+                      ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+                      MIN_HEAP_FOR_HTTPS, MIN_CONTIGUOUS_FOR_HTTPS);
         return;
     }
     
@@ -1375,6 +1642,7 @@ void HydroSystemCore::sendSensorDataToSupabase() {
     
     if (hydroSuccess) {
         Serial.println("✅ [SENSORES] Dados hidropônicos enviados ao Supabase");
+        notifyCloudSend();
     } else {
         Serial.println("❌ [SENSORES] Falha ao enviar dados hidropônicos");
     }
@@ -1382,6 +1650,11 @@ void HydroSystemCore::sendSensorDataToSupabase() {
 
 void HydroSystemCore::sendDeviceStatusToSupabase() {
     if (!supabaseConnected || !hasEnoughMemoryForHTTPS()) {
+        return;
+    }
+
+    if (isSslHotPathBusy()) {
+        Serial.println("[SSL] defer device_status HTTPS (hot path busy)");
         return;
     }
     
@@ -1459,18 +1732,19 @@ void HydroSystemCore::onEcDilutionStatic(const EcDilutionEvent* event, void* use
     }
 }
 
-void HydroSystemCore::onDilutionSlaveRelayStatic(const uint8_t* mac, int relay, bool on, void* userData) {
+uint32_t HydroSystemCore::onDilutionSlaveRelayStatic(const uint8_t* mac, int relay, bool on, void* userData) {
     if (userData && mac) {
-        static_cast<HydroSystemCore*>(userData)->handleDilutionSlaveRelay(mac, relay, on);
+        return static_cast<HydroSystemCore*>(userData)->handleDilutionSlaveRelay(mac, relay, on);
     }
+    return 0;
 }
 
-void HydroSystemCore::handleDilutionSlaveRelay(const uint8_t* mac, int relay, bool on) {
-    if (!masterManager) {
-        return;
+uint32_t HydroSystemCore::handleDilutionSlaveRelay(const uint8_t* mac, int relay, bool on) {
+    if (!mac) {
+        return 0;
     }
-    String action = on ? "on" : "off";
-    masterManager->sendRelayCommandToSlave(mac, relay, action, 0, 0, false);
+    const String action = on ? "on" : "off";
+    return relayCoordinator.actuateSlave(RelayOwner::AutoEcDilution, mac, relay, action, 0, 0);
 }
 
 void HydroSystemCore::onEcMetricStatic(const EcControllerMetricEvent* event, void* userData) {
@@ -1560,7 +1834,7 @@ void HydroSystemCore::checkPHConfigFromSupabase() {
         return;
     }
 
-    if (isSslHotPathBusy()) {
+    if (isSslTransportBusy()) {
         return;
     }
 
@@ -1611,6 +1885,8 @@ void HydroSystemCore::checkPHConfigFromSupabase() {
     hydroControl.setAutoPHInterval(config.intervalo_auto_ph, false);
     hydroControl.setAutoPHEnabled(config.auto_enabled, false);
     hydroControl.setPhRecirculacaoSeconds(config.tempo_recirculacao);
+    hydroControl.setPhPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
+    hydroControl.setConsumoPh24hEnabled(config.consumo_24h);
 }
 
 void HydroSystemCore::onPhDoseStatic(const PhDoseEvent* event, void* userData) {
@@ -2279,11 +2555,11 @@ void HydroSystemCore::performMemoryProtection() {
         }
     }
     
-    // ===== DESABILITAR SUPABASE SE MEMÓRIA BAIXA =====
-    if (freeHeap < MIN_HEAP_FOR_HTTPS && supabaseConnected) {
+    // ===== DESABILITAR SUPABASE SE MEMÓRIA CRÍTICA (histerese) =====
+    if (freeHeap < HEAP_SUPABASE_DISABLE && supabaseConnected) {
         Serial.println("⚠️ Desabilitando Supabase temporariamente - Heap baixo");
         supabaseConnected = false;
-    } else if (freeHeap > MIN_HEAP_FOR_HTTPS + 10000 && !supabaseConnected) {
+    } else if (freeHeap > HEAP_SUPABASE_REENABLE && !supabaseConnected) {
         Serial.println("✅ Reabilitando Supabase - Heap recuperado");
         supabaseConnected = true;
     }
@@ -2291,7 +2567,19 @@ void HydroSystemCore::performMemoryProtection() {
 
 // ===== UTILITIES =====
 bool HydroSystemCore::hasEnoughMemoryForHTTPS() {
-    return ESP.getFreeHeap() >= MIN_HEAP_FOR_HTTPS;
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < MIN_HEAP_FOR_HTTPS) {
+        return false;
+    }
+    const uint32_t maxBlock = ESP.getMaxAllocHeap();
+    if (maxBlock < MIN_CONTIGUOUS_FOR_HTTPS) {
+        return false;
+    }
+    // Uma request SSL de cada vez — evita OOM com MQTT retry + hydro em paralelo
+    if (supabase.isRequestInProgress()) {
+        return false;
+    }
+    return true;
 }
 
 void HydroSystemCore::printPeriodicStatus() {
@@ -2952,20 +3240,27 @@ void HydroSystemCore::completeSlaveCommand(int supabaseCommandId, uint32_t espNo
     }
 }
 
+bool HydroSystemCore::isSslTransportBusy() {
+    if (relaySyncInProgress) {
+        return true;
+    }
+    if (supabase.isRequestInProgress()) {
+        return true;
+    }
+    return false;
+}
+
 bool HydroSystemCore::isSslHotPathBusy() {
     if (hasPendingCloudAcks()) {
         return true;
     }
-    if (relaySyncInProgress) {
+    if (isSslTransportBusy()) {
         return true;
     }
     if (hasPendingSlaveAcks()) {
         return true;
     }
     if (masterManager && masterManager->getPendingRelayCommandCount() > 0) {
-        return true;
-    }
-    if (supabase.isRequestInProgress()) {
         return true;
     }
     return false;
@@ -3154,7 +3449,7 @@ bool HydroSystemCore::isMqttCommandPathStable() const {
 
 bool HydroSystemCore::tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
                                                 const uint8_t* slaveMac, int relayNumber,
-                                                bool currentState) {
+                                                bool currentState, const char* status) {
     if (!mqttClient.isConnected() || supabaseCommandId <= 0) {
         return false;
     }
@@ -3181,7 +3476,7 @@ bool HydroSystemCore::tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t 
 
     MqttCommandAckReading ack = {};
     ack.commandId = supabaseCommandId;
-    ack.status = "completed";
+    ack.status = (status && status[0]) ? status : "completed";
     ack.relayIndex = relayNumber;
     ack.action = currentState ? "on" : "off";
     ack.currentState = currentState;
@@ -3295,6 +3590,20 @@ void HydroSystemCore::handleMqttCommandPayload(const char* payload, size_t lengt
     if (parseMqttEcDilutionCommand(payload, length, dilutionVolumeL)) {
         if (hydroControl.startEcDilution(dilutionVolumeL, "manual")) {
             syncEcOperationStateToSupabase();
+        }
+        return;
+    }
+
+    char interlockMode[16];
+    if (parseMqttLevelInterlockCommand(payload, length, interlockMode, sizeof(interlockMode))) {
+        const HydroControl::LevelInterlockMode mode =
+            (strcmp(interlockMode, "carrera") == 0)
+                ? HydroControl::LEVEL_INTERLOCK_CARRERA
+                : HydroControl::LEVEL_INTERLOCK_NORMAL;
+        if (hydroControl.setLevelInterlockMode(mode)) {
+            mqttLevelsFingerprintValid = false;
+            publishMqttLevels();
+            publishMqttTelemetry();
         }
         return;
     }

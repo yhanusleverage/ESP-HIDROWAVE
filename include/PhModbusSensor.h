@@ -16,6 +16,7 @@ public:
 
     void begin();
     float readPH();
+    void runDiscoveryScan();
     float lastValidPH() const { return lastValidPh_; }
     uint16_t lastRawPh() const { return lastRawPh_; }
     uint16_t lastReg0Raw() const { return lastReg0Raw_; }

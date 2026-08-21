@@ -6,6 +6,7 @@
 user bridge_internal
 topic read hidrowave/+/heartbeat
 topic read hidrowave/+/telemetry
+topic read hidrowave/+/levels
 topic read hidrowave/+/status
 topic read hidrowave/+/ec_operation
 topic read hidrowave/+/dose

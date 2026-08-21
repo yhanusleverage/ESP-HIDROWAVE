@@ -1,9 +1,9 @@
-# Deploy bridge index.js a Lightsail (ubuntu@99.79.36.220)
+# Deploy bridge index.js a Lightsail (ubuntu@15.222.65.160)
 # Uso: .\scripts\deploy-lightsail.ps1 -PemPath "C:\path\LightsailDefaultKey-ca-central-1.pem"
 
 param(
   [string]$PemPath = "$env:USERPROFILE\Documents\Projects\LightsailDefaultKey-ca-central-1.pem",
-  [string]$SshHost = "ubuntu@99.79.36.220"
+  [string]$SshHost = "ubuntu@15.222.65.160"
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +18,7 @@ $AclDosePatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-d
 $AclMetricPatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-metric-topics.sh"
 $AclHidrowavePatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-hidrowave-publish.sh"
 $AlignBrokerSh = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\align-broker-production.sh"
+$ClearRetainSh = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\clear-retained-presence.sh"
 $SlaveCmdJs = Join-Path $BridgeDir "scripts\test-publish-slave-command.js"
 $CheckRelayRowJs = Join-Path $BridgeDir "scripts\check-relay-slave-row.js"
 
@@ -49,6 +50,9 @@ if (Test-Path $SlaveCmdJs) {
 if (Test-Path $CheckRelayRowJs) {
   scp -i $PemPath -o StrictHostKeyChecking=accept-new $CheckRelayRowJs "${SshHost}:/tmp/check-relay-slave-row.js"
 }
+if (Test-Path $ClearRetainSh) {
+  scp -i $PemPath -o StrictHostKeyChecking=accept-new $ClearRetainSh "${SshHost}:/tmp/clear-retained-presence.sh"
+}
 scp -i $PemPath -o StrictHostKeyChecking=accept-new $PackageJson "${SshHost}:/tmp/hidrowave-package.json"
 
 Write-Host ">> Instalar y reiniciar hidrowave-bridge"
@@ -61,6 +65,7 @@ sudo cp /tmp/test-publish-ec-metric.js /opt/hidrowave-bridge/scripts/test-publis
 sudo cp /tmp/test-publish-ph-metric.js /opt/hidrowave-bridge/scripts/test-publish-ph-metric.js &&
 if [ -f /tmp/test-publish-slave-command.js ]; then sudo cp /tmp/test-publish-slave-command.js /opt/hidrowave-bridge/scripts/test-publish-slave-command.js; fi &&
 if [ -f /tmp/check-relay-slave-row.js ]; then sudo cp /tmp/check-relay-slave-row.js /opt/hidrowave-bridge/scripts/check-relay-slave-row.js; fi &&
+if [ -f /tmp/clear-retained-presence.sh ]; then sudo cp /tmp/clear-retained-presence.sh /opt/hidrowave-bridge/scripts/clear-retained-presence.sh && sudo chmod 755 /opt/hidrowave-bridge/scripts/clear-retained-presence.sh; fi &&
 sudo cp /tmp/hidrowave-package.json /opt/hidrowave-bridge/package.json &&
 sudo chmod 755 /opt/hidrowave-bridge/scripts &&
 if [ -f /tmp/patch-acl-dose-topics.sh ]; then sudo bash /tmp/patch-acl-dose-topics.sh; fi &&
@@ -68,8 +73,8 @@ if [ -f /tmp/patch-acl-metric-topics.sh ]; then sudo bash /tmp/patch-acl-metric-
 if [ -f /tmp/patch-acl-hidrowave-publish.sh ]; then sudo bash /tmp/patch-acl-hidrowave-publish.sh; fi &&
 sudo chown hidrowave:hidrowave /opt/hidrowave-bridge/scripts/*.js &&
 sudo systemctl restart hidrowave-bridge &&
-sleep 2 &&
-sudo journalctl -u hidrowave-bridge -n 30 --no-pager | grep -E 'Subscribed|relay/state|link-only|Rejected|heartbeat' || true
+sleep 3 &&
+sudo journalctl -u hidrowave-bridge -n 40 --no-pager | grep -E 'Subscribed|retain-grace|ignore retained|is_online=false|PATCH device_status|heartbeat' || true
 "@
 ssh -i $PemPath -o StrictHostKeyChecking=accept-new $SshHost $remoteCmd
 

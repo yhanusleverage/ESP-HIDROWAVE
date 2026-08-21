@@ -70,7 +70,7 @@
 #define MQTT_COMMAND_PATH_STABLE_MS 60000UL
 #endif
 #ifndef CONFIG_POLL_INTERVAL_MQTT_OK_MS
-#define CONFIG_POLL_INTERVAL_MQTT_OK_MS 300000UL
+#define CONFIG_POLL_INTERVAL_MQTT_OK_MS 60000UL  // Auto EC/pH ON-OFF: 1 min (era 5 min; no starve por MQTT OK)
 #endif
 #endif
 
@@ -93,13 +93,13 @@
 #define API_RETRY_ATTEMPTS 3UL
 #define SUPABASE_TIMEOUT_MS 7000       // ✅ Otimizado: 7s (reduzido de 10s para resposta mais rápida)
 #ifndef COMMAND_POLL_INTERVAL_MS
-#define COMMAND_POLL_INTERVAL_MS 10000  // fallback HTTPS quando MQTT offline (fase 3)
+#define COMMAND_POLL_INTERVAL_MS 20000  // fallback HTTPS quando MQTT offline
 #endif
 #ifndef COMMAND_POLL_INTERVAL_MQTT_OK_MS
 #define COMMAND_POLL_INTERVAL_MQTT_OK_MS 60000UL  // backup lento se MQTT online
 #endif
 #ifndef COMMAND_POLL_INTERVAL_MQTT_DOWN_MS
-#define COMMAND_POLL_INTERVAL_MQTT_DOWN_MS 10000UL
+#define COMMAND_POLL_INTERVAL_MQTT_DOWN_MS 20000UL
 #endif
 
 // Headers HTTP para Supabase
@@ -164,25 +164,54 @@
 #define PH_MODBUS_TEMP_SCALE 10.0f     // reg0 / 10 = temperatura °C
 #define PH_MODBUS_REG 0x0001           // reg1: pH (reg0 = temperatura)
 #define PH_MODBUS_SCALE 10.0f          // pH x10 (0.1 pH)
+/** Fase A: barrido Modbus al boot (1=activo). 0 en produccion: reg0=temp, reg1=pH ya confirmados. */
+#ifndef PH_MODBUS_DISCOVERY
+#define PH_MODBUS_DISCOVERY 0
+#endif
+#define PH_MODBUS_DISCOVERY_REG_START 0x0000u
+#define PH_MODBUS_DISCOVERY_REG_END 0x000Fu
+#define PH_MODBUS_DISCOVERY_REG_DELAY_MS 80u
+/** EC diagnostico ADC (GPIO 35). Libre — YFB5 está en GPIO4. */
+#define EC_ADC_CMP_PIN 35
+/** 1 = muestra EC instantanea cada ventana (diagnostico). OK con YFB5 en GPIO4. */
+#ifndef EC_FAST_DEBUG
+#define EC_FAST_DEBUG 0
+#endif
 // UART EC legado — no usado por EcAnalogSensor
 // #define TDS_RX_PIN 36
 // #define TDS_TX_PIN 17
-#define TEMP_PIN 4                     // DS18B20 fallback si Modbus temp falla
+#define TEMP_PIN 4                     // Legacy DS18 — OBSOLETO; pin = YF-B5 (FLOW_SENSOR_PIN)
 // Legacy GPIO nivel — NO usar con RS485 (32=DE/RE, 33=EC); niveles vía PCF8574 P0-P3
 #define TANK_LOW_PIN 32
 #define TANK_HIGH_PIN 33
 
+#ifndef USE_PH_MODBUS_SENSOR
+#define USE_PH_MODBUS_SENSOR 1
+#endif
+/** DS18/OneWire: desactivado para siempre. Temp agua = Modbus pH. GPIO4 solo YF-B5. */
+#ifndef HIDRO_ENABLE_DS18B20_FALLBACK
+#define HIDRO_ENABLE_DS18B20_FALLBACK 0
+#endif
+#if HIDRO_ENABLE_DS18B20_FALLBACK
+#error "DS18/OneWire desactivado en producto — deja HIDRO_ENABLE_DS18B20_FALLBACK=0 (GPIO4=YF-B5)"
+#endif
+
 // ===== 4 SONDAS NPN VIA PCF8574 #1 (P0-P3) =====
 #define LEVEL_DEBOUNCE_MS 300
-#define LEVEL_NPN_ACTIVE_LOW 1         // NPN ON → LOW no PCF (após opto)
-#define LEVEL_SENSOR_PCF_PINS 0, 1, 2, 3
-#define WATER_TEMP_PIN 25              // Sensor de temperatura da água
-#define WATER_LEVEL_NPN_PIN 32         // Sensor de nível NPN
-#define WATER_LEVEL_PNP_PIN 33         // Sensor de nível PNP
+#define LEVEL_POLL_MS 200              // Paridad 4level_sensors LevelSensor(200)
+#define LEVEL_LOG_MS 1000              // Línea LEVEL en serial (no 10 s)
+#define LEVEL_NPN_ACTIVE_LOW 1         // NPN ON → LOW no PCF (directo, sin PC817)
+// L1 base (P3) → L4 topo (P0). Cable físico igual: P0=arriba, P3=abajo.
+// Histórico V1 (L1=P0 topo): docs/handoffs/hydraulics/LEVEL_LOGIC_VERSIONS.md
+#define LEVEL_SENSOR_PCF_PINS 3, 2, 1, 0
+    // Sensor de nível PNP
 
-// I2C - Barramento compartilhado
+// I2C - Barramento compartilhado (100 kHz como bancada CAT6)
 #define I2C_SDA 21
 #define I2C_SCL 22
+#ifndef I2C_CLOCK_HZ
+#define I2C_CLOCK_HZ 100000
+#endif
 
 // Status LED
 #define STATUS_LED_PIN 2               // LED de status (built-in)
@@ -224,33 +253,106 @@
 #define HIDRO_DEV_RELAX_SENSORS 1
 #endif
 
-#ifndef USE_PH_MODBUS_SENSOR
-#define USE_PH_MODBUS_SENSOR 1
-#endif
-
 #ifndef HIDRO_SIMULATE_WATER_LEVELS
-#define HIDRO_SIMULATE_WATER_LEVELS 1  // hasta instalar L1-L4 en PCF8574
+#define HIDRO_SIMULATE_WATER_LEVELS 0  // 1 solo bancada sin sondas; producción = PCF L1–L4 reales
 #endif
 
 // 1 = sin pH Modbus válido → EC analógica también inválida (bus 12 V común)
+// 0 = bancada: EC analógica independiente del pH Modbus
 #ifndef HIDRO_EC_REQUIRES_PH_MODBUS
-#define HIDRO_EC_REQUIRES_PH_MODBUS 1
+#define HIDRO_EC_REQUIRES_PH_MODBUS 0
 #endif
 
-// Diluição EC modo A — fluxómetro na saída do dreno
+// Diluição EC — YF-B5 Hall (GPIO4; temp agua = Modbus pH). Paridad ESP-SENSORS.
+// Amarillo ~5 V/0 V → divisor 10k serie + 20k a GND → ~3.3 V en GPIO4. Sin task FreeRTOS.
+#ifndef FLOW_SENSOR_PIN
+#define FLOW_SENSOR_PIN 4
+#endif
+// YF-B5 Seeed: F = 6.6 * Q (Hz, L/min), rango 1..30 L/min, ~396 pulsos/L.
+#ifndef FLOW_HZ_PER_LPM
+#define FLOW_HZ_PER_LPM 6.6f
+#endif
+#ifndef FLOW_PULSE_FACTOR
+#define FLOW_PULSE_FACTOR FLOW_HZ_PER_LPM  // alias legado
+#endif
+#ifndef FLOW_Q_MIN_LPM
+#define FLOW_Q_MIN_LPM 1.0f
+#endif
+#ifndef FLOW_Q_MAX_LPM
+#define FLOW_Q_MAX_LPM 30.0f
+#endif
+#ifndef FLOW_WINDOW_MS
+#define FLOW_WINDOW_MS 1000UL
+#endif
+/** Anti-rebote ISR. 100 µs (flowmeter lab) es corto en Master ruidoso; 2 ms deja margen vs máx ~198 Hz (~5 ms). */
+#ifndef FLOW_ISR_DEBOUNCE_US
+#define FLOW_ISR_DEBOUNCE_US 2000UL
+#endif
+/**
+ * SUPREME: dt real YF-B5 ~5–150 ms. Si dt_min de pulsos aceptados &lt; esto → EMI/rebote, no sumar litros.
+ * (Tu log: dt_min≈100–125 µs con total subiendo sin soplar.)
+ */
+#ifndef FLOW_MIN_PULSE_GAP_US
+#define FLOW_MIN_PULSE_GAP_US 3000UL
+#endif
+#ifndef FLOW_IDLE_HZ
+#define FLOW_IDLE_HZ 0.5f
+#endif
+#ifndef FLOW_MIN_HZ
+#define FLOW_MIN_HZ (FLOW_HZ_PER_LPM * FLOW_Q_MIN_LPM)  // 6.6
+#endif
+#ifndef FLOW_MAX_HZ
+#define FLOW_MAX_HZ (FLOW_HZ_PER_LPM * FLOW_Q_MAX_LPM * 1.05f)  // ~207.9 (+5%)
+#endif
+#ifndef FLOW_PULSES_PER_LITER
+#define FLOW_PULSES_PER_LITER (FLOW_HZ_PER_LPM * 60.0f)  // 396
+#endif
+/** K de campo: L_real / L_leido (balde). 1.0 = datasheet. No auto-ajustar por EC post-dilución. */
+#ifndef FLOW_CALIBRATION_FACTOR
+#define FLOW_CALIBRATION_FACTOR 1.0f
+#endif
+#ifndef FLOW_FILTER_ENABLE
+#define FLOW_FILTER_ENABLE 1
+#endif
+/** 1 = línea extra [FLOW dbg] why/raw/deb/dt (SUPREME). 0 = producción. */
+#ifndef FLOW_DEBUG
+#define FLOW_DEBUG 0
+#endif
+#ifndef FLOW_MIN_LPM
+#define FLOW_MIN_LPM 0.05f  // stall dilución (legacy); filtro Hz usa FLOW_MIN_HZ
+#endif
+/** 1 = log serial [FLOW] handoff (~1s). 0 = producción. */
+#ifndef FLOW_SERIAL_DEBUG
+#define FLOW_SERIAL_DEBUG 0
+#endif
+/** 1 = ISR YF-B5 solo durante dilución/dreno. 0 = ISR siempre (bancada). */
+#ifndef FLOW_ISR_ONLY_WHEN_DILUTING
+#define FLOW_ISR_ONLY_WHEN_DILUTING 1
+#endif
+/** 1 = telemetría [RES] heap/HWM/loop-s (contención Master). 0 = producción. */
+#ifndef RESOURCE_SERIAL_DEBUG
+#define RESOURCE_SERIAL_DEBUG 1
+#endif
+#ifndef RESOURCE_LOG_MS
+#define RESOURCE_LOG_MS 10000UL
+#endif
+#if EC_FAST_DEBUG && (FLOW_SENSOR_PIN == EC_ADC_CMP_PIN)
+#error "FLOW_SENSOR_PIN coincide con EC_ADC_CMP_PIN — cambia uno (ver docs/sensors/SENSOR_FLUJO_YFB5.md)"
+#endif
 #ifndef FLOWMETER_PULSE_PIN
-#define FLOWMETER_PULSE_PIN 26
+#define FLOWMETER_PULSE_PIN FLOW_SENSOR_PIN
 #endif
 #ifndef FLOWMETER_PULSES_PER_LITER
-#define FLOWMETER_PULSES_PER_LITER 450.0f
-// Calibrar no banco: drenar volume conhecido, medir pulsos, ppl = pulsos/L.
-// Ver HIDROWAVE-main/scripts/ADD_EC_DILUTION.sql § calibração.
+#define FLOWMETER_PULSES_PER_LITER FLOW_PULSES_PER_LITER
+// Calibración bancada: pulsos ÷ litros reales → flowmeter_pulses_per_liter (UI).
+// EC post-dilución valida la fórmula de dilución, NO el Hall / K.
 #endif
 #ifndef DILUTION_FILL_FLOW_LPS
 #define DILUTION_FILL_FLOW_LPS 0.5f
 #endif
-#ifndef DILUTION_FLOWMETER_STALL_MS
-#define DILUTION_FLOWMETER_STALL_MS 30000UL
+/** Bancada: con niveles simulados, tras este tiempo el fill trata "HIGH" (E2E). */
+#ifndef DILUTION_FILL_SIM_HIGH_MS
+#define DILUTION_FILL_SIM_HIGH_MS 5000UL
 #endif
 #ifndef DILUTION_DRAIN_RELAY_DEFAULT
 #define DILUTION_DRAIN_RELAY_DEFAULT -1
@@ -261,12 +363,14 @@
 #ifndef DILUTION_MAX_VOLUME_L_DEFAULT
 #define DILUTION_MAX_VOLUME_L_DEFAULT 50.0f
 #endif
+/** Esperar ACK ESP-NOW de válvula de dreno antes de contar litros. Fill reintenta, no aborta. */
+#ifndef DILUTION_VALVE_ACK_TIMEOUT_MS
+#define DILUTION_VALVE_ACK_TIMEOUT_MS 10000UL
+#endif
 
-// Grow cycle P1: pausar Auto EC/pH mientras script tanque (priority >= umbral)
+// Grow cycle P1: scripts de tanque (priority >= umbral) pausan Auto EC/pH
+// mientras el procedimiento secuencial está activo — sin timers HOLD_*.
 #define TANK_SCRIPT_PRIORITY_THRESHOLD 80
-#define TANK_SCRIPT_HOLD_MIN_MS 60000UL
-#define TANK_SCRIPT_HOLD_BUFFER_MS 30000UL
-#define TANK_SCRIPT_HOLD_DEFAULT_MS 120000UL
 
 #ifndef CIRCULATION_RELAY_DEFAULT
 #define CIRCULATION_RELAY_DEFAULT 7

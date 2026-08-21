@@ -33,7 +33,8 @@ hidrowave/{device_id}/{recurso}
 | Tópico completo | Direção | QoS | Retain | Frequência | Consumidor |
 |-----------------|---------|-----|--------|------------|------------|
 | `.../heartbeat` | ESP → broker | 0 | false | 30 s | Bridge → `device_status` |
-| `.../telemetry` | ESP → broker | 0 | false | 30–60 s | Bridge → `hydro_measurements` |
+| `.../telemetry` | ESP → broker | 0 | false | 30–60 s | Bridge → `hydro_measurements` (+ PATCH niveles) |
+| `.../levels` | ESP → broker | 0 | false | **on-change** L1–L4 | Bridge → PATCH `device_status` (anti-flood 300 ms) |
 | `.../status` | ESP → broker | 1 | **true** | connect + LWT | Bridge → `is_online` |
 | `.../relay/state` | ESP → broker | 1 | false | on change | Bridge opcional / debug |
 | `.../command` | broker → ESP | 1 | false | sob demanda | ESP subscribe |
@@ -117,6 +118,27 @@ Alinhar com campos já enviados em `sendHydroData` / `environment_data`:
 - Não duplicar insert HTTPS e MQTT sem **throttle** no bridge (ex.: max 1 registro/min por device se ambos ativos na fase 2).
 - Tipos numéricos: JSON number, não string `"6.2"`.
 - Valores inválidos de sensor: omitir chave ou `null`, nunca `-999` sem documentar.
+
+### 3.2b Níveis on-change → `.../levels`
+
+Publicado pelo ESP **solo cuando cambian** L1–L4 / `water_level` (post-debounce). Bridge hace PATCH `device_status` **sin** el throttle 30 s de telemetry.
+
+```json
+{
+  "v": 1,
+  "device_id": "ESP32_HIDRO_269844",
+  "water_level_ok": true,
+  "level_1": true,
+  "level_2": true,
+  "level_3": false,
+  "level_4": true,
+  "water_level": "medio",
+  "levels_simulated": false
+}
+```
+
+**Mapeo Supabase (`device_status`):** `level_1..4`, `water_level`, `water_level_ok`, `levels_simulated`.  
+Anti-flood bridge: `LEVELS_EVENT_THROTTLE_MS` (default 300).
 
 ### 3.3 Comando → `.../command` (broker → ESP)
 

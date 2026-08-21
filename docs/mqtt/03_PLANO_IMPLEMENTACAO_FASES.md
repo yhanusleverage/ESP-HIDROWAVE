@@ -85,8 +85,8 @@ ESP (MQTT offline)
 - [ ] Rejeitar sem `id` (R9)
 - [ ] API frontend: após INSERT `relay_commands` → `mosquitto_pub` ou route server-side
 - [ ] Ack HTTPS `markCommandCompleted` / `markCommandFailed` (R3) — inalterado
-- [ ] `COMMAND_POLL_INTERVAL_MS`: 60000 se MQTT OK, **10000** se MQTT down
-- [ ] KPI: 100 cmds manuais, 0 dup, &lt;2s latência com MQTT; fallback 10s OK offline
+- [ ] `COMMAND_POLL_INTERVAL_MS`: 60000 se MQTT OK, **20000** se MQTT down
+- [ ] KPI: 100 cmds manuais, 0 dup, &lt;2s latência com MQTT; fallback 20s OK offline
 
 ---
 

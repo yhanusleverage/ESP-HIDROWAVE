@@ -1,7 +1,48 @@
 #include "PhModbusSensor.h"
 #include "Config.h"
+#include <cstring>
 
 PhModbusSensor* PhModbusSensor::activeInstance_ = nullptr;
+
+namespace {
+
+float modbusRegsToFloat(uint16_t regHi, uint16_t regLo, bool wordSwap) {
+    const uint32_t u = wordSwap
+                           ? (static_cast<uint32_t>(regLo) << 16) | regHi
+                           : (static_cast<uint32_t>(regHi) << 16) | regLo;
+    float out = 0.0f;
+    memcpy(&out, &u, sizeof(out));
+    return out;
+}
+
+bool isPlausiblePh(float v) {
+    return v >= 0.0f && v <= 14.0f;
+}
+
+bool isPlausibleTempC(float v) {
+    return v >= -10.0f && v <= 80.0f;
+}
+
+void printScaleHints(uint16_t raw) {
+    const float d10 = static_cast<float>(raw) / 10.0f;
+    const float d100 = static_cast<float>(raw) / 100.0f;
+    const float d1000 = static_cast<float>(raw) / 1000.0f;
+    Serial.printf("  /10=%.2f /100=%.3f /1000=%.4f", d10, d100, d1000);
+    if (isPlausiblePh(d10)) {
+        Serial.print("  [pH?/10]");
+    }
+    if (isPlausiblePh(d100)) {
+        Serial.print("  [pH?/100]");
+    }
+    if (isPlausibleTempC(d10)) {
+        Serial.print("  [tempC?/10]");
+    }
+    if (isPlausibleTempC(d100)) {
+        Serial.print("  [tempC?/100]");
+    }
+}
+
+}  // namespace
 
 PhModbusSensor::PhModbusSensor(uint8_t rxPin,
                                uint8_t txPin,
@@ -46,6 +87,97 @@ void PhModbusSensor::begin() {
     modbus_.begin(slaveAddr_, Serial2);
     modbus_.preTransmission(preTransmissionStatic);
     modbus_.postTransmission(postTransmissionStatic);
+
+#if PH_MODBUS_DISCOVERY
+    runDiscoveryScan();
+#endif
+}
+
+void PhModbusSensor::runDiscoveryScan() {
+    Serial.println();
+    Serial.println("========== [pH DISCOVERY] inicio ==========");
+    Serial.printf("[DISCOVERY] slave=%u baud=%lu holding 0x%04X..0x%04X + input + float pairs\n",
+                  static_cast<unsigned>(slaveAddr_),
+                  static_cast<unsigned long>(baud_),
+                  static_cast<unsigned>(PH_MODBUS_DISCOVERY_REG_START),
+                  static_cast<unsigned>(PH_MODBUS_DISCOVERY_REG_END));
+    Serial.println();
+
+    Serial.println("  -- Holding registers (1 reg / lectura) -----------------------");
+    for (uint16_t reg = PH_MODBUS_DISCOVERY_REG_START; reg <= PH_MODBUS_DISCOVERY_REG_END; ++reg) {
+        const uint8_t result = modbus_.readHoldingRegisters(reg, 1);
+        if (result == modbus_.ku8MBSuccess) {
+            const uint16_t raw = modbus_.getResponseBuffer(0);
+            Serial.printf("  [SCAN-H] reg=0x%04X raw=%5u", reg, raw);
+            printScaleHints(raw);
+            Serial.println();
+        } else {
+            Serial.printf("  [SCAN-H] reg=0x%04X err=0x%02X\n", reg, result);
+        }
+        delay(PH_MODBUS_DISCOVERY_REG_DELAY_MS);
+    }
+
+    Serial.println();
+    Serial.println("  -- Input registers (1 reg / lectura) ---------------------------");
+    for (uint16_t reg = PH_MODBUS_DISCOVERY_REG_START; reg <= PH_MODBUS_DISCOVERY_REG_END; ++reg) {
+        const uint8_t result = modbus_.readInputRegisters(reg, 1);
+        if (result == modbus_.ku8MBSuccess) {
+            const uint16_t raw = modbus_.getResponseBuffer(0);
+            Serial.printf("  [SCAN-I] reg=0x%04X raw=%5u", reg, raw);
+            printScaleHints(raw);
+            Serial.println();
+        } else {
+            Serial.printf("  [SCAN-I] reg=0x%04X err=0x%02X\n", reg, result);
+        }
+        delay(PH_MODBUS_DISCOVERY_REG_DELAY_MS);
+    }
+
+    Serial.println();
+    Serial.println("  -- Float IEEE (pares holding consecutivos) ---------------------");
+    const uint16_t blockLen =
+        static_cast<uint16_t>(PH_MODBUS_DISCOVERY_REG_END - PH_MODBUS_DISCOVERY_REG_START + 1u);
+    const uint8_t blockResult =
+        modbus_.readHoldingRegisters(PH_MODBUS_DISCOVERY_REG_START, blockLen);
+    if (blockResult == modbus_.ku8MBSuccess) {
+        for (uint16_t i = 0; i + 1u < blockLen; i += 2u) {
+            const uint16_t regA =
+                static_cast<uint16_t>(PH_MODBUS_DISCOVERY_REG_START + i);
+            const uint16_t regB =
+                static_cast<uint16_t>(PH_MODBUS_DISCOVERY_REG_START + i + 1u);
+            const uint16_t w0 = modbus_.getResponseBuffer(i);
+            const uint16_t w1 = modbus_.getResponseBuffer(i + 1u);
+            const float fBe = modbusRegsToFloat(w0, w1, false);
+            const float fSwap = modbusRegsToFloat(w0, w1, true);
+            Serial.printf("  [SCAN-F] reg=0x%04X+0x%04X  w0=%u w1=%u  BE=%.4f  swap=%.4f",
+                          regA,
+                          regB,
+                          w0,
+                          w1,
+                          static_cast<double>(fBe),
+                          static_cast<double>(fSwap));
+            if (isPlausiblePh(fBe)) {
+                Serial.print("  [pH?BE]");
+            }
+            if (isPlausiblePh(fSwap)) {
+                Serial.print("  [pH?swap]");
+            }
+            if (isPlausibleTempC(fBe)) {
+                Serial.print("  [temp?BE]");
+            }
+            if (isPlausibleTempC(fSwap)) {
+                Serial.print("  [temp?swap]");
+            }
+            Serial.println();
+        }
+    } else {
+        Serial.printf("  [SCAN-F] bloque holding err=0x%02X\n", blockResult);
+    }
+
+    Serial.println();
+    Serial.println("  Criterio: [pH?/10] o [pH?/100] en rango 0-14; temp -10..80 C.");
+    Serial.println("  Si solo reg0x0001 tiene [pH?/10], escala actual x10 es correcta.");
+    Serial.println("========== [pH DISCOVERY] fin ==========");
+    Serial.println();
 }
 
 float PhModbusSensor::readPH() {

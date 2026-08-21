@@ -11,6 +11,47 @@
 #include <freertos/task.h>      // ✅ Para vTaskDelay
 #include <esp_task_wdt.h>
 
+/** created_by "calibragem_test#5.0" → triggered_by + dosageMl (HTTPS poll) */
+static void applyRelayCommandDosageMeta(RelayCommand& cmd, JsonObject src) {
+    if (cmd.dosageMl < 0.0f || !isfinite(cmd.dosageMl)) {
+        cmd.dosageMl = 0.0f;
+    }
+    if (src.containsKey("dosage_ml") && !src["dosage_ml"].isNull()) {
+        float ml = src["dosage_ml"].as<float>();
+        if (isfinite(ml) && ml > 0.0f) {
+            cmd.dosageMl = ml;
+        }
+    }
+    String meta = cmd.triggered_by;
+    if (src.containsKey("created_by") && !src["created_by"].isNull()) {
+        const String createdBy = src["created_by"].as<String>();
+        if (meta.length() == 0 || meta == "manual" || meta == "mqtt") {
+            meta = createdBy;
+        }
+        if (cmd.dosageMl <= 0.0f) {
+            const int hash = createdBy.indexOf('#');
+            if (hash > 0 && hash + 1 < (int)createdBy.length()) {
+                float ml = createdBy.substring(hash + 1).toFloat();
+                if (isfinite(ml) && ml > 0.0f) {
+                    cmd.dosageMl = ml;
+                }
+                meta = createdBy.substring(0, hash);
+            }
+        }
+    }
+    const int hashTb = meta.indexOf('#');
+    if (hashTb > 0) {
+        if (cmd.dosageMl <= 0.0f) {
+            float ml = meta.substring(hashTb + 1).toFloat();
+            if (isfinite(ml) && ml > 0.0f) {
+                cmd.dosageMl = ml;
+            }
+        }
+        meta = meta.substring(0, hashTb);
+    }
+    cmd.triggered_by = meta;
+}
+
 SupabaseClient::SupabaseClient() : 
     secureClient(nullptr),
     isConnected(false),
@@ -423,6 +464,20 @@ bool SupabaseClient::sendEnvironmentData(const EnvironmentReading& reading) {
     return makeRequest("POST", SUPABASE_ENVIRONMENT_TABLE, payload);
 }
 
+namespace {
+bool isValidHydroTemperature(float t) {
+    return !std::isnan(t) && !std::isinf(t) && t >= MIN_TEMP && t <= MAX_TEMP && t <= 1000.0f;
+}
+
+bool isValidHydroPh(float ph) {
+    return !std::isnan(ph) && !std::isinf(ph) && ph >= MIN_PH && ph <= MAX_PH;
+}
+
+bool isValidHydroEc(float ec) {
+    return std::isfinite(ec) && ec >= MIN_EC && ec <= MAX_EC;
+}
+} // namespace
+
 bool SupabaseClient::sendHydroData(const HydroReading& reading) {
     Serial.println("\n╔════════════════════════════════════════════════════╗");
     Serial.println("║   📤 ENVIANDO DADOS HIDROPÔNICOS AO SUPABASE      ║");
@@ -432,40 +487,20 @@ bool SupabaseClient::sendHydroData(const HydroReading& reading) {
     Serial.printf("   pH: %.2f (min: %.1f, max: %.1f)\n", reading.ph, MIN_PH, MAX_PH);
     Serial.printf("   EC: %.2f µS/cm (min: %.1f, max: %.1f)\n", reading.ec, MIN_EC, MAX_EC);
     Serial.printf("   Water Level OK: %s\n", reading.waterLevelOk ? "SIM" : "NÃO");
-    
-    // ✅ VALIDAÇÃO ANTES DE ENVIAR: Verificar valores válidos
-    // Verificar NaN e infinito
-    if (std::isnan(reading.temperature) || std::isinf(reading.temperature)) {
-        Serial.printf("❌ [HYDRO] Temperatura é NaN ou Inf: %.2f (ignorando envio)\n", reading.temperature);
-        return false;
+
+    const bool hasTemp = isValidHydroTemperature(reading.temperature);
+    const bool hasPh = isValidHydroPh(reading.ph);
+    const bool hasEc = isValidHydroEc(reading.ec);
+
+    if (!hasTemp && !hasPh && !hasEc) {
+        Serial.println("ℹ️ [HYDRO] Telemetria parcial — só níveis (sensores inválidos omitidos)");
     }
-    if (reading.temperature < MIN_TEMP || reading.temperature > MAX_TEMP) {
-        Serial.printf("❌ [HYDRO] Temperatura fora do intervalo: %.2f (min: %.1f, max: %.1f)\n", 
-            reading.temperature, MIN_TEMP, MAX_TEMP);
-        return false;
-    }
-    if (reading.temperature > 1000.0) {  // Valor máximo razoável
-        Serial.printf("❌ [HYDRO] Temperatura muito alta: %.2f (ignorando envio)\n", reading.temperature);
-        return false;
-    }
-    
-    if (std::isnan(reading.ph) || std::isinf(reading.ph)) {
-        Serial.printf("❌ [HYDRO] pH é NaN ou Inf: %.2f (ignorando envio)\n", reading.ph);
-        return false;
-    }
-    if (reading.ph < MIN_PH || reading.ph > MAX_PH) {
-        Serial.printf("❌ [HYDRO] pH fora do intervalo: %.2f (min: %.1f, max: %.1f)\n", 
-            reading.ph, MIN_PH, MAX_PH);
-        return false;
-    }
-    
-    if (!isfinite(reading.ec) || reading.ec < MIN_EC || reading.ec > MAX_EC) {
-        Serial.printf("❌ [HYDRO] EC fora do intervalo: %.2f (min: %.1f, max: %.1f)\n",
-            reading.ec, MIN_EC, MAX_EC);
-        return false;
-    }
-    
-    Serial.println("✅ [HYDRO] Validações passaram - construindo payload...");
+
+    Serial.println("✅ [HYDRO] Construindo payload parcial...");
+    if (!hasTemp) Serial.println("   ℹ️ Temp omitida");
+    if (!hasPh) Serial.println("   ℹ️ pH omitido");
+    if (!hasEc) Serial.println("   ℹ️ EC omitida");
+
     String payload = buildHydroPayload(reading);
     Serial.printf("📦 [HYDRO] Payload: %s\n", payload.c_str());
     Serial.printf("📤 [HYDRO] Enviando para tabela: %s\n", SUPABASE_HYDRO_TABLE);
@@ -476,12 +511,20 @@ bool SupabaseClient::sendHydroData(const HydroReading& reading) {
     if (result) {
         Serial.println("✅ [HYDRO] Dados hidropônicos enviados com sucesso!");
         Serial.printf("   ✅ Device ID: %s\n", getDeviceID().c_str());
-        Serial.printf("   ✅ EC: %.2f µS/cm\n", reading.ec);
+        if (hasEc) {
+            Serial.printf("   ✅ EC: %.2f µS/cm\n", reading.ec);
+        }
+#if HIDRO_SIMULATE_WATER_LEVELS
+        Serial.println("   ℹ️ levels_simulated=true (HIDRO_SIMULATE_WATER_LEVELS)");
+#endif
+        patchDeviceLevelFromHydro(reading);
         Serial.println("╚════════════════════════════════════════════════════╝\n");
     } else {
         Serial.println("❌ [HYDRO] Falha ao enviar dados hidropônicos");
         Serial.printf("   ❌ Device ID: %s\n", getDeviceID().c_str());
-        Serial.printf("   ❌ EC: %.2f µS/cm\n", reading.ec);
+        if (hasEc) {
+            Serial.printf("   ❌ EC: %.2f µS/cm\n", reading.ec);
+        }
         Serial.printf("   ❌ Erro: %s\n", getLastError().c_str());
         Serial.println("╚════════════════════════════════════════════════════╝\n");
     }
@@ -600,9 +643,15 @@ String SupabaseClient::buildHydroPayload(const HydroReading& reading) {
     
     String deviceId = getDeviceID();
     doc["device_id"] = deviceId;
-    doc["temperature"] = reading.temperature;
-    doc["ph"] = reading.ph;
-    doc["ec"] = reading.ec;
+    if (isValidHydroTemperature(reading.temperature)) {
+        doc["temperature"] = reading.temperature;
+    }
+    if (isValidHydroPh(reading.ph)) {
+        doc["ph"] = reading.ph;
+    }
+    if (isValidHydroEc(reading.ec)) {
+        doc["ec"] = reading.ec;
+    }
     doc["water_level_ok"] = reading.waterLevelOk;
     doc["level_1"] = reading.level1Wet;
     doc["level_2"] = reading.level2Wet;
@@ -611,6 +660,9 @@ String SupabaseClient::buildHydroPayload(const HydroReading& reading) {
     if (reading.waterLevel && reading.waterLevel[0]) {
         doc["water_level"] = reading.waterLevel;
     }
+#if HIDRO_SIMULATE_WATER_LEVELS
+    doc["levels_simulated"] = true;
+#endif
     
     String payload;
     serializeJson(doc, payload);
@@ -621,18 +673,48 @@ String SupabaseClient::buildHydroPayload(const HydroReading& reading) {
     return payload;
 }
 
+bool SupabaseClient::patchDeviceLevelFromHydro(const HydroReading& reading) {
+    DynamicJsonDocument doc(320);
+    doc["water_level_ok"] = reading.waterLevelOk;
+    doc["level_1"] = reading.level1Wet;
+    doc["level_2"] = reading.level2Wet;
+    doc["level_3"] = reading.level3Wet;
+    doc["level_4"] = reading.level4Wet;
+    if (reading.waterLevel && reading.waterLevel[0]) {
+        doc["water_level"] = reading.waterLevel;
+    }
+#if HIDRO_SIMULATE_WATER_LEVELS
+    doc["levels_simulated"] = true;
+#else
+    doc["levels_simulated"] = false;
+#endif
+    doc["last_seen"] = "now";
+    doc["updated_at"] = "now";
+
+    String payload;
+    serializeJson(doc, payload);
+    String endpoint = String(SUPABASE_STATUS_TABLE) + "?device_id=eq." + getDeviceID();
+    bool ok = makeRequest("PATCH", endpoint, payload);
+    if (ok) {
+        Serial.println("✅ [HYDRO] device_status niveles actualizados (levels_simulated flag)");
+    } else {
+        Serial.println("⚠️ [HYDRO] PATCH device_status niveles falló (columna levels_simulated?)");
+    }
+    return ok;
+}
+
 String SupabaseClient::buildDeviceStatusPayload(const DeviceStatusData& status) {
     DynamicJsonDocument doc(1024);
     
     doc["device_id"] = status.deviceId;
-    doc["last_seen"] = "now()";
+    doc["last_seen"] = "now";
     doc["wifi_rssi"] = status.wifiRssi;
     doc["free_heap"] = status.freeHeap;
     doc["uptime_seconds"] = status.uptimeSeconds;
     doc["is_online"] = status.isOnline;
     doc["firmware_version"] = status.firmwareVersion;
     doc["ip_address"] = status.ipAddress;
-    doc["updated_at"] = "now()";
+    doc["updated_at"] = "now";
     // Sempre enviar — NVS é fonte; dashboard sincroniza (inclui 0 após portal)
     doc["reboot_count"] = status.rebootCount;
     
@@ -961,9 +1043,13 @@ bool SupabaseClient::checkForCommands(RelayCommand* commands, int maxCommands, i
         // ✅ Campos relacionados a regras
         if (cmd.containsKey("triggered_by")) {
             commands[i].triggered_by = cmd["triggered_by"].as<String>();
+        } else if (cmd.containsKey("created_by")) {
+            commands[i].triggered_by = cmd["created_by"].as<String>();
         } else {
             commands[i].triggered_by = "manual";
         }
+        commands[i].dosageMl = 0.0f;
+        applyRelayCommandDosageMeta(commands[i], cmd);
         
         if (cmd.containsKey("rule_id")) {
             commands[i].rule_id = cmd["rule_id"].as<String>();
@@ -1439,9 +1525,13 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
         
         if (cmd.containsKey("triggered_by")) {
             commands[i].triggered_by = cmd["triggered_by"].as<String>();
+        } else if (cmd.containsKey("created_by")) {
+            commands[i].triggered_by = cmd["created_by"].as<String>();
         } else {
             commands[i].triggered_by = "manual";
         }
+        commands[i].dosageMl = 0.0f;
+        applyRelayCommandDosageMeta(commands[i], cmd);
         
         if (cmd.containsKey("rule_id")) {
             commands[i].rule_id = cmd["rule_id"].as<String>();
@@ -1911,9 +2001,13 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
         
         if (cmd.containsKey("triggered_by")) {
             commands[i].triggered_by = cmd["triggered_by"].as<String>();
+        } else if (cmd.containsKey("created_by")) {
+            commands[i].triggered_by = cmd["created_by"].as<String>();
         } else {
             commands[i].triggered_by = "manual";
         }
+        commands[i].dosageMl = 0.0f;
+        applyRelayCommandDosageMeta(commands[i], cmd);
         
         if (cmd.containsKey("rule_id")) {
             commands[i].rule_id = cmd["rule_id"].as<String>();
@@ -2358,7 +2452,7 @@ bool SupabaseClient::autoRegisterDevice(const String& deviceName, const String& 
     patchDoc["device_type"] = "ESP32_HYDROPONIC";
     patchDoc["firmware_version"] = FIRMWARE_VERSION;
     patchDoc["is_online"] = true;
-    patchDoc["last_seen"] = "now()"; // Supabase aceita "now()" como string
+    patchDoc["last_seen"] = "now";
     
     // ✅ CRÍTICO: NÃO atualizar email se já existe no Supabase
     if (emailToUse.length() > 0 && existingEmail.length() == 0) {
@@ -3022,7 +3116,7 @@ bool SupabaseClient::patchSlaveDeviceStatusHeartbeat(const String& deviceId, con
     }
 
     DynamicJsonDocument doc(384);
-    doc["last_seen"] = "now()";
+    doc["last_seen"] = "now";
     doc["is_online"] = true;
     doc["mac_address"] = macAddress;
     doc["user_email"] = userEmail;
@@ -3755,7 +3849,11 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     config.auto_enabled = configObj["auto_enabled"] | false;
     config.intervalo_auto_ec = configObj["intervalo_auto_ec"] | 300;
     config.tempo_recirculacao = configObj["tempo_recirculacao"] | 60;
-    config.dilution_auto_enabled = configObj["dilution_auto_enabled"] | false;
+    if (configObj.containsKey("dilution_auto_enabled")) {
+        config.dilution_auto_enabled = configObj["dilution_auto_enabled"];
+    } else {
+        config.dilution_auto_enabled = configObj["auto_enabled"] | true;
+    }
     config.dilution_drain_relay = configObj["dilution_drain_relay"] | -1;
     config.dilution_fill_relay = configObj["dilution_fill_relay"] | -1;
     if (configObj.containsKey("dilution_drain_slave_mac") && !configObj["dilution_drain_slave_mac"].isNull()) {
@@ -3765,8 +3863,16 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
         config.dilution_fill_slave_mac = configObj["dilution_fill_slave_mac"].as<String>();
     }
     config.dilution_max_volume_l = configObj["dilution_max_volume_l"] | 50.0;
-    config.flowmeter_pulses_per_liter = configObj["flowmeter_pulses_per_liter"] | 450.0;
+    config.flowmeter_pulses_per_liter = configObj["flowmeter_pulses_per_liter"] | 396.0; // datasheet YF-B5; calibrar balde, no EC post-dilución
     config.dilution_fill_flow_lps = configObj["dilution_fill_flow_lps"] | 0.5;
+    config.aggressiveness = configObj["aggressiveness"] | 0.5;
+    config.consumo_24h = configObj["consumo_24h"] | false;
+    config.pulse_ml = configObj["pulse_ml"] | 2.0;
+    config.pulse_gap_sec = configObj["pulse_gap_sec"] | 2.0;
+    if (config.pulse_ml < 0.05) config.pulse_ml = 0.05;
+    if (config.pulse_ml > 50.0) config.pulse_ml = 50.0;
+    if (config.pulse_gap_sec < 0.0) config.pulse_gap_sec = 0.0;
+    if (config.pulse_gap_sec > 120.0) config.pulse_gap_sec = 120.0;
     
     // ✅ Nutrients array (não salvo em NVS, mas usado para cálculo local)
     if (configObj.containsKey("nutrients") && configObj["nutrients"].is<JsonArray>()) {
@@ -3789,6 +3895,10 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", config.ec_setpoint);
     Serial.printf("   • tolerance:        %.0f µS/cm\n", config.tolerance);
     Serial.printf("   • auto_enabled:     %s\n", config.auto_enabled ? "true" : "false");
+    Serial.printf("   • aggressiveness:   %.2f\n", config.aggressiveness);
+    Serial.printf("   • consumo_24h:      %s\n", config.consumo_24h ? "true" : "false");
+    Serial.printf("   • pulse_ml:         %.2f ml\n", config.pulse_ml);
+    Serial.printf("   • pulse_gap_sec:    %.2f s\n", config.pulse_gap_sec);
     Serial.printf("   • intervalo_auto_ec: %d segundos\n", config.intervalo_auto_ec);
     Serial.printf("   • tempo_recirculacao: %lu segundos\n", config.tempo_recirculacao);
     
@@ -4083,6 +4193,13 @@ bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     config.max_pulse_seconds = o["max_pulse_seconds"] | 120;
     config.max_consecutive_corrections = o["max_consecutive_corrections"] | 5;
     config.reset_k_gains = o["reset_k_gains"] | false;
+    config.consumo_24h = o["consumo_24h"] | false;
+    config.pulse_ml = o["pulse_ml"] | 2.0;
+    config.pulse_gap_sec = o["pulse_gap_sec"] | 2.0;
+    if (config.pulse_ml < 0.05) config.pulse_ml = 0.05;
+    if (config.pulse_ml > 50.0) config.pulse_ml = 50.0;
+    if (config.pulse_gap_sec < 0.0) config.pulse_gap_sec = 0.0;
+    if (config.pulse_gap_sec > 120.0) config.pulse_gap_sec = 120.0;
     config.isValid = true;
     return true;
 }
