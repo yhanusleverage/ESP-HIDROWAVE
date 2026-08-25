@@ -4,12 +4,15 @@
 
 DecisionEngineLoop::DecisionEngineLoop() : 
     masterManager(nullptr),
-    eventBus(nullptr) {
+    eventBus(nullptr),
+    relayCoordinator(nullptr) {
 }
 
-void DecisionEngineLoop::begin(MasterSlaveManager* masterManager, GlobalEventBus* eventBus) {
+void DecisionEngineLoop::begin(MasterSlaveManager* masterManager, GlobalEventBus* eventBus,
+                                RelayCoordinator* relayCoordinator) {
     this->masterManager = masterManager;
     this->eventBus = eventBus;
+    this->relayCoordinator = relayCoordinator;
     
     Serial.println("✅ DecisionEngineLoop inicializado");
     Serial.println("   🧠 Loop primário de decisão ativo");
@@ -123,9 +126,14 @@ void DecisionEngineLoop::executeRule(const DecisionRule& rule) {
             // Por enquanto, não implementado
         } else {
             // Comando remoto (Slave)
-            success = masterManager->sendRelayCommandToSlave(
-                mac, rule.relay_number, rule.action, rule.duration, 0, true
-            );
+            if (relayCoordinator) {
+                success = relayCoordinator->actuateSlave(
+                    RelayOwner::DecisionRule, mac, rule.relay_number, rule.action, rule.duration) > 0;
+            } else {
+                success = masterManager->sendRelayCommandToSlave(
+                    mac, rule.relay_number, rule.action, rule.duration, 0, true
+                );
+            }
         }
         
         if (success) {

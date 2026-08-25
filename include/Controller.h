@@ -14,17 +14,26 @@ public:
     float calculateDosage(float ecSetpoint, float ecActual);
     
     // Getters e Setters
-    void setBaseDose(float dose) { baseDose = dose; }
+    void setBaseDose(float dose);
     void setFlowRate(float rate) { flowRate = rate; }
     void setVolume(float vol) { volume = vol; }
-    void setTotalMl(float ml) { totalMl = ml; }
+    void setTotalMl(float ml);
     void setKp(float kp) { Kp = kp; }
-    
+    void setLearnedK(float k);
+
     float getBaseDose() const { return baseDose; }
     float getFlowRate() const { return flowRate; }
     float getVolume() const { return volume; }
     float getTotalMl() const { return totalMl; }
     float getKp() const { return Kp; }
+    float getLearnedK() const { return kLearned; }
+    bool hasLearnedK() const { return kLearned > 0.0f; }
+
+    /**
+     * Identifica k após uma dose (A já está em mlApplied).
+     * Lei intacta: u = (V / (k·q)) · e · Kp — mapeia ΔEC/ml para as unidades de k.
+     */
+    bool updateGainAfterDose(float deltaEc, float mlApplied, float alpha = 0.2f);
     
     // Função para calcular o tempo de dosagem em segundos
     float calculateDosageTime(float dosageML);
@@ -40,8 +49,10 @@ private:
     float volume;       // Volume do reservatório em L (100)
     float totalMl;      // Mililitros totais para a dose base (4.1)
     float Kp;           // Ganho proporcional (1.0)
-    
-    // Função para calcular k
+    float kLearned;     // 0 = usar receta (baseDose/totalMl)
+
+    float recipeK() const;
+    void invalidateLearnedKIfRecipeChanged(float oldBase, float oldTotal);
     float calculateK() const;
 };
 

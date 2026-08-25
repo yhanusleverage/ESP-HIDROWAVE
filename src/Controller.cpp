@@ -1,4 +1,5 @@
 #include "Controller.h"
+#include <cmath>
 
 ECController::ECController() {
     // Valores zerados - removidos valores padrão
@@ -7,21 +8,91 @@ ECController::ECController() {
     volume = 0.0;         // Volume em L - removido valor padrão
     totalMl = 0.0;        // Mililitros totais para dose base - removido valor padrão
     Kp = 1.0;             // Ganho proporcional
+    kLearned = 0.0f;
 }
 
 void ECController::setParameters(float baseDose, float flowRate, float volume, float totalMl) {
+    const float oldBase = this->baseDose;
+    const float oldTotal = this->totalMl;
     this->baseDose = baseDose;
     this->flowRate = flowRate;
     this->volume = volume;
     this->totalMl = totalMl;
+    invalidateLearnedKIfRecipeChanged(oldBase, oldTotal);
+}
+
+float ECController::recipeK() const {
+    if (totalMl > 0.0f && baseDose > 0.0f) {
+        return baseDose / totalMl;
+    }
+    return 1.0f;
 }
 
 float ECController::calculateK() const {
-    // k = EC base / mililitros totais
-    if (totalMl > 0) {
-        return baseDose / totalMl;
+    if (kLearned > 1e-9f) {
+        return kLearned;
     }
-    return 1.0; // Valor padrão para evitar divisão por zero
+    return recipeK();
+}
+
+void ECController::invalidateLearnedKIfRecipeChanged(float oldBase, float oldTotal) {
+    const float db = fabsf(baseDose - oldBase);
+    const float dt = fabsf(totalMl - oldTotal);
+    if (db > 0.5f || dt > 0.05f) {
+        kLearned = 0.0f;
+    }
+}
+
+void ECController::setBaseDose(float dose) {
+    const float old = baseDose;
+    baseDose = dose;
+    invalidateLearnedKIfRecipeChanged(old, totalMl);
+}
+
+void ECController::setTotalMl(float ml) {
+    const float old = totalMl;
+    totalMl = ml;
+    invalidateLearnedKIfRecipeChanged(baseDose, old);
+}
+
+void ECController::setLearnedK(float k) {
+    kLearned = (isfinite(k) && k > 1e-9f) ? k : 0.0f;
+}
+
+bool ECController::updateGainAfterDose(float deltaEc, float mlApplied, float alpha) {
+    if (mlApplied < 0.2f || deltaEc < 5.0f) {
+        return false;
+    }
+    if (volume <= 0.01f || flowRate < 0.01f) {
+        return false;
+    }
+    if (!isfinite(deltaEc) || !isfinite(mlApplied)) {
+        return false;
+    }
+
+    // Planta G = ΔEC/ml. Lei u = V·e/(k·q) ⇒ k ≈ (V/q)·G  (q permanece na equação)
+    const float kObs = (volume / flowRate) * (deltaEc / mlApplied);
+    if (!isfinite(kObs) || kObs < 1e-9f) {
+        return false;
+    }
+
+    float a = alpha;
+    if (a < 0.05f) a = 0.05f;
+    if (a > 0.5f) a = 0.5f;
+
+    const float kPrev = calculateK();
+    float kNew = a * kObs + (1.0f - a) * kPrev;
+    const float kSeed = recipeK();
+    const float kMin = kSeed * 0.05f;
+    const float kMax = kSeed * 20.0f;
+    if (kNew < kMin) kNew = kMin;
+    if (kNew > kMax) kNew = kMax;
+
+    kLearned = kNew;
+    Serial.printf(
+        "📈 [EC k] ΔEC=%.1f ml=%.3f G=%.4f µS/ml  k: %.4f → %.4f (obs=%.4f α=%.2f q=%.3f)\n",
+        deltaEc, mlApplied, deltaEc / mlApplied, kPrev, kLearned, kObs, a, flowRate);
+    return true;
 }
 
 float ECController::calculateDosage(float ecSetpoint, float ecActual) {

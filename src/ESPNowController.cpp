@@ -247,6 +247,34 @@ bool ESPNowController::sendRelayCommand(const uint8_t* targetMac, int relayNumbe
     return success;
 }
 
+bool ESPNowController::sendSetRelayMask(const uint8_t* targetMac, uint8_t mask, uint16_t durationSec,
+                                         uint32_t commandId) {
+    if (!initialized || !targetMac) {
+        return false;
+    }
+    ESPNowMessage message = {};
+    message.type = MessageType::SET_RELAY_MASK;
+    getLocalMac(message.senderId);
+    memcpy(message.targetId, targetMac, 6);
+    message.messageId = ++messageCounter;
+    message.timestamp = millis();
+
+    RelayMaskCommandData payload = {};
+    payload.mask = mask;
+    payload.durationSec = durationSec;
+    payload.commandId = commandId;
+    message.dataSize = sizeof(RelayMaskCommandData);
+    memcpy(message.data, &payload, sizeof(payload));
+    message.checksum = calculateChecksum(message);
+
+    const bool ok = sendMessage(message, targetMac);
+    if (ok) {
+        Serial.printf("[PROC] SET_RELAY_MASK mac=%s mask=0x%02X dur=%u id=%u\n",
+                      macToString(targetMac).c_str(), mask, (unsigned)durationSec, (unsigned)commandId);
+    }
+    return ok;
+}
+
 bool ESPNowController::sendRelayCommandAck(const uint8_t* targetMac, const RelayCommandAck& ack) {
     if (!initialized || !targetMac) {
         return false;

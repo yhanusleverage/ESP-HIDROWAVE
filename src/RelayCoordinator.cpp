@@ -1,5 +1,6 @@
 #include "RelayCoordinator.h"
 #include "HydroControl.h"
+#include <string.h>
 #include "MasterSlaveManager.h"
 #include "ESPNowController.h"
 #include "PreferencesManager.h"
@@ -54,6 +55,8 @@ RelayCoordinator::RelayCoordinator()
       circulationOwner(RelayOwner::None),
       circulationRefCount(0) {
     memset(circulationMac, 0, sizeof(circulationMac));
+    memset(&localBank, 0, sizeof(localBank));
+    memset(slaveBanks, 0, sizeof(slaveBanks));
 }
 
 void RelayCoordinator::begin(HydroControl* hydro, MasterSlaveManager* masterManagerPtr) {
@@ -276,6 +279,20 @@ uint32_t RelayCoordinator::requestActuation(
         return 0;
     }
 
+    OccupancyBank* bank = target.isLocal ? &localBank : bankForMac(target.slaveMac, true);
+    if (bank && target.relay >= 0 && target.relay < 8) {
+        if (bitBlocked(bank, target.relay) && owner != RelayOwner::AutoEcDilution) {
+            Serial.printf("[PROC] deny owner=%s R%d blocked\n", relayOwnerName(owner), target.relay + 1);
+            return 0;
+        }
+        if (owner == RelayOwner::AutoEcDilution && turningOn) {
+            bank->blockedBits |= (uint8_t)(1u << target.relay);
+        }
+        if (turningOff && owner == RelayOwner::AutoEcDilution) {
+            bank->blockedBits &= (uint8_t)~(1u << target.relay);
+        }
+    }
+
     if (isCirculationTarget(target)) {
         if (turningOff && circulationRefCount > 0 &&
             owner != RelayOwner::None &&
@@ -375,4 +392,90 @@ uint32_t RelayCoordinator::actuateSlave(
     }
     return requestActuation(owner, target, act, (uint32_t)durationSec, supabaseCommandId, cycleOffSec,
                             commandMode);
+}
+
+RelayCoordinator::OccupancyBank* RelayCoordinator::bankForMac(const uint8_t mac[6], bool create) {
+    if (!mac) {
+        return nullptr;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (slaveBanks[i].used && macEquals(slaveBanks[i].mac, mac)) {
+            return &slaveBanks[i];
+        }
+    }
+    if (!create) {
+        return nullptr;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!slaveBanks[i].used) {
+            slaveBanks[i].used = true;
+            memcpy(slaveBanks[i].mac, mac, 6);
+            return &slaveBanks[i];
+        }
+    }
+    return &slaveBanks[0];
+}
+
+const RelayCoordinator::OccupancyBank* RelayCoordinator::bankForMacConst(const uint8_t mac[6]) const {
+    if (!mac) {
+        return nullptr;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (slaveBanks[i].used && macEquals(slaveBanks[i].mac, mac)) {
+            return &slaveBanks[i];
+        }
+    }
+    return nullptr;
+}
+
+bool RelayCoordinator::bitBlocked(const OccupancyBank* bank, int relay) const {
+    if (!bank || relay < 0 || relay > 7) {
+        return false;
+    }
+    return (bank->blockedBits & (uint8_t)(1u << relay)) != 0;
+}
+
+uint8_t RelayCoordinator::blockedMaskFor(const uint8_t mac[6]) const {
+    const OccupancyBank* b = bankForMacConst(mac);
+    return b ? b->blockedBits : 0;
+}
+
+void RelayCoordinator::noteObservedMask(const uint8_t mac[6], uint8_t bitsOn) {
+    OccupancyBank* b = bankForMac(mac, true);
+    if (!b) {
+        return;
+    }
+    b->bitsOn = bitsOn;
+    b->updatedMs = millis();
+}
+
+uint32_t RelayCoordinator::requestMask(RelayOwner owner, const uint8_t mac[6], uint8_t mask,
+                                         uint16_t durationSec) {
+    if (!masterManager || !mac) {
+        return 0;
+    }
+    OccupancyBank* bank = bankForMac(mac, true);
+    uint8_t blocked = bank ? bank->blockedBits : 0;
+    uint8_t apply = mask & (uint8_t)~blocked;
+    if (apply != mask) {
+        Serial.printf("[PROC] mask 0x%02X -> 0x%02X deny=0x%02X owner=%s\n",
+                      mask, apply, blocked, relayOwnerName(owner));
+    }
+    if (apply == 0 && mask != 0) {
+        Serial.println("[PROC] mask fully blocked");
+        return 0;
+    }
+    uint32_t id = masterManager->sendRelayMaskToSlave(mac, apply, durationSec, 0);
+    if (id > 0 && bank) {
+        bank->bitsOn = apply;
+        bank->updatedMs = millis();
+        for (int i = 0; i < 8; i++) {
+            if (apply & (1u << i)) {
+                bank->owners[i] = owner;
+            }
+        }
+    }
+    Serial.printf("[PROC] owner=%s mask=0x%02X deny=0x%02X id=%u\n",
+                  relayOwnerName(owner), apply, blocked, (unsigned)id);
+    return id;
 }

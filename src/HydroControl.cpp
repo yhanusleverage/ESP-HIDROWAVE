@@ -56,6 +56,8 @@ HydroControl::HydroControl()
     consumoEc24hDilutePending = false;
     ecAtLastSequenceStart = 0.0f;
     ecSetpointAtLastSequence = 0.0f;
+    lastSequenceTotalMl = 0.0f;
+    ecGainLearnPending = false;
     currentDoseSource = "auto_ec";
     nutrientDoseCallback = nullptr;
     nutrientDoseCallbackUserData = nullptr;
@@ -113,6 +115,8 @@ HydroControl::HydroControl()
     phMetricCallbackUserData = nullptr;
     phGainLearnedCallback = nullptr;
     phGainLearnedCallbackUserData = nullptr;
+    ecGainLearnedCallback = nullptr;
+    ecGainLearnedCallbackUserData = nullptr;
     tankProcedureHoldCount = 0;
 #if USE_PH_MODBUS_SENSOR
     phModbusSensor = nullptr;
@@ -817,14 +821,9 @@ bool HydroControl::setRelay(int relay, bool desiredState, int seconds) {
         return false;
     }
 
-    const char* relayNames[] = {
-        "Bomba pH-", "Bomba pH+", "Bomba A (Grow)", "Bomba B (Micro)",
-        "Bomba C (Bloom)", "Bomba CalMag", "Luz UV", "Aerador"
-    };
-
-    Serial.printf("🔌 [R%d] %s → %s",
+    Serial.printf("🔌 [R%d] Relé %d → %s",
         relay,
-        relayNames[relay],
+        relay,
         desiredState ? "LIGADO" : "DESLIGADO"
     );
 
@@ -848,14 +847,9 @@ bool HydroControl::toggleRelay(int relay, int seconds) {
         return false;
     }
 
-    const char* relayNames[] = {
-        "Bomba pH-", "Bomba pH+", "Bomba A (Grow)", "Bomba B (Micro)",
-        "Bomba C (Bloom)", "Bomba CalMag", "Luz UV", "Aerador"
-    };
-
-    Serial.printf("🔌 [R%d] %s → %s",
+    Serial.printf("🔌 [R%d] Relé %d → %s",
         relay,
-        relayNames[relay],
+        relay,
         relayStates[relay] ? "LIGADO" : "DESLIGADO"
     );
 
@@ -1066,6 +1060,11 @@ void HydroControl::checkAutoEC() {
             Serial.printf("📊 EC Atual: %.0f µS/cm\n", ec);
             Serial.printf("🎯 EC Setpoint: %.0f µS/cm\n", ecSetpoint);
             Serial.printf("⚡ Erro: %.0f µS/cm\n", ecError);
+            Serial.printf("📐 k=%.4f %s  A=%.2f  q=%.3f ml/s\n",
+                ecController.getKValue(),
+                ecController.hasLearnedK() ? "(aprendido)" : "(receta)",
+                ecAggressiveness,
+                ecController.getFlowRate());
             Serial.printf("💧 u(t) calculado: %.3f ml (proporção milimétrica)\n", dosageML);
             Serial.printf("⏱️ Tempo de dosagem: %.2f segundos\n", dosageTime);
             Serial.printf("⏱️  Tempo de dosagem: %.1f segundos\n", dosageTime);
@@ -1159,6 +1158,7 @@ void HydroControl::advanceAfterEcNutrientComplete(unsigned long now) {
             currentNutrientIndex = 0;
             currentSequenceId = "";
             showMessage("Sequencia OK!");
+            learnEcGainAfterSequence();
             notifyEcOperationChanged();
         }
     } else {
@@ -1187,6 +1187,7 @@ void HydroControl::processSimpleSequential() {
             currentNutrientIndex = 0;
             currentSequenceId = "";
             showMessage("Recirc OK");
+            learnEcGainAfterSequence();
             notifyEcOperationChanged();
         }
         return;
@@ -1247,6 +1248,8 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
 
     currentSequenceId = String(millis());
     currentDoseSource = "auto_ec";
+    lastSequenceTotalMl = totalML;
+    ecGainLearnPending = true;
     ecAtLastSequenceStart = ecActual;
     ecSetpointAtLastSequence = ecSetpoint;
     
@@ -1387,6 +1390,8 @@ void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
     Serial.println("\n🌐 INICIANDO DOSAGEM VIA WEB...");
     currentSequenceId = String(millis());
     currentDoseSource = "web";
+    ecGainLearnPending = false;
+    lastSequenceTotalMl = 0.0f;
     ecAtLastSequenceStart = ec;
     ecSetpointAtLastSequence = ecSetpoint;
     
@@ -1465,6 +1470,7 @@ void HydroControl::cancelCurrentDosage() {
         totalNutrients = 0;
         currentNutrientIndex = 0;
         stateStartTime = 0;
+        ecGainLearnPending = false;
         
         Serial.println("✅ DOSAGEM CANCELADA - Sistema resetado para IDLE");
         notifyEcOperationChanged();
@@ -1659,6 +1665,11 @@ void HydroControl::loadECControllerConfig() {
     if (volume > 0.0) ecController.setVolume(volume);
     if (totalMl > 0.0) ecController.setTotalMl(totalMl);
     if (kp > 0.0) ecController.setKp(kp);
+    float kLearn = 0.0f;
+    if (PreferencesManager::loadConfigFloat("ec_kLearn", kLearn) && kLearn > 0.0f) {
+        ecController.setLearnedK(kLearn);
+        Serial.printf("   • k aprendido:      %.4f\n", kLearn);
+    }
     if (setpoint > 0.0) ecSetpoint = setpoint;
     if (tolerance > 0.0) ecTolerance = tolerance;
     autoECEnabled = autoEnabled;
@@ -1752,6 +1763,7 @@ void HydroControl::saveECControllerConfig() {
     success &= PreferencesManager::saveConfigFloat("ec_volume", volume);
     success &= PreferencesManager::saveConfigFloat("ec_totalMl", totalMl);
     success &= PreferencesManager::saveConfigFloat("ec_kp", kp);
+    success &= PreferencesManager::saveConfigFloat("ec_kLearn", ecController.getLearnedK());
     success &= PreferencesManager::saveConfigFloat("ec_setpoint", setpoint);
     success &= PreferencesManager::saveConfigFloat("ec_tolerance", ecTolerance);
     success &= PreferencesManager::saveConfigInt("ec_autoEnabled", autoEnabled ? 1 : 0);
@@ -2098,6 +2110,26 @@ void HydroControl::emitPhControllerMetric(bool adjustmentNeeded, bool adjustment
     phMetricCallback(&event, phMetricCallbackUserData);
 }
 
+void HydroControl::learnEcGainAfterSequence() {
+    if (!ecGainLearnPending) {
+        return;
+    }
+    ecGainLearnPending = false;
+    const float ml = lastSequenceTotalMl;
+    const float deltaEc = ec - ecAtLastSequenceStart;
+    const float alpha = phGainAlpha > 0.05f ? phGainAlpha : 0.2f;
+    const bool learned = ecController.updateGainAfterDose(deltaEc, ml, alpha);
+    if (learned) {
+        saveECControllerConfig();
+        if (ecGainLearnedCallback) {
+            ecGainLearnedCallback(ecGainLearnedCallbackUserData);
+        }
+    } else {
+        Serial.printf("ℹ️ [EC k] sem update (ΔEC=%.1f ml=%.3f) — receta segue\n",
+            deltaEc, ml);
+    }
+}
+
 void HydroControl::notifyEcOperationChanged() {
     StatePersistenceManager::saveEcPhBootSnapshot(
         getEcOperationStateName(), getPhOperationStateName(), false);
@@ -2348,6 +2380,11 @@ void HydroControl::setPhDoseCallback(PhDoseCallback cb, void* userData) {
 void HydroControl::setPhGainLearnedCallback(PhGainLearnedCallback cb, void* userData) {
     phGainLearnedCallback = cb;
     phGainLearnedCallbackUserData = userData;
+}
+
+void HydroControl::setEcGainLearnedCallback(EcGainLearnedCallback cb, void* userData) {
+    ecGainLearnedCallback = cb;
+    ecGainLearnedCallbackUserData = userData;
 }
 
 float HydroControl::getPhErrorH() const {

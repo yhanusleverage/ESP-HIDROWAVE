@@ -28,7 +28,7 @@
 #define CREDENTIAL_MAX_RETRIES 3             // Máximo 3 tentativas
 
 #define MASTER_HEARTBEAT_INTERVAL 15000      // PING a cada 15s
-#define MASTER_HEARTBEAT_TIMEOUT 45000       // Timeout após 45s (3 heartbeats)
+#define MASTER_HEARTBEAT_TIMEOUT 120000     // Timeout após 120s (MQTT/HTTPS no radio)
 #define HEALTH_CHECK_INTERVAL 10000          // Verificar saúde a cada 10s
 
 #define SOFT_RECOVERY_TIMEOUT 5000           // Recovery nível 1: 5s

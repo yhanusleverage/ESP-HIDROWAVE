@@ -1,5 +1,6 @@
 #include "MasterSlaveManager.h"
 #include "Config.h"
+#include <WiFi.h>
 #include "MASTER_CONFIG.h"
 #include "ObjectPoolManager.h"  // ✅ Object Pool Pattern
 #include <Preferences.h>
@@ -22,6 +23,7 @@ static String resolveSlaveEspAction(const String& action, const String& commandM
 
 MasterSlaveManager::MasterSlaveManager(ESPNowController* espNowController) 
     : espNowController(espNowController), initialized(false),
+      espnowLockWindowUntil(0),
       totalPingsReceived(0), totalPongsSent(0), totalAcksSent(0), 
       totalAcksReceived(0), totalErrors(0), commandIdCounter(0),
       processingStatusResponse(false), lastEspNowSendAt_(0) {
@@ -230,6 +232,7 @@ bool MasterSlaveManager::addTrustedSlave(const uint8_t* macAddress, const String
     String callbackType = newSlave.deviceType;
     xSemaphoreGive(trustedSlavesMutex);  // ✅ Liberar mutex ANTES de callbacks externos
     saveTrustedPeersToNVS();
+    startEspNowLockWindow();
     
     // ⭐ POTENCIA MÁXIMA: Chamar callback SEMPRE que um slave é adicionado
     // Isso garante sincronização entre trustedSlaves e knownSlaves
@@ -244,6 +247,38 @@ bool MasterSlaveManager::addTrustedSlave(const uint8_t* macAddress, const String
     }
     
     return true;
+}
+
+void MasterSlaveManager::startEspNowLockWindow() {
+    espnowLockWindowUntil = millis() + ESPNOW_LOCK_WINDOW_MS;
+#if ESPNOW_LOCK_DEBUG
+    Serial.printf("[LOCK] window start %lums ch=%u lastRxAgeMs=%lu\n",
+                  (unsigned long)ESPNOW_LOCK_WINDOW_MS,
+                  (unsigned)WiFi.channel(),
+                  getLastRxAgeMs());
+#endif
+}
+
+bool MasterSlaveManager::isEspNowLockWindowActive() const {
+    return espnowLockWindowUntil != 0 && millis() < espnowLockWindowUntil;
+}
+
+unsigned long MasterSlaveManager::getLastRxAgeMs() {
+    unsigned long now = millis();
+    unsigned long newest = 0;
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return 0;
+    }
+    for (const auto& slave : trustedSlaves) {
+        if (slave.lastSeen > newest) {
+            newest = slave.lastSeen;
+        }
+    }
+    xSemaphoreGive(trustedSlavesMutex);
+    if (newest == 0) {
+        return 0;
+    }
+    return now - newest;
 }
 
 bool MasterSlaveManager::removeTrustedSlave(const uint8_t* macAddress) {
@@ -327,6 +362,31 @@ std::vector<TrustedSlave> MasterSlaveManager::getAllTrustedSlaves() {
         Serial.printf("❌ [getAllTrustedSlaves] TIMEOUT após %lu ms!\n", waitTime * portTICK_PERIOD_MS);
         return std::vector<TrustedSlave>();
     }
+}
+
+void MasterSlaveManager::refreshEspNowPeersOnCurrentChannel() {
+    if (!initialized || !espNowController) {
+        return;
+    }
+
+    uint8_t channel = WiFi.channel();
+    if (channel < 1 || channel > 13) {
+        Serial.println("⚠️ Refresh peers: canal STA inválido");
+        return;
+    }
+
+    Serial.printf("🔄 Re-add ESP-NOW peers no canal STA %u (sem deinit)\n", channel);
+
+    uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    espNowController->removePeer(broadcastMac);
+    espNowController->addPeerWithChannel(broadcastMac, channel, "broadcast");
+
+    forEachTrustedSlave([this, channel](const TrustedSlave& slave) {
+        espNowController->removePeer(slave.macAddress);
+        espNowController->addPeerWithChannel(slave.macAddress, channel, slave.deviceName);
+        Serial.printf("   peer %s → ch %u\n",
+                      ESPNowController::macToString(slave.macAddress).c_str(), channel);
+    });
 }
 
 bool MasterSlaveManager::forEachTrustedSlave(const std::function<void(const TrustedSlave&)>& visitor) {
@@ -546,6 +606,47 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
         // ✅ MUDANÇA 5: Retornar commandId mesmo se falhou (para mapeamento futuro)
         return commandId;  // Retorna ID mesmo se falhou (pode ser enviado depois via retry)
     }
+}
+
+uint32_t MasterSlaveManager::sendRelayMaskToSlave(const uint8_t* macAddress, uint8_t mask,
+                                                   int durationSec, int supabaseCommandId) {
+    if (!initialized || !espNowController || !macAddress) {
+        return 0;
+    }
+    const String action = (mask == 0) ? "off_all" : "on_all";
+    TrustedSlave* slave = getTrustedSlave(macAddress);
+    if (!slave) {
+        return 0;
+    }
+    uint32_t commandId = generateCommandId();
+    if (!isSlaveReachable(*slave) || hasInFlightForMac(macAddress) || !canEspNowSendToMac(macAddress)) {
+        addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, false);
+        return commandId;
+    }
+    Serial.printf("[PROC] SET_RELAY_MASK id=%u mask=0x%02X\n", (unsigned)commandId, mask);
+    bool success = espNowController->sendSetRelayMask(macAddress, mask, (uint16_t)durationSec, commandId);
+    if (success) {
+        markEspNowSendToMac(macAddress);
+        addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, true);
+        return commandId;
+    }
+    addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, false);
+    return commandId;
+}
+
+int MasterSlaveManager::applyRelayMaskToAllOnlineSlaves(uint8_t mask) {
+    int sent = 0;
+    auto slaves = getAllTrustedSlaves();
+    for (const auto& slave : slaves) {
+        if (!slave.isOnline()) {
+            continue;
+        }
+        if (sendRelayMaskToSlave(slave.macAddress, mask) > 0) {
+            sent++;
+            Serial.printf("[PROC] mask=0x%02X -> %s\n", mask, slave.deviceName.c_str());
+        }
+    }
+    return sent;
 }
 
 bool MasterSlaveManager::requestSlaveStatus(const uint8_t* macAddress) {
@@ -837,19 +938,24 @@ bool MasterSlaveManager::readSlaveRelaySnapshot(const uint8_t* macAddress, bool 
     return true;
 }
 
+bool MasterSlaveManager::hasInFlightForMacLocked(const uint8_t* mac) const {
+    if (!mac) return false;
+    for (const auto& cmd : pendingRelayCommands) {
+        if (cmd.waitingForAck && memcmp(cmd.targetMac, mac, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool MasterSlaveManager::hasInFlightForMac(const uint8_t* mac) const {
     if (!mac) return false;
     if (!lockPendingQueue(pdMS_TO_TICKS(100))) {
         return false;
     }
-    for (const auto& cmd : pendingRelayCommands) {
-        if (cmd.waitingForAck && memcmp(cmd.targetMac, mac, 6) == 0) {
-            unlockPendingQueue();
-            return true;
-        }
-    }
+    const bool inFlight = hasInFlightForMacLocked(mac);
     unlockPendingQueue();
-    return false;
+    return inFlight;
 }
 
 bool MasterSlaveManager::canEspNowSendToMac(const uint8_t* mac) const {
@@ -1334,9 +1440,7 @@ void MasterSlaveManager::processRelayStatusReceived(const uint8_t* senderMac, in
             slave->relayStates[relayNumber].hasTimer = hasTimer;
             slave->relayStates[relayNumber].remainingTime = remainingTime;
             slave->relayStates[relayNumber].lastUpdate = millis();
-            if (!name.isEmpty()) {
-                slave->relayStates[relayNumber].name = name;
-            }
+            slave->relayStates[relayNumber].name = "Relé " + String(relayNumber);
             
             // ✅ CRÍTICO: Atualizar Supabase (fonte única de verdade)
             // Solo actualizar si no estamos procesando ALL_RELAYS_STATUS (evitar spam)
@@ -1841,7 +1945,7 @@ void MasterSlaveManager::processRetryQueue() {
     
     for (auto it = pendingRelayCommands.begin(); it != pendingRelayCommands.end();) {
         if (now >= it->nextRetry && it->retryCount < MAX_RELAY_RETRIES && !it->waitingForAck) {
-            if (hasInFlightForMac(it->targetMac)) {
+            if (hasInFlightForMacLocked(it->targetMac)) {
                 ++it;
                 continue;
             }
@@ -1860,10 +1964,17 @@ void MasterSlaveManager::processRetryQueue() {
             Serial.println("⚡ Ação: " + it->action);
             Serial.println("🔢 Tentativa: " + String(it->retryCount + 1) + "/" + String(MAX_RELAY_RETRIES));
             
-            String espAction = resolveSlaveEspAction(it->action, it->commandMode);
-            bool success = espNowController->sendRelayCommand(it->targetMac, it->relayNumber, espAction,
+            bool success = false;
+            if (it->relayNumber == 255 || it->action == "on_all" || it->action == "off_all") {
+                const uint8_t mask = (it->action == "off_all") ? 0x00 : 0xFF;
+                success = espNowController->sendSetRelayMask(it->targetMac, mask,
+                                                              (uint16_t)it->duration, it->commandId);
+            } else {
+                String espAction = resolveSlaveEspAction(it->action, it->commandMode);
+                success = espNowController->sendRelayCommand(it->targetMac, it->relayNumber, espAction,
                                                               it->duration, it->commandId,
                                                               it->cycleOffDuration, it->commandMode);
+            }
             
             if (success) {
                 markEspNowSendToMac(it->targetMac);

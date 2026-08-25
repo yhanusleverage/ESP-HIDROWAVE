@@ -590,12 +590,11 @@ bool RelayCommandBox::isValidRelayNumber(int relayNumber) const {
 }
 
 void RelayCommandBox::initializeDefaultNames() {
-    // Usar nomes do Config.h
     for (int i = 0; i < MAX_RELAYS; i++) {
         relayStates[i].name = String(RELAY_NAMES[i]);
     }
-    
-    DEBUG_PRINTLN("✅ Nomes padrão dos relés carregados do Config.h");
+
+    DEBUG_PRINTLN("✅ Relés identificados por índice (Relé 0–7)");
 }
 
 // ===== 🎯 PERSISTÊNCIA DE ESTADOS (NVS) =====

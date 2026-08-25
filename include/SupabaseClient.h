@@ -277,6 +277,8 @@ public:
     bool patchPhConfigGains(const String& deviceId, float kAcid, float kBase,
                             bool clearResetFlag = false);
 
+    bool patchEcConfigGain(const String& deviceId, float kValue);
+
     // Utilitários
     bool testConnection();
     String getLastError() { return lastError; }

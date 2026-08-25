@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include "MasterSlaveManager.h"
 #include "GlobalEventBus.h"
+#include "RelayCoordinator.h"
 
 // ✅ REGRA DE DECISÃO
 struct DecisionRule {
@@ -24,6 +25,7 @@ private:
     std::vector<DecisionRule> rules;
     MasterSlaveManager* masterManager;
     GlobalEventBus* eventBus;
+    RelayCoordinator* relayCoordinator;
     
     // ✅ FUNÇÕES DE AVALIAÇÃO
     float getSensorValue(const String& sensorName);
@@ -37,7 +39,8 @@ private:
 public:
     DecisionEngineLoop();
     
-    void begin(MasterSlaveManager* masterManager, GlobalEventBus* eventBus);
+    void begin(MasterSlaveManager* masterManager, GlobalEventBus* eventBus,
+               RelayCoordinator* relayCoordinator = nullptr);
     
     // ✅ GERENCIAR REGRAS
     void addRule(const DecisionRule& rule);

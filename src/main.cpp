@@ -75,6 +75,15 @@ void handleSlaveRelayCommand(const String& command);
     
     // 🎯 SISTEMA PROFESIONAL MASTER-SLAVE (Core 0)
     MasterSlaveManager* masterManager = nullptr;
+
+    static void runSlaveRelayMask(uint8_t mask, const char* tag) {
+        if (!masterManager) {
+            Serial.println("❌ MasterSlaveManager não inicializado");
+            return;
+        }
+        const int n = masterManager->applyRelayMaskToAllOnlineSlaves(mask);
+        Serial.printf("[PROC] %s mask=0x%02X slaves=%d\n", tag, mask, n);
+    }
     
     // 📡 ESP-NOW TASK en Core 0 (Task dedicada para ESP-NOW)
     TaskHandle_t espNowTaskHandle = nullptr;    // Task dedicada Core 0
@@ -804,6 +813,15 @@ void handleMasterSerialCommands() {
                 command.trim();
                 
                 Serial.println(); // Nova linha
+
+                if (command == "relay on_all" || command == "on_all") {
+                    runSlaveRelayMask(0xFF, "on_all");
+                    continue;
+                }
+                if (command == "relay off_all" || command == "off_all") {
+                    runSlaveRelayMask(0x00, "off_all");
+                    continue;
+                }
                 
                 if (command == "help") {
                     printHelp();  // ✅ Usar printHelp() estándar
@@ -1940,7 +1958,10 @@ void handleGlobalSerialCommands() {
     // ⭐ POTENCIA MÁXIMA: Verificar comandos especiales ANTES de command.startsWith("relay ")
     // Padrão MASTER-TASK: Iterar sobre slaves primeiro, depois sobre relés
     else if (command == "relay on_all") {
-        // Comando especial: ligar todos os relés permanentemente em todos os slaves
+        runSlaveRelayMask(0xFF, "on_all");
+        return;
+    }
+    else if (command == "relay on_all__legacy_disabled") {
         Serial.println("\n🔌 ========================================");
         Serial.println("🔌 LIGANDO TODOS OS RELÉS EM TODOS OS SLAVES");
         Serial.println("🔌 ========================================");
@@ -2620,7 +2641,7 @@ void setup() {
         Serial.println("╚════════════════════════════════════════════════════╝");
         Serial.println("💡 Verifica que los Slaves estén:");
         Serial.println("   1. Encendidos y programados con SLAVE_MODE");
-        Serial.println("   2. En el mismo canal (ESPNOW_CHANNEL=1)");
+        Serial.println("   2. En el mismo canal WiFi STA (" + String(WiFi.channel()) + ")");
         Serial.println("   3. Con hardware conectado (PCF8574 + relés)");
         Serial.println();
         Serial.println("🔧 Puedes hacer discovery manual: 'discover'");

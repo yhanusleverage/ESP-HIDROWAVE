@@ -199,6 +199,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function initializeButtons() {
     console.log("Inicializando botões..."); // Debug
+    const relayNames = Array.from({ length: 9 }, (_, i) => (i === 0 ? '' : `Relé ${i - 1}`));
     const container = document.getElementById('buttons');
     if (!container) {
         console.error("Container de botões não encontrado!");

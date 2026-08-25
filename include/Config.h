@@ -124,6 +124,13 @@
 #define ESPNOW_LOCK_WIFI_CHANNEL 1
 #endif
 
+#ifndef ESPNOW_LOCK_WINDOW_MS
+#define ESPNOW_LOCK_WINDOW_MS 5000UL
+#endif
+#ifndef ESPNOW_LOCK_DEBUG
+#define ESPNOW_LOCK_DEBUG 1
+#endif
+
 /** Bancada: canal esperado del slave (debe coincidir con WiFi.channel() del router) */
 #ifndef ESPNOW_FIXED_CHANNEL
 #define ESPNOW_FIXED_CHANNEL 11

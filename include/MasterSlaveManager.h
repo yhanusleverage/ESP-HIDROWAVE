@@ -230,6 +230,10 @@ public:
      * @return true se Slave foi adicionado
      */
     bool addTrustedSlave(const uint8_t* macAddress, const String& deviceName = "", const String& deviceType = "RelayBox");
+
+    void startEspNowLockWindow();
+    bool isEspNowLockWindowActive() const;
+    unsigned long getLastRxAgeMs();
     
     /**
      * @brief Remove Slave da lista confiável
@@ -272,6 +276,12 @@ public:
      * @return Vector com todos os Slaves
      */
     std::vector<TrustedSlave> getAllTrustedSlaves();
+
+    /**
+     * Tras WiFi GOT_IP: re-add broadcast + slaves no canal STA atual.
+     * Não faz esp_now_deinit nem muda o canal do rádio.
+     */
+    void refreshEspNowPeersOnCurrentChannel();
 
     /**
      * @brief Itera slaves confiáveis sob mutex — sem alocar vector (seguro em heap baixo)
@@ -325,6 +335,11 @@ public:
     uint32_t sendRelayCommandToSlave(const uint8_t* macAddress, int relayNumber, const String& action,
                                      int duration = 0, int supabaseCommandId = 0, bool updateStatus = true,
                                      int cycleOffDuration = 0, const String& commandMode = "");
+
+    /** Un paquete SET_RELAY_MASK (bit i = relé i). mask 0xFF = on_all, 0x00 = off_all. */
+    uint32_t sendRelayMaskToSlave(const uint8_t* macAddress, uint8_t mask,
+                                  int durationSec = 0, int supabaseCommandId = 0);
+    int applyRelayMaskToAllOnlineSlaves(uint8_t mask);
     
     /**
      * @brief Solicita status de todos os relés de um Slave
@@ -548,6 +563,7 @@ public:
 private:
     ESPNowController* espNowController;  // Instância do ESPNowController
     bool initialized;                  // Status de inicialização
+    unsigned long espnowLockWindowUntil;
     
     // ✅ PROTEÇÃO MULTI-CORE: Mutex para proteger trustedSlaves
     SemaphoreHandle_t trustedSlavesMutex;  // Mutex para acesso thread-safe
@@ -617,8 +633,8 @@ private:
     static constexpr uint8_t MAX_RELAY_RETRIES = 3;
     static constexpr size_t MAX_PENDING_RELAY_COMMANDS = 8;
     static constexpr unsigned long RETRY_INTERVAL = 2000;
-    static constexpr unsigned long SLAVE_REACHABLE_MS = 45000;
-    static constexpr unsigned long SLAVE_OFFLINE_TIMEOUT_MS = 60000;
+    static constexpr unsigned long SLAVE_REACHABLE_MS = 120000;
+    static constexpr unsigned long SLAVE_OFFLINE_TIMEOUT_MS = 180000;
     static constexpr unsigned long SLAVE_QUEUE_OFFLINE_TIMEOUT_MS = 60000;
     static constexpr unsigned long ACK_WAIT_TIMEOUT_MS = 30000;
     static constexpr unsigned long MIN_ESPNOW_SEND_GAP_MS = 500;
@@ -628,6 +644,8 @@ private:
 
     void logSlaveLink(const char* event, const uint8_t* mac, long lastSeenDeltaMs = -1);
     bool hasInFlightForMac(const uint8_t* mac) const;
+    /** Caller already holds pendingRelayCommandsMutex (non-recursive). */
+    bool hasInFlightForMacLocked(const uint8_t* mac) const;
     bool canEspNowSendToMac(const uint8_t* mac) const;
     void markEspNowSendToMac(const uint8_t* mac);
     

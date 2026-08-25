@@ -6,7 +6,7 @@
 
 param(
   [string]$PemPath = "$env:USERPROFILE\Documents\Projects\LightsailDefaultKey-ca-central-1.pem",
-  [string]$SshHost = "ubuntu@99.79.36.220",
+  [string]$SshHost = "ubuntu@15.175.109.90",
   [string]$DeviceId = "ESP32_HIDRO_1A575C",
   [Parameter(Mandatory = $true)]
   [string]$DevicePass

@@ -4361,4 +4361,42 @@ bool SupabaseClient::patchPhConfigGains(const String& deviceId, float kAcid, flo
     }
     return patchOk;
 }
+
+bool SupabaseClient::patchEcConfigGain(const String& deviceId, float kValue) {
+    if (!isReady()) return false;
+
+    if (requestMutex != nullptr) {
+        if (xSemaphoreTake(requestMutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            return false;
+        }
+    }
+
+    DynamicJsonDocument doc(128);
+    doc["k_value"] = kValue;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String patchUrl = baseUrl + "/rest/v1/ec_config_view?device_id=eq." + deviceId;
+    bool patchOk = false;
+
+    if (secureClient != nullptr && http.begin(*secureClient, patchUrl)) {
+        http.addHeader("apikey", apiKey);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Prefer", "return=minimal");
+        http.setTimeout(8000);
+        int code = http.PATCH(payload);
+        patchOk = (code >= 200 && code < 300);
+        if (!patchOk) {
+            Serial.printf("⚠️ [EC CONFIG] PATCH k_value falhou HTTP %d\n", code);
+        }
+        http.end();
+    }
+
+    if (requestMutex != nullptr) {
+        xSemaphoreGive(requestMutex);
+    }
+    return patchOk;
+}
  

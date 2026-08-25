@@ -17,7 +17,7 @@
 ```bash
 # Copiar (do PC):
 # scp -i key.pem infra/mqtt/mosquitto/align-broker-production.sh \
-#     infra/mqtt/mosquitto/acl.production ubuntu@99.79.36.220:/tmp/
+#     infra/mqtt/mosquitto/acl.production ubuntu@15.175.109.90:/tmp/
 
 sudo bash /tmp/align-broker-production.sh ESP32_HIDRO_1A575C 'SUA_SENHA_MQTT_DEVICE'
 sudo grep -E '^user |topic ' /var/lib/mosquitto/acl

@@ -338,6 +338,8 @@ private:
     static void copyPhDoseToPending(const PhDoseEvent* event, PendingPhDoseExport& out);
     void handlePhGainLearned();
     static void onPhGainLearnedStatic(void* userData);
+    void handleEcGainLearned();
+    static void onEcGainLearnedStatic(void* userData);
     static void onNutrientDoseStatic(const NutrientDoseEvent* event, void* userData);
     static void onEcDilutionStatic(const EcDilutionEvent* event, void* userData);
     static uint32_t onDilutionSlaveRelayStatic(const uint8_t* mac, int relay, bool on, void* userData);

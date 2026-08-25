@@ -82,7 +82,24 @@ public:
         int cycleOffSec = 0,
         const String& commandMode = "");
 
+    /** Máscara atómica (on_all/off_all). Bits bloqueados se quitan. */
+    uint32_t requestMask(RelayOwner owner, const uint8_t mac[6], uint8_t mask, uint16_t durationSec = 0);
+    void noteObservedMask(const uint8_t mac[6], uint8_t bitsOn);
+    uint8_t blockedMaskFor(const uint8_t mac[6]) const;
+
 private:
+    struct OccupancyBank {
+        uint8_t bitsOn = 0;
+        uint8_t blockedBits = 0;
+        RelayOwner owners[8] = {};
+        unsigned long updatedMs = 0;
+        uint8_t mac[6] = {};
+        bool used = false;
+    };
+    OccupancyBank localBank;
+    OccupancyBank slaveBanks[4];
+    OccupancyBank* bankForMac(const uint8_t mac[6], bool create);
+    const OccupancyBank* bankForMacConst(const uint8_t mac[6]) const;
     HydroControl* hydroControl;
     MasterSlaveManager* masterManager;
 
@@ -95,6 +112,7 @@ private:
     bool claimCirculationOwner(RelayOwner owner);
     bool releaseCirculationOwner(RelayOwner owner, bool tryOff);
     bool executeLocalRelay(int relay, const String& action, int durationSec);
+    bool bitBlocked(const OccupancyBank* bank, int relay) const;
     uint32_t executeSlaveRelay(
         const uint8_t mac[6],
         int relay,

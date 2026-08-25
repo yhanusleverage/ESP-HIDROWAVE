@@ -70,10 +70,10 @@ struct AutoCommand {
 
 // Comandos automáticos padrão
 static const AutoCommand DEFAULT_AUTO_COMMANDS[] = {
-    {"Bomba Principal", "SlaveBox*", 0, "on", 30, 300000, 0, true},      // A cada 5 min
-    {"Luzes LED", "SlaveBox*", 1, "toggle", 0, 600000, 0, false},        // A cada 10 min
-    {"Ventilador", "SlaveBox*", 2, "on", 60, 1800000, 0, false},          // A cada 30 min
-    {"Verificação", "SlaveBox*", 7, "status", 0, 60000, 0, true}         // A cada 1 min
+    {"Relé 0", "SlaveBox*", 0, "on", 30, 300000, 0, false},
+    {"Relé 1", "SlaveBox*", 1, "toggle", 0, 600000, 0, false},
+    {"Relé 2", "SlaveBox*", 2, "on", 60, 1800000, 0, false},
+    {"Relé 7", "SlaveBox*", 7, "status", 0, 60000, 0, false}
 };
 
 // ===== CONFIGURAÇÕES DE RELÉS =====

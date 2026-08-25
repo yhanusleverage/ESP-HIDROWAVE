@@ -29,3 +29,11 @@ user mqtt_ESP32_HIDRO_1A575C
 topic read hidrowave/ESP32_HIDRO_1A575C/command
 topic write hidrowave/ESP32_HIDRO_1A575C/#
 
+# --- OBJETIVO FLOTA (ainda não em produção) ---
+# Ver docs/mqtt/HANDOFF_ACL_FLEET_VALIDATION.md
+# Um user mqtt_esp + %c = client id ESP32_HIDRO_XXXXXX. Sem passwd por MAC.
+# Firmware hoje usa user mqtt_<device_id>; passo 2 = login mqtt_esp.
+# user mqtt_esp
+# topic read hidrowave/%c/command
+# topic write hidrowave/%c/#
+

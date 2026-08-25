@@ -266,6 +266,7 @@ bool HydroSystemCore::begin() {
     hydroControl.setEcMetricCallback(&HydroSystemCore::onEcMetricStatic, this);
     hydroControl.setPhMetricCallback(&HydroSystemCore::onPhMetricStatic, this);
     hydroControl.setPhGainLearnedCallback(&HydroSystemCore::onPhGainLearnedStatic, this);
+    hydroControl.setEcGainLearnedCallback(&HydroSystemCore::onEcGainLearnedStatic, this);
     hydroControl.setEcOperationSyncCallback(&HydroSystemCore::onEcOperationSyncStatic, this);
     hydroControl.setPhOperationSyncCallback(&HydroSystemCore::onPhOperationSyncStatic, this);
     hydroControl.setPhysicalRecircCallback(&HydroSystemCore::onPhysicalRecircStatic, this);
@@ -426,8 +427,14 @@ void HydroSystemCore::loop() {
         mqttConnectedSinceMs = 0;
     }
     if (now - lastMqttTelemetrySend >= MQTT_TELEMETRY_INTERVAL_MS) {
-        publishMqttTelemetry();
-        lastMqttTelemetrySend = now;
+        if (masterManager && masterManager->isEspNowLockWindowActive()) {
+#if ESPNOW_LOCK_DEBUG
+            Serial.println("[LOCK] skip MQTT telemetry (window 5s)");
+#endif
+        } else {
+            publishMqttTelemetry();
+            lastMqttTelemetrySend = now;
+        }
     }
     maybePublishMqttLevelsOnChange();
     if (now - lastMqttHeartbeatSend >= MQTT_HEARTBEAT_INTERVAL_MS) {
@@ -625,8 +632,16 @@ void HydroSystemCore::loop() {
         phPollMs = CONFIG_POLL_INTERVAL_MQTT_OK_MS;
     }
 #endif
-    // Config Auto EC/pH: solo defer si HTTPS real ocupado (no por slave ACK offline)
-    if (supabaseConnected && !doseCycleBusy && !isSslTransportBusy()) {
+    if (masterManager && masterManager->isEspNowLockWindowActive()) {
+#if ESPNOW_LOCK_DEBUG
+        static unsigned long lastLockDeferLog = 0;
+        if (now - lastLockDeferLog >= 1000) {
+            Serial.printf("[LOCK] defer HTTPS lastRxAgeMs=%lu\n",
+                          masterManager->getLastRxAgeMs());
+            lastLockDeferLog = now;
+        }
+#endif
+    } else if (supabaseConnected && !doseCycleBusy && !isSslTransportBusy()) {
         if (now - lastECConfigCheck >= ecPollMs) {
             Serial.println("[SYNC] EC config poll");
             esp_task_wdt_reset();
@@ -727,7 +742,8 @@ void HydroSystemCore::loop() {
                             Serial.println("⚠️ [Cache] NENHUM SLAVE encontrado no masterManager!");
                             Serial.println("   💡 Verifique se:");
                             Serial.println("      1. Slaves estão ligados");
-                            Serial.println("      2. Slaves estão no mesmo canal ESP-NOW (canal 1)");
+                            Serial.println("      2. Slaves estão no mesmo canal ESP-NOW (canal " +
+                                           String(WiFi.channel()) + ")");
                             Serial.println("      3. Discovery foi executado (masterManager->rediscoverSlaves())");
                         }
                         
@@ -757,7 +773,7 @@ void HydroSystemCore::loop() {
                                 relayObj["state"] = slave.relayStates[i].state;  // ✅ Estado do relé
                                 relayObj["has_timer"] = slave.relayStates[i].hasTimer;  // ✅ Tem timer?
                                 relayObj["remaining_time"] = slave.relayStates[i].remainingTime;  // ✅ Tempo restante
-                                relayObj["name"] = slave.relayStates[i].name.length() > 0 ? slave.relayStates[i].name : ("Relé " + String(i + 1));  // ✅ Nome do relé
+                                relayObj["name"] = slave.relayStates[i].name.length() > 0 ? slave.relayStates[i].name : ("Relé " + String(i));
                             }
                         }
                         
@@ -904,6 +920,12 @@ void HydroSystemCore::checkSupabaseCommands() {
 #endif
 
     if (isSslHotPathBusy()) {
+        return;
+    }
+    if (masterManager && masterManager->isEspNowLockWindowActive()) {
+#if ESPNOW_LOCK_DEBUG
+        Serial.println("[LOCK] skip command poll (window 5s)");
+#endif
         return;
     }
     
@@ -1422,8 +1444,12 @@ void HydroSystemCore::updateStatusLedFromWifi() {
     if (st == lastWifiLedState && statusLedSendUntilMs == 0) {
         return;
     }
+    const int previousWifi = lastWifiLedState;
     lastWifiLedState = st;
     if (st == WL_CONNECTED) {
+        if (previousWifi != -1 && previousWifi != WL_CONNECTED && masterManager) {
+            masterManager->refreshEspNowPeersOnCurrentChannel();
+        }
         statusLed.setConnected();
     } else if (st == WL_IDLE_STATUS || st == WL_DISCONNECTED || st == WL_NO_SSID_AVAIL ||
                st == WL_CONNECTION_LOST) {
@@ -1899,6 +1925,21 @@ void HydroSystemCore::onPhGainLearnedStatic(void* userData) {
     if (userData) {
         static_cast<HydroSystemCore*>(userData)->handlePhGainLearned();
     }
+}
+
+void HydroSystemCore::onEcGainLearnedStatic(void* userData) {
+    if (userData) {
+        static_cast<HydroSystemCore*>(userData)->handleEcGainLearned();
+    }
+}
+
+void HydroSystemCore::handleEcGainLearned() {
+    if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
+        return;
+    }
+    const float k = hydroControl.getECController().getKValue();
+    Serial.printf("💾 [EC K] PATCH k_value post-recirc (k=%.4f)\n", k);
+    supabase.patchEcConfigGain(getDeviceID(), k);
 }
 
 void HydroSystemCore::handlePhGainLearned() {
@@ -2637,10 +2678,11 @@ void HydroSystemCore::processWebCommands() {
                         
                         if (hasMac) {
                             // ✅ Compatibilidade: Receber commandId mas usar como bool
-                            uint32_t commandId = masterManager->sendRelayCommandToSlave(
-                                cmd.slaveMac, 
-                                cmd.relayNumber, 
-                                cmd.action, 
+                            uint32_t commandId = relayCoordinator.actuateSlave(
+                                RelayOwner::Manual,
+                                cmd.slaveMac,
+                                cmd.relayNumber,
+                                cmd.action,
                                 cmd.duration
                             );
                             bool success = (commandId > 0);  // ✅ Conversão para compatibilidade

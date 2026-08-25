@@ -89,6 +89,7 @@ struct PhDoseEvent {
 
 typedef void (*PhDoseCallback)(const PhDoseEvent* event, void* userData);
 typedef void (*PhGainLearnedCallback)(void* userData);
+typedef void (*EcGainLearnedCallback)(void* userData);
 
 /** Métricas de ciclo Auto EC (cada checkAutoEC con PV válido). */
 struct EcControllerMetricEvent {
@@ -306,6 +307,7 @@ public:
     void resetPhLearnedGains();
     void setPhDoseCallback(PhDoseCallback cb, void* userData);
     void setPhGainLearnedCallback(PhGainLearnedCallback cb, void* userData);
+    void setEcGainLearnedCallback(EcGainLearnedCallback cb, void* userData);
     float getPhErrorH() const;
     void setPhRecirculacaoSeconds(unsigned long seconds) { phRecircSeconds = seconds > 0 ? seconds : 60; }
     void setPhOperationSyncCallback(PhOperationSyncCallback cb, void* userData);
@@ -415,6 +417,8 @@ private:
     unsigned long lastECCheckAtMs;
     float ecAtLastSequenceStart;
     float ecSetpointAtLastSequence;
+    float lastSequenceTotalMl;
+    bool ecGainLearnPending;
     String currentSequenceId;
     const char* currentDoseSource;
     NutrientDoseCallback nutrientDoseCallback;
@@ -477,6 +481,8 @@ private:
     void* phMetricCallbackUserData;
     PhGainLearnedCallback phGainLearnedCallback;
     void* phGainLearnedCallbackUserData;
+    EcGainLearnedCallback ecGainLearnedCallback;
+    void* ecGainLearnedCallbackUserData;
 
     // Diluição EC modo A
     DilutionState dilutionState;
@@ -584,6 +590,7 @@ private:
                            float mlApplied, float hBefore, float phBefore);
     void finishPhRecirculation();
     void emitPhDoseEvent();
+    void learnEcGainAfterSequence();
     void emitEcControllerMetric(bool adjustmentNeeded, bool adjustmentApplied,
                                 float dosageMl, float dosageTimeSec, float ecError,
                                 const String& sequenceId);

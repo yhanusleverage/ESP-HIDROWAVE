@@ -41,8 +41,9 @@ enum class MessageType : uint8_t {
     HANDSHAKE_RESPONSE = 0x0B,  // Resposta ao handshake
     CONNECTIVITY_CHECK = 0x0C,  // Verificação de conectividade
     CONNECTIVITY_REPORT = 0x0D, // Relatório de conectividade
-    ALL_RELAYS_STATUS = 0x0E,   // 🔄 Estado de todos os relays
-    PERSISTENT_STATE_SYNC = 0x0F // 🎯 Sincronização de estados persistentes (NVS)
+    ALL_RELAYS_STATUS = 0x0E,   // slave → Master: estado real 8 relés
+    SET_RELAY_MASK = 0x0F,       // Master → slave: máscara atómica (contrato SLAVE)
+    PERSISTENT_STATE_SYNC = 0x11 // NVS persistente (não usar 0x0F)
 };
 
 /**
@@ -62,6 +63,14 @@ struct ESPNowMessage {
 /**
  * @brief Estrutura para comando de relé
  */
+/** Master → slave: bit i = relé i ON. duration 0 = permanente. */
+struct RelayMaskCommandData {
+    uint8_t mask;
+    uint8_t pad;
+    uint16_t durationSec;
+    uint32_t commandId;
+} __attribute__((packed));
+
 struct RelayCommandData {
     int relayNumber;           // Número do relé (0-7)
     bool state;               // Estado desejado
@@ -210,6 +219,8 @@ public:
      */
     bool sendRelayCommand(const uint8_t* targetMac, int relayNumber, const String& action, int duration = 0,
                           uint32_t commandId = 0, int cycleOffDuration = 0, const String& mode = "");
+
+    bool sendSetRelayMask(const uint8_t* targetMac, uint8_t mask, uint16_t durationSec, uint32_t commandId);
 
     /**
      * @brief Envia ACK de comando de relé (slave → master, formato TaskESPNowMessage)

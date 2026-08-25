@@ -533,7 +533,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                         relay["state"] = slave.relayStates[i].state;
                         relay["name"] = slave.relayStates[i].name.length() > 0 
                             ? slave.relayStates[i].name 
-                            : (slave.deviceName + " - Relé " + String(i + 1));
+                            : (slave.deviceName + " - Relé " + String(i));
                         relay["type"] = "slave"; // ✅ NOVO: Indicar que é relé de slave
                         relay["slave_mac"] = ESPNowController::macToString(slave.macAddress);
                         relay["slave_name"] = slave.deviceName;
@@ -1566,7 +1566,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                     relayObj["state"] = relayState;
                     relayObj["has_timer"] = slave.relayStates[i].hasTimer;
                     relayObj["remaining_time"] = slave.relayStates[i].remainingTime;
-                    relayObj["name"] = slave.relayStates[i].name.length() > 0 ? slave.relayStates[i].name : ("Relé " + String(i + 1));
+                    relayObj["name"] = slave.relayStates[i].name.length() > 0 ? slave.relayStates[i].name : ("Relé " + String(i));
                     // ✅ NOVO: Adicionar timestamp da última atualização para debug
                     relayObj["last_update_ms"] = slave.relayStates[i].lastUpdate;
                     relayObj["state_age_ms"] = neverUpdated ? -1 : (int)stateAge;  // -1 se nunca atualizado
@@ -2176,26 +2176,10 @@ void WebServerManager::initSPIFFS() {
 }
 
 String WebServerManager::getRelayName(int relay) {
-    // Nomes padrão conforme o prompt ESP32 Integration
-    switch(relay) {
-        case 0: return "💧 Bomba Principal";
-        case 1: return "🧪 Bomba Nutrientes";
-        case 2: return "⚗️ Bomba pH";
-        case 3: return "💨 Ventilador";
-        case 4: return "💡 Luz UV";
-        case 5: return "🔥 Aquecedor";
-        case 6: return "🌊 Bomba Circulação";
-        case 7: return "🫧 Bomba Oxigenação";
-        case 8: return "🚪 Válvula Entrada";
-        case 9: return "🚪 Válvula Saída";
-        case 10: return "🔄 Sensor Agitador";
-        case 11: return "🌱 Luz LED Crescimento";
-        case 12: return "📱 Reserva 1";
-        case 13: return "📱 Reserva 2";
-        case 14: return "📱 Reserva 3";
-        case 15: return "📱 Reserva 4";
-        default: return "Relé " + String(relay);
+    if (relay < 0) {
+        return "Relé ?";
     }
+    return "Relé " + String(relay);
 }
 
 bool WebServerManager::shouldRefreshSlaveStates() {

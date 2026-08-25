@@ -1,9 +1,9 @@
-# Deploy bridge index.js a Lightsail (ubuntu@15.222.65.160)
+# Deploy bridge index.js a Lightsail (ubuntu@15.175.109.90)
 # Uso: .\scripts\deploy-lightsail.ps1 -PemPath "C:\path\LightsailDefaultKey-ca-central-1.pem"
 
 param(
   [string]$PemPath = "$env:USERPROFILE\Documents\Projects\LightsailDefaultKey-ca-central-1.pem",
-  [string]$SshHost = "ubuntu@15.222.65.160"
+  [string]$SshHost = "ubuntu@15.175.109.90"
 )
 
 $ErrorActionPreference = "Stop"

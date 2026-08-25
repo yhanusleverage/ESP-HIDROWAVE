@@ -31,12 +31,7 @@ export default function TestRelays() {
     }
   }
 
-  const relayNames = [
-    'Grow', 'Micro', 'Bloom', 'Luz LED',
-    'luz uv', 'drain', 'Bomba pH+', 'Bomba pH-',
-    'Recarga água', 'Válvula 2', 'Válvula 3', 'Válvula 4',
-    'Reserva 1', 'Reserva 2', 'Reserva 3', 'Reserva 4'
-  ]
+  const relayNames = Array.from({ length: 16 }, (_, i) => `Relé ${i}`)
 
   return (
     <div className="p-8 max-w-6xl mx-auto">
