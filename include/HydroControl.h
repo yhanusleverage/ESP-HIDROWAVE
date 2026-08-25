@@ -302,8 +302,7 @@ public:
     int getAutoPHInterval() const { return autoPHIntervalSeconds; }
     void setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
                          float mlPerUnitAcid, float mlPerUnitBase);
-    void setPhAdaptiveConfig(float aggressiveness, float gainAlpha,
-                             float maxDoseMl, int maxPulseSec, int maxConsecutive);
+    void setPhAdaptiveConfig(float aggressiveness, float gainAlpha);
     void resetPhLearnedGains();
     void setPhDoseCallback(PhDoseCallback cb, void* userData);
     void setPhGainLearnedCallback(PhGainLearnedCallback cb, void* userData);
@@ -450,9 +449,6 @@ private:
     unsigned long phPulseOnDurationMs;
     int phPulseIndex;
     float phGainAlpha;
-    float phMaxDoseMl;
-    int phMaxPulseSec;
-    int phMaxConsecutive;
     int phConsecutiveCorrections;
     unsigned long phRecircSeconds;
     bool consumoPh24hEnabled;
@@ -541,7 +537,7 @@ private:
         String name;
         int relay;      // Índice do relé (0-15)
         float mlPerLiter;  // ml/L do nutriente
-        float flowRate;    // Vazão desta bomba (ml/s); 0 = usar flow_rate global
+        float flowRate;    // Vazão desta bomba (ml/s); 0 = não calibrada
         float proportion;  // Proporção calculada (0.0 - 1.0)
         bool active;   // Se está ativo
     };
@@ -604,7 +600,7 @@ private:
     void loadECControllerConfig();  // Carregar configuração do Controller ao iniciar
     void loadPHControllerConfig();  // Carregar SP/auto/interval pH do NVS ao iniciar
     void loadNutrientProportions();  // Carregar proporções nutricionais ao iniciar
-    float nutrientFlowRateMlPerSec(int idx) const;  // Vazão da bomba; fallback flow_rate global
+    float nutrientFlowRateMlPerSec(int idx) const;  // Vazão da bomba (0 = sem calibragem)
     void loadEcCalibrationFromNVS();
     void saveEcCalibrationToNVS();
 };

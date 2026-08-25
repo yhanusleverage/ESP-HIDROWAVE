@@ -146,7 +146,6 @@ float AdaptivePHController::clampAggressiveness(float a) {
 
 PhDosePlan AdaptivePHController::planDose(float phSetpoint, float phMeasured, float tolerancePh,
                                          float aggressiveness, float flowRateMlPerSec,
-                                         float maxDoseMl, float maxPulseSec,
                                          bool commissioning) const {
     PhDosePlan plan = {};
     plan.valid = false;
@@ -168,20 +167,12 @@ PhDosePlan AdaptivePHController::planDose(float phSetpoint, float phMeasured, fl
     }
     plan.doseRealMl = a * plan.doseIdealMl;
 
-    if (maxDoseMl > 0.0f && plan.doseRealMl > maxDoseMl) {
-        plan.doseRealMl = maxDoseMl;
-    }
     if (plan.doseRealMl < MIN_DOSE_ML) return plan;
 
     if (flowRateMlPerSec > 0.01f) {
         plan.durationSec = plan.doseRealMl / flowRateMlPerSec;
     } else {
         return plan;
-    }
-
-    if (maxPulseSec > 0 && plan.durationSec > (float)maxPulseSec) {
-        plan.durationSec = (float)maxPulseSec;
-        plan.doseRealMl = plan.durationSec * flowRateMlPerSec;
     }
 
     plan.valid = plan.durationSec >= MIN_PULSE_SEC;

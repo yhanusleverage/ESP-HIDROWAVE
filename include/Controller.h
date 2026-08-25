@@ -30,8 +30,8 @@ public:
     bool hasLearnedK() const { return kLearned > 0.0f; }
 
     /**
-     * Identifica k após uma dose (A já está em mlApplied).
-     * Lei intacta: u = (V / (k·q)) · e · Kp — mapeia ΔEC/ml para as unidades de k.
+     * Identifica k após uma dose (mlApplied já inclui A).
+     * Lei: u = (V / k) · e · Kp  [ml]. q_i só entra no tempo de cada bomba.
      */
     bool updateGainAfterDose(float deltaEc, float mlApplied, float alpha = 0.2f);
     

@@ -88,9 +88,6 @@ HydroControl::HydroControl()
     phPulseOnDurationMs = 0;
     phPulseIndex = 0;
     phGainAlpha = 0.2f;
-    phMaxDoseMl = 50.0f;
-    phMaxPulseSec = 120;
-    phMaxConsecutive = 5;
     phConsecutiveCorrections = 0;
     phRecircSeconds = 60;
     consumoPh24hEnabled = false;
@@ -1060,11 +1057,10 @@ void HydroControl::checkAutoEC() {
             Serial.printf("📊 EC Atual: %.0f µS/cm\n", ec);
             Serial.printf("🎯 EC Setpoint: %.0f µS/cm\n", ecSetpoint);
             Serial.printf("⚡ Erro: %.0f µS/cm\n", ecError);
-            Serial.printf("📐 k=%.4f %s  A=%.2f  q=%.3f ml/s\n",
+            Serial.printf("📐 k=%.4f %s  A=%.2f  (q por bomba no split)\n",
                 ecController.getKValue(),
                 ecController.hasLearnedK() ? "(aprendido)" : "(receta)",
-                ecAggressiveness,
-                ecController.getFlowRate());
+                ecAggressiveness);
             Serial.printf("💧 u(t) calculado: %.3f ml (proporção milimétrica)\n", dosageML);
             Serial.printf("⏱️ Tempo de dosagem: %.2f segundos\n", dosageTime);
             Serial.printf("⏱️  Tempo de dosagem: %.1f segundos\n", dosageTime);
@@ -1280,7 +1276,13 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
             // dosagemNutriente = u(t) × (mlPerLiter / totalMlPerLiter)
             float proportion = dynamicProportions[i].proportion;
             float nutDosage = totalML * proportion;
-            float nutTime = nutDosage / nutrientFlowRateMlPerSec(i);
+            float qPump = nutrientFlowRateMlPerSec(i);
+            if (qPump < 0.01f) {
+                Serial.printf("⚠️  %s: sem flowRate calibrado (Calibragem) — nutriente ignorado\n",
+                    dynamicProportions[i].name.c_str());
+                continue;
+            }
+            float nutTime = nutDosage / qPump;
             int durationMs = (int)(nutTime * 1000);
             
             if (durationMs < 100) durationMs = 100; // Mínimo 100ms
@@ -1298,7 +1300,6 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
                 if (existingIdx >= 0) {
                     nutrients[existingIdx].dosageML += nutDosage;
                     float q = nutrientFlowRateMlPerSec(i);
-                    if (q < 0.01f) q = 1.0f;
                     nutrients[existingIdx].flowRateMlPerS = q;
                     nutrients[existingIdx].durationMs = (int)((nutrients[existingIdx].dosageML / q) * 1000);
                     if (nutrients[existingIdx].durationMs < 100) {
@@ -1308,7 +1309,6 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
                         dynamicProportions[i].name.c_str(), nutDosage, dynamicProportions[i].relay + 1);
                 } else {
                     float q = nutrientFlowRateMlPerSec(i);
-                    if (q < 0.01f) q = 1.0f;
                     nutrients[totalNutrients].name = dynamicProportions[i].name;
                     nutrients[totalNutrients].relay = dynamicProportions[i].relay;
                     nutrients[totalNutrients].dosageML = nutDosage;
@@ -1857,8 +1857,7 @@ float HydroControl::nutrientFlowRateMlPerSec(int idx) const {
     if (idx >= 0 && idx < activeNutrientsCount && dynamicProportions[idx].flowRate > 0.01f) {
         return dynamicProportions[idx].flowRate;
     }
-    const float globalQ = ecController.getFlowRate();
-    return globalQ > 0.01f ? globalQ : 1.0f;
+    return 0.0f;
 }
 
 // ✅ Implementação dos setters com persistência automática
@@ -2355,15 +2354,11 @@ void HydroControl::setPhPumpConfig(int relayUp, int relayDown, float flowUp, flo
     }
 }
 
-void HydroControl::setPhAdaptiveConfig(float aggressiveness, float gainAlpha,
-                                       float maxDoseMl, int maxPulseSec, int maxConsecutive) {
+void HydroControl::setPhAdaptiveConfig(float aggressiveness, float gainAlpha) {
     phAggressiveness = aggressiveness >= 0.05f ? aggressiveness : 0.5f;
     if (phAggressiveness > 1.0f) phAggressiveness = 1.0f;
     phGainAlpha = gainAlpha >= 0.05f ? gainAlpha : 0.2f;
     if (phGainAlpha > 0.5f) phGainAlpha = 0.5f;
-    phMaxDoseMl = maxDoseMl > 0 ? maxDoseMl : 50.0f;
-    phMaxPulseSec = maxPulseSec > 0 ? maxPulseSec : 120;
-    phMaxConsecutive = maxConsecutive > 0 ? maxConsecutive : 5;
 }
 
 void HydroControl::resetPhLearnedGains() {
@@ -2643,13 +2638,6 @@ void HydroControl::checkAutoPH() {
     }
     consumoPh24hForcePending = false;
 
-#if !PH_PROTOTYPE_RELAX_GUARDS
-    if (phConsecutiveCorrections >= phMaxConsecutive) {
-        Serial.printf("🛑 [AUTO PH] Limite consecutivo (%d) — pausa\n", phMaxConsecutive);
-        return;
-    }
-#endif
-
     const PhCorrectionPath path = adaptivePhController.selectPath(phSetpoint, phForControl, phTolerance);
     if (path == PH_PATH_NONE) {
         emitPhControllerMetric(true, false, PH_PATH_NONE, nullptr, "");
@@ -2659,8 +2647,7 @@ void HydroControl::checkAutoPH() {
     const float flow = path == PH_PATH_BASE ? flowRatePhUp : flowRatePhDown;
     const bool commissioning = adaptivePhController.getValidLearningCycles() < 3;
     const PhDosePlan plan = adaptivePhController.planDose(
-        phSetpoint, phForControl, phTolerance, phAggressiveness, flow,
-        phMaxDoseMl, (float)phMaxPulseSec, commissioning);
+        phSetpoint, phForControl, phTolerance, phAggressiveness, flow, commissioning);
 
     if (!plan.valid) {
         emitPhControllerMetric(true, false, path, &plan, "");

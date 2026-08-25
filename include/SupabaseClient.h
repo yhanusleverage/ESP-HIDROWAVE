@@ -121,9 +121,6 @@ struct PHConfig {
     double gain_alpha;
     double k_acid;
     double k_base;
-    double max_dose_ml_per_cycle;
-    int max_pulse_seconds;
-    int max_consecutive_corrections;
     bool reset_k_gains;
     bool consumo_24h;
     double pulse_ml;

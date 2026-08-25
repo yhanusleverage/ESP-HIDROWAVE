@@ -73,6 +73,26 @@
 #define CONFIG_POLL_INTERVAL_MQTT_OK_MS 60000UL  // Auto EC/pH ON-OFF: 1 min (era 5 min; no starve por MQTT OK)
 #endif
 #endif
+#ifndef CONFIG_POLL_PH_STAGGER_MS
+#define CONFIG_POLL_PH_STAGGER_MS 15000UL  // pH GET nunca no mesmo segundo que EC
+#endif
+// Poll HTTPS: só colunas que o firmware aplica (não select=*). nutrients inclui flowRate.
+#ifndef EC_CONFIG_POLL_SELECT
+#define EC_CONFIG_POLL_SELECT \
+    "auto_enabled,base_dose,flow_rate,volume,total_ml,kp,ec_setpoint,tolerance," \
+    "intervalo_auto_ec,tempo_recirculacao,nutrients," \
+    "dilution_auto_enabled,dilution_drain_relay,dilution_fill_relay," \
+    "dilution_drain_slave_mac,dilution_fill_slave_mac,dilution_max_volume_l," \
+    "flowmeter_pulses_per_liter,dilution_fill_flow_lps," \
+    "aggressiveness,consumo_24h,pulse_ml,pulse_gap_sec"
+#endif
+#ifndef PH_CONFIG_POLL_SELECT
+#define PH_CONFIG_POLL_SELECT \
+    "auto_enabled,ph_setpoint,ph_tolerance,flow_rate_ph_up,flow_rate_ph_down,volume," \
+    "ml_per_ph_unit,ml_per_ph_unit_acid,ml_per_ph_unit_base,relay_ph_up,relay_ph_down," \
+    "intervalo_auto_ph,tempo_recirculacao,aggressiveness,gain_alpha,k_acid,k_base," \
+    "reset_k_gains,consumo_24h,pulse_ml,pulse_gap_sec"
+#endif
 
 // ===== CONFIGURAÇÕES DA API =====
 // Credenciais Supabase: definidas em secrets.ini (ver secrets.ini.example)

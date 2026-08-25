@@ -63,15 +63,15 @@ bool ECController::updateGainAfterDose(float deltaEc, float mlApplied, float alp
     if (mlApplied < 0.2f || deltaEc < 5.0f) {
         return false;
     }
-    if (volume <= 0.01f || flowRate < 0.01f) {
+    if (volume <= 0.01f) {
         return false;
     }
     if (!isfinite(deltaEc) || !isfinite(mlApplied)) {
         return false;
     }
 
-    // Planta G = ΔEC/ml. Lei u = V·e/(k·q) ⇒ k ≈ (V/q)·G  (q permanece na equação)
-    const float kObs = (volume / flowRate) * (deltaEc / mlApplied);
+    // Planta G = ΔEC/ml. Lei u = (V/k)·e ⇒ k ≈ V·G  [µS por (ml/L)]
+    const float kObs = volume * (deltaEc / mlApplied);
     if (!isfinite(kObs) || kObs < 1e-9f) {
         return false;
     }
@@ -90,8 +90,8 @@ bool ECController::updateGainAfterDose(float deltaEc, float mlApplied, float alp
 
     kLearned = kNew;
     Serial.printf(
-        "📈 [EC k] ΔEC=%.1f ml=%.3f G=%.4f µS/ml  k: %.4f → %.4f (obs=%.4f α=%.2f q=%.3f)\n",
-        deltaEc, mlApplied, deltaEc / mlApplied, kPrev, kLearned, kObs, a, flowRate);
+        "📈 [EC k] ΔEC=%.1f ml=%.3f G=%.4f µS/ml  k: %.4f → %.4f (obs=%.4f α=%.2f)\n",
+        deltaEc, mlApplied, deltaEc / mlApplied, kPrev, kLearned, kObs, a);
     return true;
 }
 
@@ -102,12 +102,11 @@ float ECController::calculateDosage(float ecSetpoint, float ecActual) {
     // k = EC base / mililitros totais
     float k = calculateK();
     
-    // u(t) = (V / k * q) * e
-    // Resposta em ml/s
+    // u(t) = (V / k) * e * Kp  [ml]. q_i aplica-se depois: t_i = ml_i / q_i
     float dosage = 0.0;
     
-    if (k > 0 && flowRate > 0) {
-        dosage = (volume / (k * flowRate)) * error * Kp;
+    if (k > 0 && volume > 0) {
+        dosage = (volume / k) * error * Kp;
     }
     
     // Garantir que a dosagem seja positiva (só adicionar nutrientes)

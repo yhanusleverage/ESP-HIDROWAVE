@@ -50,7 +50,6 @@ public:
 
     PhDosePlan planDose(float phSetpoint, float phMeasured, float tolerancePh,
                         float aggressiveness, float flowRateMlPerSec,
-                        float maxDoseMl, float maxPulseSec,
                         bool commissioning = false) const;
 
     bool updateGainAfterDose(PhCorrectionPath path, float hBefore, float hAfter,

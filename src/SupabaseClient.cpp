@@ -3539,7 +3539,7 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     }
     
     String deviceId = getDeviceID();
-    String endpoint = "ec_config_view?device_id=eq." + deviceId + "&select=*";
+    String endpoint = "ec_config_view?device_id=eq." + deviceId + "&select=" + String(EC_CONFIG_POLL_SELECT);
     
     Serial.printf("🔍 [EC_CONFIG] GET ec_config_view: %s\n", (baseUrl + "/rest/v1/" + endpoint).c_str());
     Serial.printf("🔍 [EC_CONFIG] Device ID: %s\n", deviceId.c_str());
@@ -4138,7 +4138,7 @@ bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     }
 
     String deviceId = getDeviceID();
-    String endpoint = "ph_config_view?device_id=eq." + deviceId + "&select=*";
+    String endpoint = "ph_config_view?device_id=eq." + deviceId + "&select=" + String(PH_CONFIG_POLL_SELECT);
     String fullUrl = baseUrl + "/rest/v1/" + endpoint;
     bool ok = false;
     String response;
@@ -4189,9 +4189,6 @@ bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     config.gain_alpha = o["gain_alpha"] | 0.2;
     config.k_acid = o["k_acid"] | 0.0;
     config.k_base = o["k_base"] | 0.0;
-    config.max_dose_ml_per_cycle = o["max_dose_ml_per_cycle"] | 50.0;
-    config.max_pulse_seconds = o["max_pulse_seconds"] | 120;
-    config.max_consecutive_corrections = o["max_consecutive_corrections"] | 5;
     config.reset_k_gains = o["reset_k_gains"] | false;
     config.consumo_24h = o["consumo_24h"] | false;
     config.pulse_ml = o["pulse_ml"] | 2.0;

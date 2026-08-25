@@ -1,5 +1,11 @@
 # 🧠 Filosofia de Controle: Sistema Proporcional Adaptativo com Bomba Peristáltica
 
+> **Canónico 2026-08:** las leyes de Auto EC/pH están en [`docs/engineering/EQUACOES_AUTO_EC_PH.md`](docs/engineering/EQUACOES_AUTO_EC_PH.md).  
+> Este archivo es histórico: **no** uses `u = V/(k·q)` ni `max_pulse` / `flow_rate` global.
+
+---
+
+
 ## 📚 **1. Memória Heap = RAM? Sim, mas com nuances...**
 
 ### **✅ Resposta Direta:**

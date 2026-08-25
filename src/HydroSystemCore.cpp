@@ -586,7 +586,7 @@ void HydroSystemCore::loop() {
     // ✅ IMPORTANTE: Buscar SEMPRE que Supabase estiver conectado, mesmo se auto_enabled = false
     // Isso permite que o ESP32 seja ativado remotamente pelo frontend
     static unsigned long lastECConfigCheck = 0;
-    static unsigned long lastPHConfigCheck = 0;
+    static unsigned long lastPHConfigCheck = CONFIG_POLL_PH_STAGGER_MS;
     static unsigned long lastDebugPrint = 0;
     
     // ✅ DEBUG: Mostrar status a cada 10 segundos
@@ -641,19 +641,33 @@ void HydroSystemCore::loop() {
             lastLockDeferLog = now;
         }
 #endif
-    } else if (supabaseConnected && !doseCycleBusy && !isSslTransportBusy()) {
-        if (now - lastECConfigCheck >= ecPollMs) {
+    } else if (supabaseConnected && !isSslTransportBusy()) {
+        // Config poll incluso durante dosagem: senão auto_enabled=false nunca chega e fica SIM.
+        // Um GET por passagem: TLS EC+pH no mesmo segundo → maxAllocLow nos dois.
+        const unsigned long phStaggerMs =
+            (CONFIG_POLL_PH_STAGGER_MS < phPollMs) ? CONFIG_POLL_PH_STAGGER_MS : (phPollMs / 2UL);
+        const bool ecDue = (now - lastECConfigCheck >= ecPollMs);
+        const bool phDue = (now - lastPHConfigCheck >= phPollMs);
+
+        if (ecDue) {
             Serial.println("[SYNC] EC config poll");
             esp_task_wdt_reset();
-            checkECConfigFromSupabase();
-            lastECConfigCheck = now;
-        }
-
-        if (now - lastPHConfigCheck >= phPollMs) {
+            if (checkECConfigFromSupabase()) {
+                lastECConfigCheck = now;
+            } else {
+                lastECConfigCheck = now - ecPollMs + 5000UL;
+            }
+            if (phDue) {
+                lastPHConfigCheck = now - phPollMs + phStaggerMs;
+            }
+        } else if (phDue) {
             Serial.println("[SYNC] PH config poll");
             esp_task_wdt_reset();
-            checkPHConfigFromSupabase();
-            lastPHConfigCheck = now;
+            if (checkPHConfigFromSupabase()) {
+                lastPHConfigCheck = now;
+            } else {
+                lastPHConfigCheck = now - phPollMs + 5000UL;
+            }
         }
     } else if (supabaseConnected && isSslTransportBusy()) {
         static unsigned long lastDeferLog = 0;
@@ -981,17 +995,12 @@ void HydroSystemCore::checkSupabaseRules() {
 }
 
 // ✅ NOVO: Buscar EC Config do Supabase via RPC activate_auto_ec
-void HydroSystemCore::checkECConfigFromSupabase() {
-    if (!supabaseConnected || !hasEnoughMemoryForHTTPS()) {
-        return;
-    }
-
-    if (isSslTransportBusy()) {
-        return;
-    }
-    
-    if (!supabase.isReady()) {
-        return;
+bool HydroSystemCore::checkECConfigFromSupabase() {
+    const char* skip = httpsConfigPollSkipReason();
+    if (skip) {
+        Serial.printf("[EC CONFIG] GET skip: %s heap=%u maxAlloc=%u\n",
+                      skip, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        return false;
     }
     
     Serial.println("\n╔════════════════════════════════════════════════════╗");
@@ -1063,7 +1072,6 @@ void HydroSystemCore::checkECConfigFromSupabase() {
             if (!ecConfigUnchanged(config)) {
             // ✅ Atualizar parâmetros do controller
             hydroControl.getECController().setBaseDose(config.base_dose);
-            hydroControl.getECController().setFlowRate(config.flow_rate);
             hydroControl.getECController().setVolume(config.volume);
             hydroControl.getECController().setTotalMl(config.total_ml);
             hydroControl.getECController().setKp(config.kp);
@@ -1105,29 +1113,62 @@ void HydroSystemCore::checkECConfigFromSupabase() {
                     DynamicJsonDocument adaptedDoc(2048);
                     JsonArray adaptedArray = adaptedDoc.to<JsonArray>();
                     
+                    float flowByRelay[16];
+                    for (int r = 0; r < 16; r++) {
+                        flowByRelay[r] = 0.0f;
+                    }
                     for (JsonVariant nutrient : nutrientsArray) {
-                        if (!nutrient["active"].as<bool>()) {
-                            continue;  // Pular nutrientes inativos
+                        int relay = nutrient["relay"].as<int>();
+                        if (relay < 0 || relay >= 16) {
+                            continue;
+                        }
+                        float q = 0.0f;
+                        if (nutrient.containsKey("flowRate")) {
+                            q = nutrient["flowRate"].as<float>();
+                        } else if (nutrient.containsKey("flow_rate")) {
+                            q = nutrient["flow_rate"].as<float>();
+                        }
+                        if (q > 0.01f) {
+                            flowByRelay[relay] = q;
+                        }
+                    }
+
+                    for (JsonVariant nutrient : nutrientsArray) {
+                        float mlL = 0.0f;
+                        if (nutrient.containsKey("mlPerLiter")) {
+                            mlL = nutrient["mlPerLiter"].as<float>();
+                        } else if (nutrient.containsKey("ml_per_liter")) {
+                            mlL = nutrient["ml_per_liter"].as<float>();
+                        }
+                        const bool flaggedActive = nutrient["active"].as<bool>();
+                        if (!flaggedActive && mlL < 0.1f) {
+                            continue;
                         }
                         
                         JsonObject adaptedNutrient = adaptedArray.createNestedObject();
                         adaptedNutrient["name"] = nutrient["name"].as<String>();
-                        adaptedNutrient["mlPerLiter"] = nutrient["mlPerLiter"].as<float>();
-                        adaptedNutrient["active"] = nutrient["active"].as<bool>();
+                        adaptedNutrient["mlPerLiter"] = mlL;
+                        adaptedNutrient["active"] = true;
+                        int relay = nutrient["relay"].as<int>();
+                        float q = 0.0f;
                         if (nutrient.containsKey("flowRate")) {
-                            adaptedNutrient["flowRate"] = nutrient["flowRate"].as<float>();
+                            q = nutrient["flowRate"].as<float>();
                         } else if (nutrient.containsKey("flow_rate")) {
-                            adaptedNutrient["flowRate"] = nutrient["flow_rate"].as<float>();
+                            q = nutrient["flow_rate"].as<float>();
+                        }
+                        if (q < 0.01f && relay >= 0 && relay < 16) {
+                            q = flowByRelay[relay];
+                        }
+                        if (q > 0.01f) {
+                            adaptedNutrient["flowRate"] = q;
                         }
                         
-                        // Converter relay (0-15) para relayNumber (1-16)
-                        int relay = nutrient["relay"].as<int>();
-                        adaptedNutrient["relayNumber"] = relay + 1;  // Converter para 1-16
+                        adaptedNutrient["relayNumber"] = relay + 1;
                         
                         Serial.printf("   ✅ %s: %.2f ml/L q=%.3f ml/s → Relé %d\n",
                             nutrient["name"].as<const char*>(),
-                            nutrient["mlPerLiter"].as<float>(),
-                            adaptedNutrient["flowRate"] | 0.0f,
+                            mlL,
+                            q,
                             relay + 1);
                     }
                     
@@ -1167,10 +1208,11 @@ void HydroSystemCore::checkECConfigFromSupabase() {
             Serial.println("╚════════════════════════════════════════════════════╝\n");
         }
     } else {
-        Serial.println("❌ [EC CONFIG] Falha ao buscar config do Supabase");
+            Serial.println("❌ [EC CONFIG] Falha ao buscar config do Supabase");
         Serial.println("   💡 Usando valores do NVS (fallback)");
         Serial.println("╚════════════════════════════════════════════════════╝\n");
     }
+    return true;
 }
 
 void HydroSystemCore::processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via) {
@@ -1855,18 +1897,17 @@ void HydroSystemCore::syncPhOperationStateToSupabase() {
     );
 }
 
-void HydroSystemCore::checkPHConfigFromSupabase() {
-    if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
-        return;
-    }
-
-    if (isSslTransportBusy()) {
-        return;
+bool HydroSystemCore::checkPHConfigFromSupabase() {
+    const char* skip = httpsConfigPollSkipReason();
+    if (skip) {
+        Serial.printf("[PH CONFIG] GET skip: %s heap=%u maxAlloc=%u\n",
+                      skip, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        return false;
     }
 
     PHConfig config;
     if (!supabase.getPHConfigFromSupabase(config)) {
-        return;
+        return true;
     }
 
     if (!config.isValid) {
@@ -1878,7 +1919,7 @@ void HydroSystemCore::checkPHConfigFromSupabase() {
             syncPhOperationStateToSupabase();
         }
 #endif
-        return;
+        return true;
     }
 
     hydroControl.setPHSetpoint((float)config.ph_setpoint, false);
@@ -1893,10 +1934,7 @@ void HydroSystemCore::checkPHConfigFromSupabase() {
     );
     hydroControl.setPhAdaptiveConfig(
         (float)config.aggressiveness,
-        (float)config.gain_alpha,
-        (float)config.max_dose_ml_per_cycle,
-        config.max_pulse_seconds,
-        config.max_consecutive_corrections
+        (float)config.gain_alpha
     );
     if (config.reset_k_gains) {
         hydroControl.resetPhLearnedGains();
@@ -1913,6 +1951,7 @@ void HydroSystemCore::checkPHConfigFromSupabase() {
     hydroControl.setPhRecirculacaoSeconds(config.tempo_recirculacao);
     hydroControl.setPhPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
     hydroControl.setConsumoPh24hEnabled(config.consumo_24h);
+    return true;
 }
 
 void HydroSystemCore::onPhDoseStatic(const PhDoseEvent* event, void* userData) {
@@ -2607,6 +2646,30 @@ void HydroSystemCore::performMemoryProtection() {
 }
 
 // ===== UTILITIES =====
+const char* HydroSystemCore::httpsConfigPollSkipReason() {
+    if (!supabaseConnected) {
+        return "supabaseDisconnected";
+    }
+    const uint32_t heap = ESP.getFreeHeap();
+    const uint32_t maxBlock = ESP.getMaxAllocHeap();
+    if (heap < MIN_HEAP_FOR_HTTPS) {
+        return "heapLow";
+    }
+    if (maxBlock < MIN_CONTIGUOUS_FOR_HTTPS) {
+        return "maxAllocLow";
+    }
+    if (supabase.isRequestInProgress()) {
+        return "requestInProgress";
+    }
+    if (isSslTransportBusy()) {
+        return "sslTransport";
+    }
+    if (!supabase.isReady()) {
+        return "supabaseNotReady";
+    }
+    return nullptr;
+}
+
 bool HydroSystemCore::hasEnoughMemoryForHTTPS() {
     const uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < MIN_HEAP_FOR_HTTPS) {

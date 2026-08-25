@@ -295,8 +295,9 @@ private:
     void applyBootPolicies();
     void initDecisionEngine();
     void checkSupabaseRules();  // sync config only (decision_rules → LittleFS)
-    void checkECConfigFromSupabase();  // ✅ NOVO: Buscar EC config do Supabase via RPC activate_auto_ec
-    void checkPHConfigFromSupabase();  // GET ph_config_view (read-only poll)
+    bool checkECConfigFromSupabase();  // GET ec_config_view — true se HTTPS rodou
+    bool checkPHConfigFromSupabase();  // GET ph_config_view
+    const char* httpsConfigPollSkipReason();
     void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "https");
     
     static void mqttCommandReceived(const char* payload, size_t length, void* userData);
