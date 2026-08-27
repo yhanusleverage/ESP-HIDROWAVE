@@ -158,7 +158,7 @@ struct MqttRelayStateReading {
     bool omitRelayStates;
 };
 
-typedef void (*MqttCommandPayloadHandler)(const char* payload, size_t length, void* userData);
+typedef void (*MqttIncomingHandler)(const char* topic, const char* payload, size_t length, void* userData);
 
 #if ENABLE_MQTT
 
@@ -186,7 +186,7 @@ public:
     bool publishCommandAck(const MqttCommandAckReading& reading);
     bool publishRelayState(const MqttRelayStateReading& reading);
 
-    void setCommandHandler(MqttCommandPayloadHandler handler, void* userData);
+    void setIncomingHandler(MqttIncomingHandler handler, void* userData);
 
 private:
     WiFiClient wifiClient;
@@ -198,6 +198,8 @@ private:
     String heartbeatTopic;
     String statusTopic;
     String commandTopic;
+    String ecConfigTopic;
+    String phConfigTopic;
     String ecOperationTopic;
     String doseTopic;
     String phOperationTopic;
@@ -212,8 +214,8 @@ private:
     unsigned long reconnectIntervalMs;
     unsigned long lastFailLogMs;
     uint8_t consecutiveFailCount;
-    MqttCommandPayloadHandler commandHandler;
-    void* commandHandlerUserData;
+    MqttIncomingHandler incomingHandler;
+    void* incomingHandlerUserData;
 
     static void mqttMessageCallback(char* topic, byte* payload, unsigned int length);
     static MqttClientWrapper* callbackInstance;
@@ -222,7 +224,7 @@ private:
     bool ensureConnected();
     /** true se já conectado — sem tentativa de TCP/MQTT. */
     bool isConnectedCached() const { return mqtt.connected(); }
-    bool subscribeCommandTopic();
+    bool subscribeInboundTopics();
     bool publishOnlineStatus();
     void bumpReconnectBackoff();
 };
@@ -246,7 +248,7 @@ public:
     bool publishPhMetric(const MqttPhMetricReading&) { return false; }
     bool publishCommandAck(const MqttCommandAckReading&) { return false; }
     bool publishRelayState(const MqttRelayStateReading&) { return false; }
-    void setCommandHandler(MqttCommandPayloadHandler, void*) {}
+    void setIncomingHandler(MqttIncomingHandler, void*) {}
 };
 
 #endif

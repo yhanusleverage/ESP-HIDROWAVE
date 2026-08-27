@@ -4,6 +4,7 @@
 #if ENABLE_MQTT
 
 #include <ArduinoJson.h>
+#include <string.h>
 
 #ifndef MQTT_HOST
 #define MQTT_HOST ""
@@ -26,27 +27,33 @@ MqttClientWrapper::MqttClientWrapper()
       reconnectIntervalMs(30000),
       lastFailLogMs(0),
       consecutiveFailCount(0),
-      commandHandler(nullptr),
-      commandHandlerUserData(nullptr) {
-    mqtt.setBufferSize(512);
+      incomingHandler(nullptr),
+      incomingHandlerUserData(nullptr) {
+    mqtt.setBufferSize(2048);
     lwtPayload[0] = '\0';
 }
 
-void MqttClientWrapper::setCommandHandler(MqttCommandPayloadHandler handler, void* userData) {
-    commandHandler = handler;
-    commandHandlerUserData = userData;
+void MqttClientWrapper::setIncomingHandler(MqttIncomingHandler handler, void* userData) {
+    incomingHandler = handler;
+    incomingHandlerUserData = userData;
 }
 
 void MqttClientWrapper::mqttMessageCallback(char* topic, byte* payload, unsigned int length) {
-    if (!callbackInstance || !callbackInstance->commandHandler || length == 0) {
+    if (!callbackInstance || !callbackInstance->incomingHandler || length == 0) {
         return;
     }
-    Serial.printf("[MQTT] rx command topic=%s len=%u\n", topic, length);
-    callbackInstance->commandHandler(reinterpret_cast<const char*>(payload), length,
-                                     callbackInstance->commandHandlerUserData);
+    if (length >= 2047) {
+        Serial.printf("[MQTT] rx drop topic=%s len=%u (max 2047)\n", topic, length);
+        return;
+    }
+    char buf[2048];
+    memcpy(buf, payload, length);
+    buf[length] = '\0';
+    Serial.printf("[MQTT] rx topic=%s len=%u\n", topic, length);
+    callbackInstance->incomingHandler(topic, buf, length, callbackInstance->incomingHandlerUserData);
 }
 
-bool MqttClientWrapper::subscribeCommandTopic() {
+bool MqttClientWrapper::subscribeInboundTopics() {
     if (!mqtt.connected() || commandTopic.length() == 0) {
         return false;
     }
@@ -55,6 +62,22 @@ bool MqttClientWrapper::subscribeCommandTopic() {
         Serial.printf("[MQTT] subscribe command QoS1 %s\n", commandTopic.c_str());
     } else {
         Serial.println("[MQTT] subscribe command failed");
+    }
+    if (ecConfigTopic.length() > 0) {
+        if (mqtt.subscribe(ecConfigTopic.c_str(), 1)) {
+            Serial.printf("[MQTT] subscribe ec/config QoS1 %s\n", ecConfigTopic.c_str());
+        } else {
+            Serial.println("[MQTT] subscribe ec/config failed");
+            ok = false;
+        }
+    }
+    if (phConfigTopic.length() > 0) {
+        if (mqtt.subscribe(phConfigTopic.c_str(), 1)) {
+            Serial.printf("[MQTT] subscribe ph/config QoS1 %s\n", phConfigTopic.c_str());
+        } else {
+            Serial.println("[MQTT] subscribe ph/config failed");
+            ok = false;
+        }
     }
     return ok;
 }
@@ -66,6 +89,8 @@ bool MqttClientWrapper::begin(const String& id) {
     heartbeatTopic = String("hidrowave/") + deviceId + "/heartbeat";
     statusTopic = String("hidrowave/") + deviceId + "/status";
     commandTopic = String("hidrowave/") + deviceId + "/command";
+    ecConfigTopic = String("hidrowave/") + deviceId + "/ec/config";
+    phConfigTopic = String("hidrowave/") + deviceId + "/ph/config";
     ecOperationTopic = String("hidrowave/") + deviceId + "/ec_operation";
     doseTopic = String("hidrowave/") + deviceId + "/dose";
     phOperationTopic = String("hidrowave/") + deviceId + "/ph_operation";
@@ -179,7 +204,7 @@ bool MqttClientWrapper::ensureConnected() {
         reconnectIntervalMs = 30000;
         consecutiveFailCount = 0;
         publishOnlineStatus();
-        subscribeCommandTopic();
+        subscribeInboundTopics();
     } else {
         bumpReconnectBackoff();
         // Rate-limit: 1? fail + depois no m?ximo a cada 60s

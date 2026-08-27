@@ -59,6 +59,8 @@ topic read hidrowave/+/relay/state
 
 user hidrowave
 topic write hidrowave/+/command
+topic write hidrowave/+/ec/config
+topic write hidrowave/+/ph/config
 topic read hidrowave/+/#
 
 EOF
@@ -73,6 +75,8 @@ cat >> "$ACL_FILE" <<EOF
 ${MARKER}
 user ${MQTT_USER}
 topic read hidrowave/${DEVICE_ID}/command
+topic read hidrowave/${DEVICE_ID}/ec/config
+topic read hidrowave/${DEVICE_ID}/ph/config
 topic write hidrowave/${DEVICE_ID}/#
 EOF
 

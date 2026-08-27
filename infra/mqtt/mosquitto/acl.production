@@ -21,6 +21,8 @@ topic read hidrowave/+/relay/state
 # --- Railway / UI publish (comandos — qualquer master) ---
 user hidrowave
 topic write hidrowave/+/command
+topic write hidrowave/+/ec/config
+topic write hidrowave/+/ph/config
 topic read hidrowave/+/#
 
 # --- Master ESP (bloco injetado por align-broker-production.sh) ---

@@ -3840,7 +3840,7 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     JsonObject configObj = configArray[0];
     
     config.base_dose = configObj["base_dose"] | 0.0;
-    config.flow_rate = configObj["flow_rate"] | 1.0;
+    config.flow_rate = 0.0; // legado; vazão = nutrients[].flowRate
     config.volume = configObj["volume"] | 10.0;
     config.total_ml = configObj["total_ml"] | 0.0;
     config.kp = configObj["kp"] | 1.0;
@@ -3879,6 +3879,18 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
         JsonArray nutrientsArray = configObj["nutrients"].as<JsonArray>();
         serializeJson(nutrientsArray, config.nutrientsJson);
         Serial.printf("📊 [RPC EC_CONFIG] Nutrients recebidos: %d nutriente(s)\n", nutrientsArray.size());
+        for (JsonVariant n : nutrientsArray) {
+            float q = 0.0f;
+            if (n.containsKey("flowRate")) {
+                q = n["flowRate"].as<float>();
+            } else if (n.containsKey("flow_rate")) {
+                q = n["flow_rate"].as<float>();
+            }
+            Serial.printf("      • %s relé=%d q=%.3f ml/s\n",
+                n["name"] | "?",
+                (int)(n["relay"] | -1),
+                q);
+        }
     } else {
         config.nutrientsJson = "[]";
     }
@@ -3888,7 +3900,6 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     // ✅ Mostrar valores recebidos
     Serial.println("✅ [RPC EC_CONFIG] Config recebida com sucesso:");
     Serial.printf("   • base_dose:        %.2f µS/cm\n", config.base_dose);
-    Serial.printf("   • flow_rate:        %.3f ml/s\n", config.flow_rate);
     Serial.printf("   • volume:           %.2f L\n", config.volume);
     Serial.printf("   • total_ml:         %.2f ml/L\n", config.total_ml);
     Serial.printf("   • kp:               %.2f\n", config.kp);

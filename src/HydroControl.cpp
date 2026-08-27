@@ -1113,7 +1113,10 @@ bool HydroControl::startEcPulseOn() {
     SimpleNutrient& n = nutrients[currentNutrientIndex];
     float q = n.flowRateMlPerS;
     if (q < 0.01f) {
-        q = 1.0f;
+        Serial.printf("⚠️ [PULSO EC] %s sem flowRate Calibragem — pulso ignorado\n",
+            n.name.c_str());
+        pulseRemainingMl = 0;
+        return false;
     }
     pulseChunkMl = (pulseRemainingMl < ecPulseMl) ? pulseRemainingMl : ecPulseMl;
     pulseOnDurationMs = (unsigned long)((pulseChunkMl / q) * 1000.0f);
@@ -1329,43 +1332,7 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
             }
         }
     } else {
-        // ===== FALLBACK: Proporções padrão (se não há tabela nutricional) =====
-        Serial.println("⚠️  Tabela nutricional não configurada - usando proporções padrão");
-        
-        struct NutrientInfo {
-            String name;
-            int relay;
-            float ratio;
-        };
-        
-        NutrientInfo nutrientList[] = {
-            {"Grow", 2, 0.35},
-            {"Micro", 3, 0.35},
-            {"Bloom", 4, 0.25},
-            {"CalMag", 5, 0.05}
-        };
-        
-        for (int i = 0; i < 4; i++) {
-            float nutDosage = totalML * nutrientList[i].ratio;
-            float nutTime = nutDosage / ecController.getFlowRate();
-            int durationMs = (int)(nutTime * 1000);
-            
-            if (durationMs < 100) durationMs = 100;
-            
-            if (nutDosage > 0.001) {
-                nutrients[totalNutrients].name = nutrientList[i].name;
-                nutrients[totalNutrients].relay = nutrientList[i].relay;
-                nutrients[totalNutrients].dosageML = nutDosage;
-                nutrients[totalNutrients].durationMs = durationMs;
-                nutrients[totalNutrients].flowRateMlPerS = ecController.getFlowRate() > 0.01f
-                    ? (float)ecController.getFlowRate() : 1.0f;
-                
-                Serial.printf("📝 %s: %.3fml (%.0f%%) → %dms → Relé %d\n", 
-                    nutrientList[i].name.c_str(), nutDosage, nutrientList[i].ratio * 100, durationMs, nutrientList[i].relay + 1);
-                
-                totalNutrients++;
-            }
-        }
+        Serial.println("❌ Tabela nutricional sem flowRate Calibragem — Auto EC não dosa com 1.0 ml/s legado");
     }
     
     if (totalNutrients > 0) {
@@ -2060,7 +2027,15 @@ void HydroControl::emitEcControllerMetric(bool adjustmentNeeded, bool adjustment
     event.dosageMl = dosageMl;
     event.dosageTimeSeconds = dosageTimeSec;
     event.baseDose = ecController.getBaseDose();
-    event.flowRate = ecController.getFlowRate();
+    float qSum = 0.0f;
+    int qCount = 0;
+    for (int i = 0; i < activeNutrientsCount; i++) {
+        if (dynamicProportions[i].active && dynamicProportions[i].flowRate > 0.01f) {
+            qSum += dynamicProportions[i].flowRate;
+            qCount++;
+        }
+    }
+    event.flowRate = qCount > 0 ? (qSum / qCount) : 0.0f;
     event.volume = ecController.getVolume();
     event.totalMl = ecController.getTotalMl();
     event.kp = ecController.getKp();

@@ -1803,15 +1803,23 @@ async function patchRelaySlaveFromMqtt(row) {
   const linkOnly = row.heartbeat && !row.relayStates;
 
   if (linkOnly) {
+    // link_online=false: no refrescar last_update (UI se quedaría verde). 
+    // last_update viejo + WS UPDATE → resolveSlaveOnline = offline al instante.
+    const lastUpdate =
+      row.linkOnline === false
+        ? new Date(Date.now() - 3 * 60 * 1000).toISOString()
+        : nowIso;
     const { error } = await supabase
       .from('relay_slaves')
-      .update({ last_update: nowIso, updated_at: nowIso })
+      .update({ last_update: lastUpdate, updated_at: nowIso })
       .eq('device_id', slaveDeviceId);
     if (error) {
       console.error(`[bridge] relay_slaves link heartbeat ${slaveDeviceId}:`, error.message);
       return false;
     }
-    console.log(`[bridge] PATCH relay_slaves link-only ${slaveDeviceId} via MQTT`);
+    console.log(
+      `[bridge] PATCH relay_slaves link-only ${slaveDeviceId} via MQTT link_online=${row.linkOnline}`
+    );
     return true;
   }
 

@@ -33,7 +33,7 @@ t_i  = ml_i / q_i
 |---|---|
 | `r_i` | `nutrients[i].mlPerLiter` |
 | `R` | suma de `r_i` activos |
-| `q_i` | `nutrients[i].flowRate` (Calibragem, ml/s) |
+| `q_i` | `nutrients[i].flowRate` (Calibragem, ml/s). **No** usar columna SQL `flow_rate`. |
 
 Sin `q_i` calibrado esa bomba no dosa.
 

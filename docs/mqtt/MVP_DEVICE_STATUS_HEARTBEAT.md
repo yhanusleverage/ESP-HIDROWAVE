@@ -1,7 +1,7 @@
 # MVP device_status — heartbeat MQTT (fechar agora)
 
 **Objetivo:** ESP publica saúde + presença via MQTT → bridge PATCH `device_status` → view `system_health_metrics` para UI.  
-**Modo:** bivalente (`mqtt_health_only=0`) — HTTPS `updateDeviceStatus` continua em paralelo até soak validado.
+**Modo (25/08):** `mqtt_health_only=1` — heartbeat MQTT es el canal de salud; HTTPS `updateDeviceStatus` solo si MQTT cae (120 s) o last_seen ≤4 min. Tabla `device_status` se queda (la UI la lee).
 
 ---
 
@@ -109,7 +109,7 @@ mosquitto_pub -h 127.0.0.1 -u hidrowave -P 'SENHA' \
 |------|--------|
 | `mqtt_enabled=0` + reflash | ESP só HTTPS para saúde |
 | Bridge antigo (só telemetry) | Sem PATCH device_status via MQTT |
-| `mqtt_health_only=1` (futuro) | Omitir HTTPS saúde; só MQTT |
+| `mqtt_health_only=1` (25/08) | Salud MQTT; HTTPS só fallback + last_seen ≤4 min |
 
 ---
 

@@ -932,8 +932,9 @@ bool MasterSlaveManager::readSlaveRelaySnapshot(const uint8_t* macAddress, bool 
         timers[i] = slave->relayStates[i].hasTimer;
         remaining[i] = slave->relayStates[i].remainingTime;
     }
-    linkOnline = isSlaveReachable(*slave);
-    linkLastSeenS = (uint16_t)(slave->getTimeSinceLastSeen() / 1000UL);
+    const unsigned long sinceSeen = slave->getTimeSinceLastSeen();
+    linkOnline = slave->isOnline() && slave->lastSeen != 0 && sinceSeen < 90000UL;
+    linkLastSeenS = (uint16_t)(sinceSeen / 1000UL);
     xSemaphoreGive(trustedSlavesMutex);
     return true;
 }

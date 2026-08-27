@@ -52,7 +52,7 @@
 // 1 = saúde: MQTT heartbeat se broker OK; HTTPS device_status só se MQTT cair (igual hydro)
 // 0 = bivalente: MQTT + HTTPS updateDeviceStatus em paralelo
 #ifndef MQTT_HEALTH_ONLY
-#define MQTT_HEALTH_ONLY 0
+#define MQTT_HEALTH_ONLY 1
 #endif
 // 1 = cierre command_ack + relay/state via MQTT → bridge Node (sem HTTPS no hot path)
 #ifndef MQTT_COMMAND_BRIDGE_ONLY
@@ -72,6 +72,13 @@
 #ifndef CONFIG_POLL_INTERVAL_MQTT_OK_MS
 #define CONFIG_POLL_INTERVAL_MQTT_OK_MS 60000UL  // Auto EC/pH ON-OFF: 1 min (era 5 min; no starve por MQTT OK)
 #endif
+// 1 = Auto EC/pH config só MQTT retained (sem GET HTTPS)
+#ifndef MQTT_CONFIG_BRIDGE_ONLY
+#define MQTT_CONFIG_BRIDGE_ONLY 1
+#endif
+#ifndef MQTT_CONFIG_HTTPS_DISABLED
+#define MQTT_CONFIG_HTTPS_DISABLED 1
+#endif
 #endif
 #ifndef CONFIG_POLL_PH_STAGGER_MS
 #define CONFIG_POLL_PH_STAGGER_MS 15000UL  // pH GET nunca no mesmo segundo que EC
@@ -79,7 +86,7 @@
 // Poll HTTPS: só colunas que o firmware aplica (não select=*). nutrients inclui flowRate.
 #ifndef EC_CONFIG_POLL_SELECT
 #define EC_CONFIG_POLL_SELECT \
-    "auto_enabled,base_dose,flow_rate,volume,total_ml,kp,ec_setpoint,tolerance," \
+    "auto_enabled,base_dose,volume,total_ml,kp,ec_setpoint,tolerance," \
     "intervalo_auto_ec,tempo_recirculacao,nutrients," \
     "dilution_auto_enabled,dilution_drain_relay,dilution_fill_relay," \
     "dilution_drain_slave_mac,dilution_fill_slave_mac,dilution_max_volume_l," \

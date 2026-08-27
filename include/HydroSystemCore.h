@@ -225,6 +225,8 @@ private:
     void markRecentlyClosedCloudAck(int supabaseCommandId);
 #if ENABLE_MQTT
     unsigned long mqttConnectedSinceMs;
+    bool mqttEcConfigReceived;
+    bool mqttPhConfigReceived;
     bool isMqttCommandPathStable() const;
     bool tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
                                    const uint8_t* slaveMac, int relayNumber, bool currentState,
@@ -297,10 +299,15 @@ private:
     void checkSupabaseRules();  // sync config only (decision_rules → LittleFS)
     bool checkECConfigFromSupabase();  // GET ec_config_view — true se HTTPS rodou
     bool checkPHConfigFromSupabase();  // GET ph_config_view
+    bool applyECConfig(const ECConfig& config, const char* via);
+    bool applyPHConfig(const PHConfig& config, const char* via);
+    bool parseMqttEcConfigJson(const char* json, size_t len, ECConfig& config);
+    bool parseMqttPhConfigJson(const char* json, size_t len, PHConfig& config);
     const char* httpsConfigPollSkipReason();
     void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "https");
     
-    static void mqttCommandReceived(const char* payload, size_t length, void* userData);
+    static void mqttIncomingReceived(const char* topic, const char* payload, size_t length, void* userData);
+    void handleMqttIncoming(const char* topic, const char* payload, size_t length);
     void handleMqttCommandPayload(const char* payload, size_t length);
     unsigned long resolveCommandPollIntervalMs() const;
     

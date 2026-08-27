@@ -36,10 +36,16 @@ topic read hidrowave/+/relay/state
 
 user hidrowave
 topic write hidrowave/+/command
+topic write hidrowave/+/ec/config
+topic write hidrowave/+/ph/config
 topic read hidrowave/+/#
+
+# Prod 27/08: users mqtt_<device_id> (não mqtt_esp). Mapa: ACL_MAPA_FUNCIONALIDADES_27AGO2026.md
 
 user mqtt_esp
 topic read hidrowave/%c/command
+topic read hidrowave/%c/ec/config
+topic read hidrowave/%c/ph/config
 topic write hidrowave/%c/#
 ```
 

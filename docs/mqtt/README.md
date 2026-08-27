@@ -29,6 +29,8 @@ Arquitetura **híbrida MQTT + Supabase**: integridade e sync primeiro; WebSocket
 | [10_REQUISITOS_CONFIABILIDADE.md](./10_REQUISITOS_CONFIABILIDADE.md) | Critérios de aceite |
 | [11_ANALISE_BROKER_JOURNAL.md](./11_ANALISE_BROKER_JOURNAL.md) | Bancada: `journalctl --no-pager` no bridge/Mosquitto |
 | [HANDOFF_ACL_FLEET_VALIDATION.md](./HANDOFF_ACL_FLEET_VALIDATION.md) | Validar ACL flota `mqtt_esp` + `%c` (não em produção) |
+| [ACL_MAPA_FUNCIONALIDADES_27AGO2026.md](./ACL_MAPA_FUNCIONALIDADES_27AGO2026.md) | ACL vivo vs objetivo; mapa relés + Auto EC/pH config |
+| [HANDOFF_UPLOAD_LIGHTSAIL.md](./HANDOFF_UPLOAD_LIGHTSAIL.md) | Copiar/pegar: PEM → SCP ACL + index.js → Mosquitto/bridge |
 | [../handoffs/HANDOFF_GERAL_SESSAO_22AGO2026.md](../handoffs/HANDOFF_GERAL_SESSAO_22AGO2026.md) | Sessão ago 2026: ESP-NOW, Atlas UI, MQTT, ACL |
 
 ## Templates infra
