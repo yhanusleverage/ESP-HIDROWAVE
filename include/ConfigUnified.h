@@ -55,7 +55,7 @@
 #ifndef NUM_RELAYS
 #define NUM_RELAYS 16
 #endif
-#define RELAY_TIMER_MAX 3600  // 1 hora em segundos
+#define RELAY_TIMER_MAX 86400  // 24 h (ciclo / timer)
 #define RELAY_SAFETY_TIMEOUT 7200  // 2 horas máximo
 
 // ===== CONFIGURAÇÕES DE SENSORES =====

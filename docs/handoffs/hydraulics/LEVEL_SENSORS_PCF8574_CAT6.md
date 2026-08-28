@@ -42,7 +42,6 @@ Cable físico: **P0 = arriba**, **P3 = abajo**. Lógico producto: L1=base vía `
 |------|----------|------|
 | Niveles | 0 0 0 | **0x20** |
 | Relés dosagem | 1 0 0 | **0x24** |
-| LCD típico | 1 1 1 | 0x27 |
 
 ---
 

@@ -57,8 +57,13 @@ SupabaseClient::SupabaseClient() :
     isConnected(false),
     lastMasterCommandCheck(0),
     lastSlaveCommandCheck(0),
+#if !COMMAND_POLL_HTTPS_DISABLED
     commandPollIntervalMs(COMMAND_POLL_INTERVAL_MS),
     commandPollQuiet(true),
+#else
+    commandPollIntervalMs(0),
+    commandPollQuiet(true),
+#endif
     requestMutex(nullptr),        // ✅ NOVO: Mutex inicializado como nullptr
     commandCheckMutex(nullptr) {   // ✅ NOVO: Mutex inicializado como nullptr
 }
@@ -727,6 +732,7 @@ String SupabaseClient::buildDeviceStatusPayload(const DeviceStatusData& status) 
     return payload;
 }
 
+#if !COMMAND_POLL_HTTPS_DISABLED
 bool SupabaseClient::checkForCommands(RelayCommand* commands, int maxCommands, int& commandCount) {
     // ✅ NOVO: Proteger com mutex para thread-safety
     if (commandCheckMutex == nullptr) {
@@ -1098,8 +1104,10 @@ bool SupabaseClient::checkForCommands(RelayCommand* commands, int maxCommands, i
     
     return true;
 }
+#endif  // !COMMAND_POLL_HTTPS_DISABLED
 
 // ✅ NOVO: Buscar comandos Master usando RPC atômica
+#if !COMMAND_POLL_HTTPS_DISABLED
 bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxCommands, int& commandCount) {
     if (secureClient == nullptr) {
         setError("Cliente SSL não inicializado");
@@ -1561,8 +1569,10 @@ bool SupabaseClient::checkForMasterCommands(RelayCommand* commands, int maxComma
     
     return true;
 }
+#endif  // !COMMAND_POLL_HTTPS_DISABLED
 
 // ✅ NOVO: Buscar comandos Slave usando RPC atômica
+#if !COMMAND_POLL_HTTPS_DISABLED
 bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxCommands, int& commandCount) {
     if (secureClient == nullptr) {
         setError("Cliente SSL não inicializado");
@@ -2032,7 +2042,9 @@ bool SupabaseClient::checkForSlaveCommands(RelayCommand* commands, int maxComman
     
     return true;
 }
+#endif  // !COMMAND_POLL_HTTPS_DISABLED
 
+#if !COMMAND_POLL_HTTPS_DISABLED
 bool SupabaseClient::markCommandSent(int commandId, bool isSlave) {
     (void)isSlave;
     if (secureClient == nullptr) {
@@ -2063,6 +2075,7 @@ bool SupabaseClient::markCommandSent(int commandId, bool isSlave) {
     
     return (httpCode >= 200 && httpCode < 300);
 }
+#endif  // !COMMAND_POLL_HTTPS_DISABLED
 
 bool SupabaseClient::markCommandCompleted(int commandId, bool currentState, bool isSlave) {
     (void)isSlave;
@@ -3517,6 +3530,7 @@ bool SupabaseClient::initMutexes() {
     return true;
 }
 
+#if !MQTT_CONFIG_HTTPS_DISABLED
 // ✅ Buscar EC Config read-only (GET ec_config_view) — NÃO usar activate_auto_ec no poll
 // activate_auto_ec força auto_enabled=true; reservado ao botão "Ativar Auto EC" no frontend
 bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
@@ -3945,6 +3959,8 @@ bool SupabaseClient::getECConfigFromSupabase(ECConfig& config) {
     return true;
 }
 
+#endif  // !MQTT_CONFIG_HTTPS_DISABLED
+
 void SupabaseClient::cleanupMutexes() {
     if (requestMutex != nullptr) {
         vSemaphoreDelete(requestMutex);
@@ -4138,6 +4154,7 @@ bool SupabaseClient::patchBootInterrupted(const String& deviceId, bool interrupt
     return code >= 200 && code < 300;
 }
 
+#if !MQTT_CONFIG_HTTPS_DISABLED
 bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     config.isValid = false;
     if (!isConnected || !isReady()) return false;
@@ -4211,6 +4228,7 @@ bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     config.isValid = true;
     return true;
 }
+#endif  // !MQTT_CONFIG_HTTPS_DISABLED
 
 bool SupabaseClient::insertPhDosage(const String& deviceId, const String& sequenceId,
                                       const String& direction, int relayNumber,
@@ -4327,6 +4345,7 @@ bool SupabaseClient::insertPhControllerMetric(const String& deviceId,
     return insert("ph_controller_metrics", payload);
 }
 
+#if !GAIN_PATCH_HTTPS_DISABLED
 bool SupabaseClient::patchPhConfigGains(const String& deviceId, float kAcid, float kBase,
                                         bool clearResetFlag) {
     if (!isReady()) return false;
@@ -4407,4 +4426,5 @@ bool SupabaseClient::patchEcConfigGain(const String& deviceId, float kValue) {
     }
     return patchOk;
 }
+#endif  // !GAIN_PATCH_HTTPS_DISABLED
  

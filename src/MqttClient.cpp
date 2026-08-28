@@ -97,6 +97,8 @@ bool MqttClientWrapper::begin(const String& id) {
     phDoseTopic = String("hidrowave/") + deviceId + "/ph_dose";
     ecMetricTopic = String("hidrowave/") + deviceId + "/ec_metric";
     phMetricTopic = String("hidrowave/") + deviceId + "/ph_metric";
+    ecGainTopic = String("hidrowave/") + deviceId + "/ec_gain";
+    phGainTopic = String("hidrowave/") + deviceId + "/ph_gain";
     ecDilutionTopic = String("hidrowave/") + deviceId + "/ec_dilution";
     commandAckTopic = String("hidrowave/") + deviceId + "/command_ack";
     relayStateTopic = String("hidrowave/") + deviceId + "/relay/state";
@@ -118,11 +120,12 @@ bool MqttClientWrapper::begin(const String& id) {
     serializeJson(lwtDoc, lwtPayload, sizeof(lwtPayload));
 
     Serial.printf("[MQTT] Broker %s:%d user=%s\n", MQTT_HOST, MQTT_PORT, mqttUsername.c_str());
-    Serial.printf("[MQTT] topics telemetry=%s levels=%s heartbeat=%s status=%s command=%s ec_op=%s dose=%s ph_op=%s ph_dose=%s ec_metric=%s ph_metric=%s\n",
+    Serial.printf("[MQTT] topics telemetry=%s levels=%s heartbeat=%s status=%s command=%s ec_op=%s dose=%s ph_op=%s ph_dose=%s ec_metric=%s ph_metric=%s ec_gain=%s ph_gain=%s\n",
                   telemetryTopic.c_str(), levelsTopic.c_str(), heartbeatTopic.c_str(), statusTopic.c_str(),
                   commandTopic.c_str(), ecOperationTopic.c_str(), doseTopic.c_str(),
                   phOperationTopic.c_str(), phDoseTopic.c_str(),
-                  ecMetricTopic.c_str(), phMetricTopic.c_str());
+                  ecMetricTopic.c_str(), phMetricTopic.c_str(),
+                  ecGainTopic.c_str(), phGainTopic.c_str());
     return ensureConnected();
 }
 
@@ -638,6 +641,59 @@ bool MqttClientWrapper::publishPhMetric(const MqttPhMetricReading& reading) {
                       reading.errorH, reading.doseRealMl, reading.adjustmentApplied ? 1 : 0);
     } else {
         Serial.println("[MQTT] ph_metric publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishEcGain(float kValue) {
+    if (!mqtt.connected() || kValue <= 0.0f) {
+        return false;
+    }
+
+    StaticJsonDocument<192> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ts"] = (uint32_t)(millis() / 1000UL);
+    doc["k_value"] = round(kValue * 10000.0) / 10000.0;
+
+    char payload[192];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(ecGainTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ec_gain k_value=%.4f\n", kValue);
+    } else {
+        Serial.println("[MQTT] ec_gain publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishPhGain(float kAcid, float kBase) {
+    if (!mqtt.connected() || kAcid <= 0.0f || kBase <= 0.0f) {
+        return false;
+    }
+
+    StaticJsonDocument<256> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ts"] = (uint32_t)(millis() / 1000UL);
+    doc["k_acid"] = kAcid;
+    doc["k_base"] = kBase;
+
+    char payload[256];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(phGainTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ph_gain k_acid=%.3e k_base=%.3e\n", kAcid, kBase);
+    } else {
+        Serial.println("[MQTT] ph_gain publish failed");
     }
     return published;
 }

@@ -193,6 +193,9 @@ void HydroSupaManager::updateDeviceStatus() {
 }
 
 void HydroSupaManager::checkHttpCommands() {
+#if COMMAND_POLL_HTTPS_DISABLED
+    return;
+#else
     if (!httpClient.isReady()) return;
     
     RelayCommand commands[5];
@@ -205,6 +208,7 @@ void HydroSupaManager::checkHttpCommands() {
             processCommand(commands[i], "HTTP");
         }
     }
+#endif  // !COMMAND_POLL_HTTPS_DISABLED
 }
 
 void HydroSupaManager::handleWebSocketCommand(int relay, String action, int duration) {

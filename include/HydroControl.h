@@ -3,7 +3,6 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include "Config.h"
 #if HIDRO_ENABLE_DS18B20_FALLBACK
 #include <OneWire.h>
@@ -345,7 +344,6 @@ public:
 
 private:
     // Hardware
-    LiquidCrystal_I2C lcd;
 #if HIDRO_ENABLE_DS18B20_FALLBACK
     OneWire oneWire;
     DallasTemperature sensors;
@@ -551,7 +549,6 @@ private:
     void pollDiscreteLevels();
     void refreshTankLevelOkFromAggregate();
     void loadLevelInterlockModeFromNVS();
-    void updateDisplay();
     void checkRelayTimers();
     void checkAutoEC();
     void checkAutoPH();  // ✅ Verificar e ajustar pH automaticamente

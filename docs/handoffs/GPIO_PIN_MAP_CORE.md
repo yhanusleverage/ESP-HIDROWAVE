@@ -25,7 +25,7 @@ Temp agua = **pH Modbus** (`reg0`). GPIO4 **no** es DS18 en PCB: es **flujo**.
 | Bornes / J | Señal | GPIO / bus | Notas |
 |------------|-------|------------|-------|
 | J-LED | LED_STATUS | GPIO2 | Built-in / LED |
-| J-I2C | SDA / SCL / 3V3 / GND | 21 / 22 | PCF + LCD |
+| J-I2C | SDA / SCL / 3V3 / GND | 21 / 22 | PCF8574 ×2 (niveles + relés) |
 | J-RS485 | DI / DE_RE / RO + A/B/GND/5V | 23 / 32 / 34 | pH + temp agua |
 | J-EC | EC_ADC | GPIO33 | EC analógico |
 | **J-FLOW** | **YF-B5 5V / GND / signal** | **GPIO4** | **Divisor 10k serie + 20k GND → ~3.3 V** |
@@ -63,7 +63,7 @@ Firmware: `INPUT_PULLUP` + FALLING (paridad ESP-SENSORS). Idle sin flujo: **`lvl
 | 2 | `STATUS_LED_PIN` | LED |
 | **4** | **`FLOW_SENSOR_PIN`** | **YFB5** |
 | 15 | `DHT_PIN` | DHT opcional |
-| 21 / 22 | I2C | PCF + LCD |
+| 21 / 22 | I2C | PCF8574 @ 0x20 (niveles) + 0x24 (relés) |
 | 23 / 32 / 34 | RS485 | pH Modbus |
 | 25 | `WATER_TEMP_PIN` | NC |
 | 33 | `TDS_PIN` | EC ADC |
@@ -84,8 +84,7 @@ Firmware: `INPUT_PULLUP` + FALLING (paridad ESP-SENSORS). Idle sin flujo: **`lvl
 | Addr | Rol |
 |------|-----|
 | 0x20 | L1–L4 NPN (P3=base … P0=topo) |
-| 0x24 | Dosadores (PCB); alinear `RELAY_PIN_MAPPING` si aún apunta 0x20 |
-| 0x27 | LCD |
+| 0x24 | Dosadores / relés peristálticos (P0–P7) |
 
 ```
 ESP32 Core

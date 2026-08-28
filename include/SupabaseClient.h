@@ -167,18 +167,15 @@ public:
     // Método genérico para inserir dados
     bool insert(const String& table, const String& jsonData);
     
-    // Receber comandos de Supabase
+    // Receber comandos de Supabase (poll HTTPS — desativado se COMMAND_POLL_HTTPS_DISABLED)
+#if !COMMAND_POLL_HTTPS_DISABLED
     bool checkForCommands(RelayCommand* commands, int maxCommands, int& commandCount);
-    
-    // ✅ NOVO: Funções RPC atômicas para buscar comandos
     bool checkForMasterCommands(RelayCommand* commands, int maxCommands, int& commandCount);
     bool checkForSlaveCommands(RelayCommand* commands, int maxCommands, int& commandCount);
-
     void setCommandPollIntervalMs(unsigned long ms) { commandPollIntervalMs = ms; }
     void setCommandPollQuiet(bool quiet) { commandPollQuiet = quiet; }
-    
-    // ✅ NOVO: Marcar comandos com suporte para Master/Slave
     bool markCommandSent(int commandId, bool isSlave = false);
+#endif
     bool markCommandCompleted(int commandId, bool currentState = false, bool isSlave = false);
     bool completeRelayCommand(int commandId, bool currentState,
                               const String& slaveMac = "",
@@ -218,9 +215,11 @@ public:
                                const String& slaveDeviceId, int relayNumber, 
                                bool state, bool hasTimer = false, int remainingTime = 0);
     
-    // ✅ NOVO: Buscar EC Config do Supabase via RPC activate_auto_ec
+    // ✅ NOVO: Buscar EC Config — desativado (MQTT_CONFIG_HTTPS_DISABLED). Usar MQTT ec/config.
+#if !MQTT_CONFIG_HTTPS_DISABLED
     bool getECConfigFromSupabase(ECConfig& config);
     bool getPHConfigFromSupabase(PHConfig& config);
+#endif
 
     /** Registra dosagem executada (tabela nutrient_dosages). */
     bool insertNutrientDosage(const String& deviceId, const String& sequenceId,
@@ -271,10 +270,11 @@ public:
                                   bool adjustmentNeeded, bool adjustmentApplied,
                                   const String& sequenceId);
 
+#if !GAIN_PATCH_HTTPS_DISABLED
     bool patchPhConfigGains(const String& deviceId, float kAcid, float kBase,
                             bool clearResetFlag = false);
-
     bool patchEcConfigGain(const String& deviceId, float kValue);
+#endif
 
     // Utilitários
     bool testConnection();

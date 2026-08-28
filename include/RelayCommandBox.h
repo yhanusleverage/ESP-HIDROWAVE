@@ -210,7 +210,7 @@ public:
 
 private:
     static const int RELAY_COUNT = 8;           // Número de relés do PCF8574
-    static const int DEFAULT_MAX_DURATION = 3600; // Duração máxima padrão (1 hora)
+    static const int DEFAULT_MAX_DURATION = 86400; // 24 h (ciclo luz / timer longo)
     
     PCF8574 pcf8574;                          // Instância do PCF8574
     uint8_t i2cAddress;                       // Endereço I2C do PCF8574
@@ -221,8 +221,8 @@ private:
 
     struct RelayCycleState {
         bool active;
-        uint16_t onSeconds;
-        uint16_t offSeconds;
+        uint32_t onSeconds;
+        uint32_t offSeconds;
         unsigned long phaseStartMs;
         bool phaseOn;
     };

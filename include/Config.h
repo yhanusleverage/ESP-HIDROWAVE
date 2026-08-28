@@ -2,7 +2,6 @@
 #define CONFIG_H
 
 #include <Arduino.h>
-#include "LCDConfig.h"
 #include "DebugConfig.h"
 
 // ===== CONFIGURAÇÕES DE ARQUIVOS =====
@@ -58,9 +57,15 @@
 #ifndef MQTT_COMMAND_BRIDGE_ONLY
 #define MQTT_COMMAND_BRIDGE_ONLY 1
 #endif
+// 1 = entrega de comandos só MQTT (sem poll HTTPS get_and_lock / relay_commands)
+#ifndef COMMAND_POLL_HTTPS_DISABLED
+#define COMMAND_POLL_HTTPS_DISABLED 1
+#endif
+#if !COMMAND_POLL_HTTPS_DISABLED
 // 1 = nao poll get_and_lock se MQTT conectado >60s
 #ifndef COMMAND_POLL_DISABLED_IF_MQTT_OK
 #define COMMAND_POLL_DISABLED_IF_MQTT_OK 1
+#endif
 #endif
 // 1 = nao sync HTTPS relay_master/slaves periodico se MQTT OK
 #ifndef RELAY_HTTPS_SYNC_DISABLED_IF_MQTT_OK
@@ -69,21 +74,26 @@
 #ifndef MQTT_COMMAND_PATH_STABLE_MS
 #define MQTT_COMMAND_PATH_STABLE_MS 60000UL
 #endif
-#ifndef CONFIG_POLL_INTERVAL_MQTT_OK_MS
-#define CONFIG_POLL_INTERVAL_MQTT_OK_MS 60000UL  // Auto EC/pH ON-OFF: 1 min (era 5 min; no starve por MQTT OK)
 #endif
-// 1 = Auto EC/pH config só MQTT retained (sem GET HTTPS)
-#ifndef MQTT_CONFIG_BRIDGE_ONLY
-#define MQTT_CONFIG_BRIDGE_ONLY 1
-#endif
+
+// Auto EC/pH: config só via MQTT retained (+ NVS local). GET HTTPS ec_config_view removido (heap/SSL).
 #ifndef MQTT_CONFIG_HTTPS_DISABLED
 #define MQTT_CONFIG_HTTPS_DISABLED 1
 #endif
+
+// Ganhos K aprendidos (EC k_value, pH k_acid/k_base): MQTT ec_gain/ph_gain → bridge → PATCH views.
+// 1 = sem PATCH HTTPS directo do ESP (NVS local sempre; cloud via MQTT).
+#ifndef GAIN_PATCH_HTTPS_DISABLED
+#define GAIN_PATCH_HTTPS_DISABLED 1
+#endif
+
+#if !MQTT_CONFIG_HTTPS_DISABLED
+#ifndef CONFIG_POLL_INTERVAL_MQTT_OK_MS
+#define CONFIG_POLL_INTERVAL_MQTT_OK_MS 60000UL
 #endif
 #ifndef CONFIG_POLL_PH_STAGGER_MS
-#define CONFIG_POLL_PH_STAGGER_MS 15000UL  // pH GET nunca no mesmo segundo que EC
+#define CONFIG_POLL_PH_STAGGER_MS 15000UL
 #endif
-// Poll HTTPS: só colunas que o firmware aplica (não select=*). nutrients inclui flowRate.
 #ifndef EC_CONFIG_POLL_SELECT
 #define EC_CONFIG_POLL_SELECT \
     "auto_enabled,base_dose,volume,total_ml,kp,ec_setpoint,tolerance," \
@@ -99,6 +109,7 @@
     "ml_per_ph_unit,ml_per_ph_unit_acid,ml_per_ph_unit_base,relay_ph_up,relay_ph_down," \
     "intervalo_auto_ph,tempo_recirculacao,aggressiveness,gain_alpha,k_acid,k_base," \
     "reset_k_gains,consumo_24h,pulse_ml,pulse_gap_sec"
+#endif
 #endif
 
 // ===== CONFIGURAÇÕES DA API =====
@@ -119,6 +130,7 @@
 // Configurações de API
 #define API_RETRY_ATTEMPTS 3UL
 #define SUPABASE_TIMEOUT_MS 7000       // ✅ Otimizado: 7s (reduzido de 10s para resposta mais rápida)
+#if !COMMAND_POLL_HTTPS_DISABLED
 #ifndef COMMAND_POLL_INTERVAL_MS
 #define COMMAND_POLL_INTERVAL_MS 20000  // fallback HTTPS quando MQTT offline
 #endif
@@ -127,6 +139,7 @@
 #endif
 #ifndef COMMAND_POLL_INTERVAL_MQTT_DOWN_MS
 #define COMMAND_POLL_INTERVAL_MQTT_DOWN_MS 20000UL
+#endif
 #endif
 
 // Headers HTTP para Supabase
@@ -253,7 +266,6 @@
 // ===== ENDEREÇOS I2C =====
 #define PCF8574_ADDR_1 0x20           // Primeiro PCF8574
 #define PCF8574_ADDR_2 0x24           // Segundo PCF8574 (se usado)
-#define LCD_ADDR 0x27                 // Display LCD
 
 // ===== INTERVALOS DE TEMPO (em milissegundos) =====
 #define SENSOR_READ_INTERVAL_MS 30000     // 30 segundos

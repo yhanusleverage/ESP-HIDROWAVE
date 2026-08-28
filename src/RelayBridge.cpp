@@ -55,6 +55,9 @@ void RelayBridge::update() {
 }
 
 void RelayBridge::processSupabaseCommands() {
+#if COMMAND_POLL_HTTPS_DISABLED
+    return;
+#else
     if (!enabled || !supabase || !supabase->isReady()) {
         return;
     }
@@ -130,6 +133,7 @@ void RelayBridge::processSupabaseCommands() {
         commandsProcessed++;
         logCommand(cmd, success);
     }
+#endif  // !COMMAND_POLL_HTTPS_DISABLED
 }
 
 bool RelayBridge::sendCommandToSlave(const RelayCommand& supaCmd, const uint8_t* slaveMac) {
@@ -182,7 +186,11 @@ bool RelayBridge::updateCommandStatus(int commandId, const String& status) {
     
     // Actualizar en Supabase según el status
     if (status == "sent") {
+#if !COMMAND_POLL_HTTPS_DISABLED
         return supabase->markCommandSent(commandId);
+#else
+        return false;
+#endif
     } else if (status == "completed") {
         return supabase->markCommandCompleted(commandId);
     } else if (status == "failed") {

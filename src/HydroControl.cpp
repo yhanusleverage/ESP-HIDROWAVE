@@ -7,13 +7,12 @@
 #include <cstring>
 
 HydroControl::HydroControl()
-    : lcd(0x27, 16, 2)
+    : pcf1(0x20)  // Primeiro PCF8574
+    , pcf2(0x24)  // Segundo PCF8574
 #if HIDRO_ENABLE_DS18B20_FALLBACK
     , oneWire(TEMP_PIN)
     , sensors(&oneWire)
 #endif
-    , pcf1(0x20)  // Primeiro PCF8574
-    , pcf2(0x24)  // Segundo PCF8574
     , pcf1_ok(false)
     , pcf2_ok(false)
     , tankLevelOk(false)
@@ -189,15 +188,14 @@ HydroControl::HydroControl()
  * 
  * 1. Wire.begin() - OBRIGATÓRIO PRIMEIRO (inicializa barramento I2C)
  * 2. Escanear dispositivos I2C (debug)
- * 3. lcd.begin(16, 2) - LCD I2C
- * 4. DS18/OneWire — OFF permanente (HIDRO_ENABLE_DS18B20_FALLBACK=0); GPIO4 = YF-B5
- * 5. Temp agua producción = Modbus pH reg0
- * 6. pHSensor / PhModbusSensor
- * 7. ecSensor = new EcAnalogSensor() - Sensor EC analógico
- * 8. tankSensor / DiscreteLevelBank - Sensor de nível
- * 9. delay(100) - Estabilizar barramento I2C
- * 10. pcf1.begin(0xFF) - PCF8574 #1 (niveles) — NUNCA begin(false) (= write 0x00)
- * 11. pcf2.begin(0xFF) - PCF8574 #2 (relés)
+ * 3. DS18/OneWire — OFF permanente (HIDRO_ENABLE_DS18B20_FALLBACK=0); GPIO4 = YF-B5
+ * 4. Temp agua producción = Modbus pH reg0
+ * 5. pHSensor / PhModbusSensor
+ * 6. ecSensor = new EcAnalogSensor() - Sensor EC analógico
+ * 7. tankSensor / DiscreteLevelBank - Sensor de nível
+ * 8. delay(100) - Estabilizar barramento I2C
+ * 9. pcf1.begin(0xFF) - PCF8574 #1 (niveles) — NUNCA begin(false) (= write 0x00)
+ * 10. pcf2.begin(0xFF) - PCF8574 #2 (relés)
  * 
  * ⚠️ DEPENDÊNCIAS CRÍTICAS:
  * - Wire.begin() DEVE ser chamado PRIMEIRO
@@ -208,7 +206,7 @@ HydroControl::HydroControl()
  */
 bool HydroControl::begin() {
     // ⚠️ PASSO 1: Inicializar I2C uma única vez - OBRIGATÓRIO PRIMEIRO
-    // Por quê: Todos os dispositivos I2C (LCD, PCF8574) dependem do barramento I2C
+    // Por quê: PCF8574 depende do barramento I2C
     // ✅ CORREÇÃO CRÍTICA: Verificar se I2C já está iniciado antes de chamar Wire.begin()
     // Isso evita o erro "Bus already started in Master Mode"
     // ✅ PADRÃO ESP-NOW MASTERTASK: Usar static bool para garantir inicialização única
@@ -235,12 +233,6 @@ bool HydroControl::begin() {
             Serial.printf("✅ Dispositivo I2C encontrado no endereço 0x%02X\n", i);
         }
     }
-
-    // Inicializar LCD sem reiniciar I2C
-    // ✅ CORREÇÃO: LCD pode tentar inicializar I2C internamente, mas já está iniciado
-    lcd.begin(16, 2);  // Removido lcd.init() para evitar dupla inicialização
-    lcd.backlight();
-    lcd.print("Iniciando...");
 
     // Inicializar sensores
 #if HIDRO_ENABLE_DS18B20_FALLBACK
@@ -417,7 +409,6 @@ void HydroControl::update() {
 #endif
     }
 #endif
-    updateDisplay();
     checkRelayTimers();
     processPhAutoState();
     processDilution();
@@ -737,39 +728,10 @@ const char* HydroControl::getWaterLevelAggregate() const {
 #endif
 }
 
-void HydroControl::updateDisplay() {
-    lcd.clear();
-
-    String tempText = "Temp:";
-    if (tempValid && isfinite(temperature)) {
-        tempText += String(temperature, 1) + char(223) + "C";
-    } else {
-        tempText += "--";
-    }
-    lcd.setCursor((16 - tempText.length()) / 2, 0);
-    lcd.print(tempText);
-
-    lcd.setCursor(0, 1);
-    lcd.print("pH:");
-    if (phValid && isfinite(pH)) {
-        lcd.print(pH, 2);
-    } else {
-        lcd.print("--");
-    }
-
-    String ecText = "EC:";
-    if (ecValid && isfinite(ec)) {
-        ecText += String(ec, 0);
-    } else {
-        ecText += "--";
-    }
-    lcd.setCursor(16 - ecText.length(), 1);
-    lcd.print(ecText);
-}
-
 void HydroControl::showMessage(String msg) {
-    lcd.clear();
-    lcd.print(msg);
+    if (msg.length() > 0) {
+        Serial.printf("[Hydro] %s\n", msg.c_str());
+    }
 }
 
 static void logPcf8574BusScan() {
@@ -887,8 +849,6 @@ void HydroControl::updateSensorData(float temp, float humidity, float ph, float 
     pH = ph;
     ec = ecUsCm;
     ecValid = isfinite(ecUsCm) && isValidEcMicroSiemens(ecUsCm);
-    
-    updateDisplay();
 }
 
 void HydroControl::updateRelayTimers() {

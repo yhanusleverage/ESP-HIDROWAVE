@@ -92,7 +92,7 @@ static const AutoCommand DEFAULT_AUTO_COMMANDS[] = {
 // Usar RELAY_NAMES de DataTypes.h para evitar conflitos
 
 // Configurações de segurança
-#define RELAY_MAX_DURATION 3600              // 1 hora máximo
+#define RELAY_MAX_DURATION 86400             // 24 h (ciclo luz / timer)
 #define RELAY_SAFETY_TIMEOUT 300000          // 5 minutos timeout de segurança
 #define RELAY_EMERGENCY_STOP_RELAY 7         // Relé de parada de emergência
 

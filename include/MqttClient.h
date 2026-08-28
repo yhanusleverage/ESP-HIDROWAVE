@@ -183,6 +183,10 @@ public:
     bool publishPhDose(const MqttPhDoseReading& reading);
     bool publishEcMetric(const MqttEcMetricReading& reading);
     bool publishPhMetric(const MqttPhMetricReading& reading);
+    /** hidrowave/{id}/ec_gain — bridge → PATCH ec_config_view.k_value */
+    bool publishEcGain(float kValue);
+    /** hidrowave/{id}/ph_gain — bridge → PATCH ph_config_view k_acid/k_base */
+    bool publishPhGain(float kAcid, float kBase);
     bool publishCommandAck(const MqttCommandAckReading& reading);
     bool publishRelayState(const MqttRelayStateReading& reading);
 
@@ -206,6 +210,8 @@ private:
     String phDoseTopic;
     String ecMetricTopic;
     String phMetricTopic;
+    String ecGainTopic;
+    String phGainTopic;
     String ecDilutionTopic;
     String commandAckTopic;
     String relayStateTopic;
@@ -246,6 +252,8 @@ public:
     bool publishPhDose(const MqttPhDoseReading&) { return false; }
     bool publishEcMetric(const MqttEcMetricReading&) { return false; }
     bool publishPhMetric(const MqttPhMetricReading&) { return false; }
+    bool publishEcGain(float) { return false; }
+    bool publishPhGain(float, float) { return false; }
     bool publishCommandAck(const MqttCommandAckReading&) { return false; }
     bool publishRelayState(const MqttRelayStateReading&) { return false; }
     void setIncomingHandler(MqttIncomingHandler, void*) {}

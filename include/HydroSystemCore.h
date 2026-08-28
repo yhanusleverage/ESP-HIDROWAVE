@@ -54,7 +54,6 @@ private:
     unsigned long lastStatusSend;
     unsigned long lastRelayStatesSync;  // ✅ NOVO: Controle de sincronização unificada de relay states
     unsigned long lastStatusPrint;
-    unsigned long lastSupabaseCheck;
     unsigned long lastRulesCheck;      // ✅ NOVO: Controle de verificação de regras (decision_rules)
     unsigned long lastMemoryProtection;
     unsigned long lastMqttTelemetrySend;
@@ -69,7 +68,6 @@ private:
     unsigned long lastEcOperationIdleSync;
     unsigned long lastPhOperationSync;
     unsigned long lastPhOperationIdleSync;
-    unsigned long commandPollIntervalMs;
     MqttCommandDedup mqttCommandDedup;
 
     DecisionEngine decisionEngine;
@@ -293,23 +291,18 @@ public:
     
 private:
     // Operações principais
-    void checkSupabaseCommands();
     void applyBootPolicies();
     void initDecisionEngine();
     void checkSupabaseRules();  // sync config only (decision_rules → LittleFS)
-    bool checkECConfigFromSupabase();  // GET ec_config_view — true se HTTPS rodou
-    bool checkPHConfigFromSupabase();  // GET ph_config_view
     bool applyECConfig(const ECConfig& config, const char* via);
     bool applyPHConfig(const PHConfig& config, const char* via);
     bool parseMqttEcConfigJson(const char* json, size_t len, ECConfig& config);
     bool parseMqttPhConfigJson(const char* json, size_t len, PHConfig& config);
-    const char* httpsConfigPollSkipReason();
-    void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "https");
+    void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "mqtt");
     
     static void mqttIncomingReceived(const char* topic, const char* payload, size_t length, void* userData);
     void handleMqttIncoming(const char* topic, const char* payload, size_t length);
     void handleMqttCommandPayload(const char* payload, size_t length);
-    unsigned long resolveCommandPollIntervalMs() const;
     
     // ✅ FORK: Processamento separado por tipo de comando
     void processManualCommand(const RelayCommand& cmd, bool isSlave);      // Comando manual (botão)

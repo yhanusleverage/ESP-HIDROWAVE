@@ -34,7 +34,6 @@ AsyncTCP @ Core 1, stack 16 KB, prio 10           (mismo flag)
 | `HydroStateManager` | `src/HydroStateManager.cpp` | cada loop | CPU bajo | — |
 | `HydroSystemCore::loop` | `src/HydroSystemCore.cpp` | cada loop (activo) | CPU alto (orquesta red) | — |
 | `HydroControl::update` | `src/HydroControl.cpp` | cada loop | CPU / I2C / ADC | — |
-| LCD `updateDisplay` | `HydroControl.cpp` | **cada update (~10 ms)** | **I2C/CPU muy alto** | — |
 | PCF niveles L1–L4 | `DiscreteLevelBank` / `pollDiscreteLevels` | 200 ms | I2C | `LEVEL_POLL_MS` |
 | PCF relés | `HydroControl` setRelay | event + timers | I2C | — |
 | EC analógico | `EcAnalogSensor.cpp` | sample 200 ms; ventana ~6 s | ADC/CPU | — |
@@ -146,12 +145,11 @@ Rellenar filas nuevas al repetir A–D con slave online / MQTT OK.
 
 | Pri | Componente | Evidencia | Acción ahora |
 |-----|------------|-----------|--------------|
-| 1 | **HTTPS / SSL pool** | `sslBusy=1` frecuente; `min≈44 KB`; `maxAlloc≈45 KB` | Mantener gates heap; no bajar umbrales; revisar intervalos sync si `min` sigue bajando. **No throttle LCD aún.** |
-| 2 | **LCD I2C cada loop** | Sospecha teórica; en este run `loop/s` 19–28 (≥15) | **Watch only.** Throttle `updateDisplay` **solo si** idle A da `loop/s` &lt; 15 de forma estable. |
-| 3 | **ESP-NOW Core 0** | `espnow_hwm` ~6k words (holgado) | Sin cambio. |
-| 4 | **YF-B5 ISR + `[FLOW]`** | Idle limpio; soplar OK | Flow OK provisional; `FLOW_SERIAL_DEBUG=0` en prod para menos UART. |
-| 5 | **Modbus pH** | `0xE0`/`0xE2` (sonda/bus) | Fuera de recursos máquina; no es contención heap. |
-| 6 | **MQTT** | `rc=-2` timeout | Broker/red; no confundir con OOM. |
+| 1 | **HTTPS / SSL pool** | `sslBusy=1` frecuente; `min≈44 KB`; `maxAlloc≈45 KB` | Mantener gates heap; no bajar umbrales; revisar intervalos sync si `min` sigue bajando. |
+| 2 | **ESP-NOW Core 0** | `espnow_hwm` ~6k words (holgado) | Sin cambio. |
+| 3 | **YF-B5 ISR + `[FLOW]`** | Idle limpio; soplar OK | Flow OK provisional; `FLOW_SERIAL_DEBUG=0` en prod para menos UART. |
+| 4 | **Modbus pH** | `0xE0`/`0xE2` (sonda/bus) | Fuera de recursos máquina; no es contención heap. |
+| 5 | **MQTT** | `rc=-2` timeout | Broker/red; no confundir con OOM. |
 
 **No hacer (producto):** reabrir DS18/OneWire; tocar `LEVEL_SENSOR_PCF_PINS` / 4 levels; auto-K flujo por EC.
 
@@ -160,7 +158,6 @@ Rellenar filas nuevas al repetir A–D con slave online / MQTT OK.
 ## Fase 2 (fuera de este handoff)
 
 - CPU% por task (`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`)
-- Throttle de `updateDisplay` (si evidencia `loop/s`)
 - Refactor de intervalos HTTPS/MQTT
 
 ---

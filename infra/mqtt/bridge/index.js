@@ -11,6 +11,8 @@
  *   hidrowave/+/ph_dose         → INSERT ph_dosages
  *   hidrowave/+/ec_metric       → INSERT ec_controller_metrics
  *   hidrowave/+/ph_metric       → INSERT ph_controller_metrics
+ *   hidrowave/+/ec_gain         → PATCH ec_config_view.k_value (K aprendido firmware)
+ *   hidrowave/+/ph_gain         → PATCH ph_config_view k_acid/k_base
  */
 import 'dotenv/config';
 import mqtt from 'mqtt';
@@ -31,6 +33,8 @@ const TOPICS = [
   'hidrowave/+/ph_dose',
   'hidrowave/+/ec_metric',
   'hidrowave/+/ph_metric',
+  'hidrowave/+/ec_gain',
+  'hidrowave/+/ph_gain',
   'hidrowave/+/ec_dilution',
   'hidrowave/+/command_ack',
   'hidrowave/+/relay/state',
@@ -1591,6 +1595,125 @@ async function handlePhMetric(topic, message) {
   await insertPhMetric(validated.row);
 }
 
+async function handleEcGain(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'ec_gain');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateEcGain(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await patchEcConfigGain(validated.row);
+}
+
+async function handlePhGain(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'ph_gain');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validatePhGain(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await patchPhConfigGain(validated.row);
+}
+
+function validateEcGain(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const kValue = Number(payload.k_value);
+  if (!Number.isFinite(kValue) || kValue <= 0) {
+    return { ok: false, reason: 'k_value must be finite number > 0' };
+  }
+
+  return {
+    ok: true,
+    row: { deviceId, k_value: kValue },
+  };
+}
+
+function validatePhGain(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const kAcid = Number(payload.k_acid);
+  const kBase = Number(payload.k_base);
+  if (!Number.isFinite(kAcid) || kAcid <= 0) {
+    return { ok: false, reason: 'k_acid must be finite number > 0' };
+  }
+  if (!Number.isFinite(kBase) || kBase <= 0) {
+    return { ok: false, reason: 'k_base must be finite number > 0' };
+  }
+
+  return {
+    ok: true,
+    row: { deviceId, k_acid: kAcid, k_base: kBase },
+  };
+}
+
+async function patchEcConfigGain(row) {
+  const nowIso = new Date().toISOString();
+  const { error } = await supabase
+    .from('ec_config_view')
+    .update({ k_value: row.k_value, updated_at: nowIso })
+    .eq('device_id', row.deviceId);
+
+  if (error) {
+    console.error(`[bridge] ec_gain PATCH failed (${row.deviceId}):`, error.message);
+    return false;
+  }
+  console.log(`[bridge] ec_gain PATCH ec_config_view ${row.deviceId} k_value=${row.k_value}`);
+  return true;
+}
+
+async function patchPhConfigGain(row) {
+  const nowIso = new Date().toISOString();
+  const { error } = await supabase
+    .from('ph_config_view')
+    .update({
+      k_acid: row.k_acid,
+      k_base: row.k_base,
+      reset_k_gains: false,
+      updated_at: nowIso,
+    })
+    .eq('device_id', row.deviceId);
+
+  if (error) {
+    console.error(`[bridge] ph_gain PATCH failed (${row.deviceId}):`, error.message);
+    return false;
+  }
+  console.log(
+    `[bridge] ph_gain PATCH ph_config_view ${row.deviceId} k_acid=${row.k_acid} k_base=${row.k_base}`
+  );
+  return true;
+}
+
 function slaveDeviceIdFromMac(mac) {
   return `ESP32_SLAVE_${String(mac).replace(/:/g, '_')}`;
 }
@@ -2049,6 +2172,10 @@ client.on('message', (topic, message, packet) => {
       await handleEcMetric(topic, message);
     } else if (suffix === 'ph_metric') {
       await handlePhMetric(topic, message);
+    } else if (suffix === 'ec_gain') {
+      await handleEcGain(topic, message);
+    } else if (suffix === 'ph_gain') {
+      await handlePhGain(topic, message);
     } else if (suffix === 'ec_dilution') {
       await handleEcDilution(topic, message);
     } else if (suffix === 'command_ack') {

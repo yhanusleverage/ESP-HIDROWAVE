@@ -44,6 +44,8 @@ topic read hidrowave/+/ph_operation
 topic read hidrowave/+/ph_dose
 topic read hidrowave/+/ec_metric
 topic read hidrowave/+/ph_metric
+topic read hidrowave/+/ec_gain
+topic read hidrowave/+/ph_gain
 topic read hidrowave/+/ec_dilution
 topic read hidrowave/+/command_ack
 topic read hidrowave/+/relay/state

@@ -333,7 +333,7 @@ int RelayCommandBox::getRemainingTime(int relayNumber) const {
     if (cycleStates[relayNumber].active) {
         const RelayCycleState& c = cycleStates[relayNumber];
         unsigned long elapsed = (millis() - c.phaseStartMs) / 1000;
-        uint16_t phaseDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
+        uint32_t phaseDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
         int remaining = (int)phaseDuration - (int)elapsed;
         return remaining > 0 ? remaining : 0;
     }
@@ -508,8 +508,8 @@ bool RelayCommandBox::startCycle(int relayNumber, int onSeconds, int offSeconds)
     stopCycle(relayNumber);
 
     cycleStates[relayNumber].active = true;
-    cycleStates[relayNumber].onSeconds = (uint16_t)onSeconds;
-    cycleStates[relayNumber].offSeconds = (uint16_t)offSeconds;
+    cycleStates[relayNumber].onSeconds = (uint32_t)onSeconds;
+    cycleStates[relayNumber].offSeconds = (uint32_t)offSeconds;
     cycleStates[relayNumber].phaseOn = true;
     cycleStates[relayNumber].phaseStartMs = millis();
 
@@ -553,7 +553,7 @@ void RelayCommandBox::checkCycles() {
 
         RelayCycleState& c = cycleStates[i];
         unsigned long elapsed = (millis() - c.phaseStartMs) / 1000;
-        uint16_t phaseDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
+        uint32_t phaseDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
 
         relayStates[i].hasTimer = true;
         relayStates[i].startTime = c.phaseStartMs;
@@ -566,7 +566,7 @@ void RelayCommandBox::checkCycles() {
         c.phaseOn = !c.phaseOn;
         c.phaseStartMs = millis();
         bool newState = c.phaseOn;
-        uint16_t nextDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
+        uint32_t nextDuration = c.phaseOn ? c.onSeconds : c.offSeconds;
 
         relayStates[i].isOn = newState;
         relayStates[i].hasTimer = true;
