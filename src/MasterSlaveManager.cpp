@@ -323,25 +323,28 @@ TrustedSlave* MasterSlaveManager::findTrustedSlaveUnsafe(const uint8_t* macAddre
 }
 
 TrustedSlave* MasterSlaveManager::getTrustedSlave(const uint8_t* macAddress) {
-    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    TrustedSlave* found = nullptr;
+    if (!lookupTrustedSlave(macAddress, &found)) {
         logSlaveLink("mutex_timeout", macAddress);
-        return nullptr;
     }
-    
-    // Buscar slave
-    TrustedSlave* found = findTrustedSlaveUnsafe(macAddress);
-    
-    // ⚠️ PROBLEMA: Retornar ponteiro con mutex bloqueado causa deadlocks
-    // SOLUÇÃO: Siempre liberar mutex. El llamador debe tomar mutex si necesita modificar.
-    // NOTA: Esto es seguro porque retornamos un puntero a un objeto en el vector,
-    // pero el vector puede cambiar. El llamador debe usar el puntero inmediatamente
-    // o tomar el mutex antes de usarlo.
-    
-    xSemaphoreGive(trustedSlavesMutex);  // ✅ SIEMPRE liberar mutex
-    
-    // ⚠️ ADVERTENCIA: El puntero retornado puede volverse inválido si el vector cambia
-    // El llamador debe tomar el mutex antes de usar el puntero para modificar
     return found;
+}
+
+bool MasterSlaveManager::lookupTrustedSlave(const uint8_t* macAddress, TrustedSlave** out) {
+    if (out) {
+        *out = nullptr;
+    }
+    if (!macAddress || !out) {
+        return false;
+    }
+
+    if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
+
+    *out = findTrustedSlaveUnsafe(macAddress);
+    xSemaphoreGive(trustedSlavesMutex);
+    return true;
 }
 
 std::vector<TrustedSlave> MasterSlaveManager::getAllTrustedSlaves() {
@@ -515,7 +518,11 @@ int MasterSlaveManager::getOnlineSlaveCount() {
 bool MasterSlaveManager::sendPingToSlave(const uint8_t* macAddress) {
     if (!initialized || !espNowController) return false;
     
-    TrustedSlave* slave = getTrustedSlave(macAddress);
+    TrustedSlave* slave = nullptr;
+    if (!lookupTrustedSlave(macAddress, &slave)) {
+        logSlaveLink("mutex_timeout", macAddress);
+        return false;
+    }
     if (!slave) {
         Serial.println("❌ Slave não encontrado na lista confiável: " + ESPNowController::macToString(macAddress));
         return false;
@@ -557,7 +564,11 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
     // ✅ MUDANÇA 1: Retornar 0 em vez de false (compatível: 0 = false, >0 = true)
     if (!initialized || !espNowController) return 0;
     
-    TrustedSlave* slave = getTrustedSlave(macAddress);
+    TrustedSlave* slave = nullptr;
+    if (!lookupTrustedSlave(macAddress, &slave)) {
+        logSlaveLink("mutex_timeout", macAddress);
+        return 0;
+    }
     if (!slave) {
         Serial.println("❌ Slave não encontrado na lista confiável: " + ESPNowController::macToString(macAddress));
         return 0;  // ✅ MUDANÇA 2: 0 em vez de false

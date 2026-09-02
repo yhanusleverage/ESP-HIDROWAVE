@@ -80,6 +80,12 @@
 #ifndef MQTT_COMMAND_PATH_STABLE_MS
 #define MQTT_COMMAND_PATH_STABLE_MS 60000UL
 #endif
+#ifndef MQTT_RELAY_STATE_DEBOUNCE_MS
+#define MQTT_RELAY_STATE_DEBOUNCE_MS 300UL
+#endif
+#ifndef MQTT_RELAY_STATE_URGENT_MS
+#define MQTT_RELAY_STATE_URGENT_MS 0UL
+#endif
 // 1 = cloud runtime só MQTT (telemetria + heartbeat). Sem HTTPS procedural se broker cair.
 // Boot: autoRegisterDevice e patchBootInterrupted mantidos.
 #ifndef HTTPS_RUNTIME_FALLBACK_DISABLED

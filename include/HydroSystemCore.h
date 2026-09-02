@@ -235,7 +235,36 @@ private:
                                    const char* status = "completed");
     void publishSlaveRelayStateMqtt(const uint8_t* slaveMac, int fallbackRelay = -1,
                                     bool fallbackState = false, bool heartbeat = false);
+    void scheduleSlaveRelayStateMqtt(const uint8_t* slaveMac, bool urgent, bool heartbeat);
+    void flushPendingRelayStateMqtt();
     void forceSlaveRelayMqttFullSync();
+
+    static const size_t RELAY_STATE_COALESCE_SLOTS = 4;
+    struct PendingRelayStateSlot {
+        uint8_t mac[6];
+        unsigned long dueMs;
+        bool active;
+        bool urgent;
+        bool heartbeat;
+    };
+    struct LastPublishedRelayState {
+        uint8_t mac[6];
+        bool valid;
+        bool states[8];
+        bool timers[8];
+        int remaining[8];
+        bool linkOnline;
+        uint8_t numRelays;
+    };
+    PendingRelayStateSlot pendingRelayStateSlots_[RELAY_STATE_COALESCE_SLOTS];
+    LastPublishedRelayState lastPublishedRelayState_[RELAY_STATE_COALESCE_SLOTS];
+
+    int findRelayStateCoalesceSlot(const uint8_t* mac) const;
+    int allocRelayStateCoalesceSlot(const uint8_t* mac);
+    bool isRelayStateSnapshotUnchanged(const uint8_t* mac, const bool states[8], const bool timers[8],
+                                       const int remaining[8], uint8_t numRelays, bool linkOnline) const;
+    void rememberPublishedRelayState(const uint8_t* mac, const bool states[8], const bool timers[8],
+                                     const int remaining[8], uint8_t numRelays, bool linkOnline);
 #endif
     
 public:

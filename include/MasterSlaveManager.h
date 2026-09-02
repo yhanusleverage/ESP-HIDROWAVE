@@ -249,6 +249,9 @@ public:
      */
     TrustedSlave* getTrustedSlave(const uint8_t* macAddress);
 
+    /** false = mutex timeout; true = mutex held (*out may be nullptr if absent) */
+    bool lookupTrustedSlave(const uint8_t* macAddress, TrustedSlave** out);
+
     /**
      * @brief Registra contato radio com slave (atualiza lastSeen + ONLINE)
      */

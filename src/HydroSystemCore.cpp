@@ -234,6 +234,10 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     memset(pendingCloudAckQueue, 0, sizeof(pendingCloudAckQueue));
     memset(recentlyClosedSupabaseIds, 0, sizeof(recentlyClosedSupabaseIds));
     memset(recentlyClosedAtMs, 0, sizeof(recentlyClosedAtMs));
+#if ENABLE_MQTT
+    memset(pendingRelayStateSlots_, 0, sizeof(pendingRelayStateSlots_));
+    memset(lastPublishedRelayState_, 0, sizeof(lastPublishedRelayState_));
+#endif
     lastMqttWaterLevel[0] = '\0';
     lastMqttInterlockMode[0] = '\0';
     // Log de dependências injetadas
@@ -326,7 +330,7 @@ void HydroSystemCore::wireMasterManagerIntegration() {
             }
         }
 #if ENABLE_MQTT
-        publishSlaveRelayStateMqtt(mac, -1, false, false);
+        scheduleSlaveRelayStateMqtt(mac, false, false);
 #endif
     });
 
@@ -738,6 +742,8 @@ void HydroSystemCore::loop() {
         forceSlaveRelayMqttFullSync();
         lastSlaveRelayFullSync = now;
     }
+
+    flushPendingRelayStateMqtt();
 #endif
     
     // ===== DEBUG PERIÓDICO (30s) =====
@@ -3319,7 +3325,7 @@ bool HydroSystemCore::tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t 
     }
 
     if (slaveMac) {
-        publishSlaveRelayStateMqtt(slaveMac, relayNumber, currentState);
+        scheduleSlaveRelayStateMqtt(slaveMac, true, false);
     }
     return true;
 }
@@ -3342,13 +3348,185 @@ void HydroSystemCore::forceSlaveRelayMqttFullSync() {
         esp_task_wdt_reset();
 
         if (gotStatus) {
-            publishSlaveRelayStateMqtt(slave.macAddress, -1, false, false);
             Serial.printf("[SYNC-MQTT] full relay_states mac=%s\n",
                           ESPNowController::macToString(slave.macAddress).c_str());
         } else {
             Serial.printf("[SYNC-MQTT] ALL_RELAYS timeout mac=%s\n",
                           ESPNowController::macToString(slave.macAddress).c_str());
         }
+    }
+}
+
+int HydroSystemCore::findRelayStateCoalesceSlot(const uint8_t* mac) const {
+    if (!mac) {
+        return -1;
+    }
+    for (size_t i = 0; i < RELAY_STATE_COALESCE_SLOTS; i++) {
+        if (pendingRelayStateSlots_[i].active && memcmp(pendingRelayStateSlots_[i].mac, mac, 6) == 0) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+int HydroSystemCore::allocRelayStateCoalesceSlot(const uint8_t* mac) {
+    if (!mac) {
+        return -1;
+    }
+
+    const int existing = findRelayStateCoalesceSlot(mac);
+    if (existing >= 0) {
+        return existing;
+    }
+
+    for (size_t i = 0; i < RELAY_STATE_COALESCE_SLOTS; i++) {
+        if (!pendingRelayStateSlots_[i].active) {
+            return static_cast<int>(i);
+        }
+    }
+
+    int victim = 0;
+    unsigned long oldestDue = pendingRelayStateSlots_[0].dueMs;
+    for (size_t i = 1; i < RELAY_STATE_COALESCE_SLOTS; i++) {
+        if (pendingRelayStateSlots_[i].dueMs > oldestDue) {
+            oldestDue = pendingRelayStateSlots_[i].dueMs;
+            victim = static_cast<int>(i);
+        }
+    }
+    return victim;
+}
+
+bool HydroSystemCore::isRelayStateSnapshotUnchanged(const uint8_t* mac, const bool states[8],
+                                                    const bool timers[8], const int remaining[8],
+                                                    uint8_t numRelays, bool linkOnline) const {
+    if (!mac || !states || !timers || !remaining) {
+        return false;
+    }
+
+    for (size_t i = 0; i < RELAY_STATE_COALESCE_SLOTS; i++) {
+        const LastPublishedRelayState& last = lastPublishedRelayState_[i];
+        if (!last.valid || memcmp(last.mac, mac, 6) != 0) {
+            continue;
+        }
+        if (last.linkOnline != linkOnline || last.numRelays != numRelays) {
+            return false;
+        }
+        const uint8_t n = numRelays > 8 ? 8 : numRelays;
+        for (uint8_t r = 0; r < n; r++) {
+            if (last.states[r] != states[r] || last.timers[r] != timers[r] ||
+                last.remaining[r] != remaining[r]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+void HydroSystemCore::rememberPublishedRelayState(const uint8_t* mac, const bool states[8],
+                                                  const bool timers[8], const int remaining[8],
+                                                  uint8_t numRelays, bool linkOnline) {
+    if (!mac || !states || !timers || !remaining) {
+        return;
+    }
+
+    size_t slot = 0;
+    for (; slot < RELAY_STATE_COALESCE_SLOTS; slot++) {
+        if (lastPublishedRelayState_[slot].valid &&
+            memcmp(lastPublishedRelayState_[slot].mac, mac, 6) == 0) {
+            break;
+        }
+    }
+    if (slot >= RELAY_STATE_COALESCE_SLOTS) {
+        for (size_t i = 0; i < RELAY_STATE_COALESCE_SLOTS; i++) {
+            if (!lastPublishedRelayState_[i].valid) {
+                slot = i;
+                break;
+            }
+        }
+    }
+
+    LastPublishedRelayState& last = lastPublishedRelayState_[slot];
+    memcpy(last.mac, mac, 6);
+    last.valid = true;
+    last.linkOnline = linkOnline;
+    last.numRelays = numRelays > 8 ? 8 : numRelays;
+    for (uint8_t r = 0; r < 8; r++) {
+        last.states[r] = states[r];
+        last.timers[r] = timers[r];
+        last.remaining[r] = remaining[r];
+    }
+}
+
+void HydroSystemCore::scheduleSlaveRelayStateMqtt(const uint8_t* slaveMac, bool urgent, bool heartbeat) {
+    if (!slaveMac || !masterManager || !mqttClient.isConnected()) {
+        return;
+    }
+
+    if (!heartbeat) {
+        bool states[8] = {false};
+        bool timers[8] = {false};
+        int remaining[8] = {0};
+        uint8_t n = 8;
+        bool linkOnline = false;
+        uint16_t linkLastSeenS = 0;
+        if (masterManager->readSlaveRelaySnapshot(slaveMac, states, timers, remaining, n,
+                                                  linkOnline, linkLastSeenS) &&
+            isRelayStateSnapshotUnchanged(slaveMac, states, timers, remaining, n, linkOnline)) {
+            return;
+        }
+    }
+
+    const int slotIdx = allocRelayStateCoalesceSlot(slaveMac);
+    if (slotIdx < 0) {
+        return;
+    }
+
+    PendingRelayStateSlot& slot = pendingRelayStateSlots_[slotIdx];
+    const unsigned long now = millis();
+    const unsigned long delayMs = urgent ? MQTT_RELAY_STATE_URGENT_MS : MQTT_RELAY_STATE_DEBOUNCE_MS;
+    const unsigned long newDue = now + delayMs;
+
+    if (!slot.active || memcmp(slot.mac, slaveMac, 6) != 0) {
+        memcpy(slot.mac, slaveMac, 6);
+        slot.active = true;
+        slot.urgent = urgent;
+        slot.heartbeat = heartbeat;
+        slot.dueMs = newDue;
+        return;
+    }
+
+    slot.urgent = slot.urgent || urgent;
+    if (!heartbeat) {
+        slot.heartbeat = false;
+    }
+    if (slot.urgent) {
+        slot.dueMs = (newDue < slot.dueMs) ? newDue : slot.dueMs;
+    } else {
+        slot.dueMs = newDue;
+    }
+}
+
+void HydroSystemCore::flushPendingRelayStateMqtt() {
+    if (!mqttClient.isConnected()) {
+        return;
+    }
+
+    const unsigned long now = millis();
+    for (size_t i = 0; i < RELAY_STATE_COALESCE_SLOTS; i++) {
+        PendingRelayStateSlot& slot = pendingRelayStateSlots_[i];
+        if (!slot.active || now < slot.dueMs) {
+            continue;
+        }
+
+        const bool heartbeat = slot.heartbeat;
+        uint8_t mac[6];
+        memcpy(mac, slot.mac, 6);
+        slot.active = false;
+        slot.urgent = false;
+        slot.heartbeat = false;
+
+        publishSlaveRelayStateMqtt(mac, -1, false, heartbeat);
     }
 }
 
@@ -3403,8 +3581,17 @@ void HydroSystemCore::publishSlaveRelayStateMqtt(const uint8_t* slaveMac, int fa
         Serial.printf("[SLAVE-LINK] event=relay_state_link_heartbeat mac=%s online=%d lastSeen=%us\n",
                       macStr.c_str(), reading.linkOnline ? 1 : 0,
                       (unsigned)linkLastSeenS);
+    } else if (isRelayStateSnapshotUnchanged(slaveMac, states, timers, remaining, n, linkOnline)) {
+        return;
     }
-    mqttClient.publishRelayState(reading);
+
+    if (!mqttClient.publishRelayState(reading)) {
+        return;
+    }
+
+    if (!heartbeat) {
+        rememberPublishedRelayState(slaveMac, states, timers, remaining, n, linkOnline);
+    }
 }
 #endif
 
