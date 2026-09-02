@@ -4427,4 +4427,95 @@ bool SupabaseClient::patchEcConfigGain(const String& deviceId, float kValue) {
     return patchOk;
 }
 #endif  // !GAIN_PATCH_HTTPS_DISABLED
+
+bool SupabaseClient::patchEcConfigNutrients(const String& deviceId, const String& nutrientsJson) {
+    if (!isReady() || nutrientsJson.length() == 0) {
+        return false;
+    }
+
+    if (requestMutex != nullptr) {
+        if (xSemaphoreTake(requestMutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            return false;
+        }
+    }
+
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, nutrientsJson);
+    if (err || !doc.is<JsonArray>()) {
+        if (requestMutex != nullptr) {
+            xSemaphoreGive(requestMutex);
+        }
+        return false;
+    }
+    DynamicJsonDocument payload(2048);
+    payload["nutrients"] = doc.as<JsonArray>();
+    String body;
+    serializeJson(payload, body);
+
+    String patchUrl = baseUrl + "/rest/v1/ec_config_view?device_id=eq." + deviceId;
+    bool patchOk = false;
+
+    if (secureClient != nullptr && http.begin(*secureClient, patchUrl)) {
+        http.addHeader("apikey", apiKey);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Prefer", "return=minimal");
+        http.setTimeout(10000);
+        const int code = http.PATCH(body);
+        patchOk = (code >= 200 && code < 300);
+        if (!patchOk) {
+            Serial.printf("⚠️ [EC CONFIG] PATCH nutrients falhou HTTP %d\n", code);
+        } else {
+            Serial.println("✅ [EC CONFIG] PATCH nutrients OK (pump flow calib)");
+        }
+        http.end();
+    }
+
+    if (requestMutex != nullptr) {
+        xSemaphoreGive(requestMutex);
+    }
+    return patchOk;
+}
+
+bool SupabaseClient::patchPhConfigFlowRates(const String& deviceId, float flowUp, float flowDown) {
+    if (!isReady()) {
+        return false;
+    }
+
+    if (requestMutex != nullptr) {
+        if (xSemaphoreTake(requestMutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            return false;
+        }
+    }
+
+    DynamicJsonDocument doc(128);
+    doc["flow_rate_ph_up"] = roundf(flowUp * 1000.0f) / 1000.0f;
+    doc["flow_rate_ph_down"] = roundf(flowDown * 1000.0f) / 1000.0f;
+    String payload;
+    serializeJson(doc, payload);
+
+    String patchUrl = baseUrl + "/rest/v1/ph_config_view?device_id=eq." + deviceId;
+    bool patchOk = false;
+
+    if (secureClient != nullptr && http.begin(*secureClient, patchUrl)) {
+        http.addHeader("apikey", apiKey);
+        http.addHeader("Authorization", buildAuthHeader());
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Prefer", "return=minimal");
+        http.setTimeout(8000);
+        const int code = http.PATCH(payload);
+        patchOk = (code >= 200 && code < 300);
+        if (!patchOk) {
+            Serial.printf("⚠️ [PH CONFIG] PATCH flow rates falhou HTTP %d\n", code);
+        } else {
+            Serial.println("✅ [PH CONFIG] PATCH flow rates OK (pump flow calib)");
+        }
+        http.end();
+    }
+
+    if (requestMutex != nullptr) {
+        xSemaphoreGive(requestMutex);
+    }
+    return patchOk;
+}
  

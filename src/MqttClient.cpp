@@ -30,6 +30,8 @@ MqttClientWrapper::MqttClientWrapper()
       incomingHandler(nullptr),
       incomingHandlerUserData(nullptr) {
     mqtt.setBufferSize(2048);
+    mqtt.setKeepAlive(MQTT_KEEPALIVE_SEC);
+    wifiClient.setTimeout(MQTT_WIFI_CLIENT_TIMEOUT_SEC);
     lwtPayload[0] = '\0';
 }
 
@@ -119,7 +121,9 @@ bool MqttClientWrapper::begin(const String& id) {
     lwtDoc["online"] = false;
     serializeJson(lwtDoc, lwtPayload, sizeof(lwtPayload));
 
-    Serial.printf("[MQTT] Broker %s:%d user=%s\n", MQTT_HOST, MQTT_PORT, mqttUsername.c_str());
+    Serial.printf("[MQTT] Broker %s:%d user=%s keepalive=%us\n",
+                  MQTT_HOST, MQTT_PORT, mqttUsername.c_str(),
+                  static_cast<unsigned>(MQTT_KEEPALIVE_SEC));
     Serial.printf("[MQTT] topics telemetry=%s levels=%s heartbeat=%s status=%s command=%s ec_op=%s dose=%s ph_op=%s ph_dose=%s ec_metric=%s ph_metric=%s ec_gain=%s ph_gain=%s\n",
                   telemetryTopic.c_str(), levelsTopic.c_str(), heartbeatTopic.c_str(), statusTopic.c_str(),
                   commandTopic.c_str(), ecOperationTopic.c_str(), doseTopic.c_str(),
@@ -189,6 +193,9 @@ bool MqttClientWrapper::ensureConnected() {
         return false;
     }
     lastReconnectAttempt = now;
+
+    wifiClient.stop();
+    delay(20);
 
     String clientId = deviceId.length() ? deviceId : "ESP32_HIDRO";
     Serial.printf("[MQTT] Connecting clientId=%s user=%s (backoff=%lus)...\n",

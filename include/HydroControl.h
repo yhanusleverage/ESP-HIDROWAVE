@@ -341,6 +341,16 @@ public:
     // ✅ Proporções Dinâmicas da Tabela Nutricional
     void updateNutrientProportions(JsonArray nutrients);  // Receber do frontend
     void calculateProportionsFromMlPerLiter(JsonArray nutrients);  // Calcular proporções
+    /** Vazão calibrada (ml/s) para relé 0..7; 0 se não calibrado. */
+    float getFlowRateMlPerSecForRelay(int relay) const;
+    /** Calib HMI/UART: grava ml/s por relé (nutriente, ghost ou pH). Retorna 1=EC 2=pH 0=fail. */
+    int applyPumpFlowCalib(int relay, float flowMlPerSec);
+    /** JSON nutrients[] para PATCH ec_config_view (web parity). */
+    bool buildNutrientsJsonForCloud(String& out) const;
+    int getRelayPhUp() const { return relayPhUp; }
+    int getRelayPhDown() const { return relayPhDown; }
+    float getFlowRatePhUp() const { return flowRatePhUp; }
+    float getFlowRatePhDown() const { return flowRatePhDown; }
 
 private:
     // Hardware
@@ -393,6 +403,8 @@ private:
     float ecSetpoint;
     float ecTolerance;
     bool autoECEnabled;
+    /** Desactivar Auto EC: terminar secuencia proporcional + recirc antes de parar. */
+    bool autoECGracefulStopPending;
     unsigned long lastECCheck;
     static const unsigned long EC_CHECK_INTERVAL = 30000; // 30 segundos
     static const unsigned long CONSUMO_24H_MS = 24UL * 60UL * 60UL * 1000UL;
@@ -542,6 +554,12 @@ private:
     NutrientProportion dynamicProportions[16];  // Máximo 16 nutrientes (um por relé)
     int activeNutrientsCount;
     float totalMlPerLiter;  // Soma total de mlPerLiter
+    /** Caudal manual por bomba R1-R6 (relé 0-5) sem nutriente activo. ml/s */
+    float pumpFlowGhostMlPerSec[6];
+    
+    void loadPumpFlowGhosts();
+    void savePumpFlowGhost(int relay);
+    void savePhFlowRatesToNVS();
     
     // Funções internas
     void updateSensors();
@@ -559,6 +577,8 @@ private:
     void beginEcNutrientPulses();
     bool startEcPulseOn();
     void advanceAfterEcNutrientComplete(unsigned long now);
+    bool isAutoEcCycleActive() const;
+    void completeAutoEcGracefulStopIfNeeded();
     void beginPhDosePulses(float flowMlPerS);
     bool startPhPulseOn(float flowMlPerS);
     void processDilution();

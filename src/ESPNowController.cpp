@@ -90,11 +90,11 @@ bool ESPNowController::begin() {
             Serial.println("   Actualizando wifiChannel de " + String(oldChannel) + " a " + String(actualChannel));
         }
     } else {
-        // Sem WiFi STA: usar canal configurado (evita canal stale de sessão anterior)
-        actualChannel = ESPNOW_CHANNEL;
+        // Sem WiFi STA: marco cero CONFIG para provisioning com slave
+        actualChannel = ESPNOW_CONFIG_CHANNEL;
         wifiChannel = actualChannel;
         esp_wifi_set_channel(actualChannel, WIFI_SECOND_CHAN_NONE);
-        Serial.println("📶 Sem WiFi STA — canal ESP-NOW forçado para: " + String(actualChannel));
+        Serial.println("📶 Sem WiFi STA — canal ESP-NOW CONFIG: " + String(actualChannel));
     }
     
     // Configurar canal WiFi con el canal REAL detectado
@@ -597,14 +597,95 @@ bool ESPNowController::sendWiFiCredentialsBroadcast(const String& ssid, const St
     
     if (success) {
         Serial.println("✅ Credenciais enviadas em broadcast com sucesso!");
-        Serial.println("📡 Todos os dispositivos no alcance receberão");
-        Serial.println("⏳ Aguarde os dispositivos conectarem (10-20 segundos)...");
         Serial.println("================================================\n");
+        return true;
     } else {
         Serial.println("❌ Falha ao enviar credenciais via ESP-NOW");
+        Serial.println("================================================\n");
+        return false;
     }
-    
-    return success;
+}
+
+bool ESPNowController::hopToChannel(uint8_t channel) {
+    if (channel < 1 || channel > 13) {
+        return false;
+    }
+    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    if (err == ESP_OK) {
+        wifiChannel = channel;
+        return true;
+    }
+    Serial.printf("❌ hopToChannel(%u) falhou: %d\n", channel, err);
+    return false;
+}
+
+uint8_t ESPNowController::getCurrentRadioChannel() const {
+    wifi_second_chan_t secondChan;
+    uint8_t ch = 0;
+    esp_wifi_get_channel(&ch, &secondChan);
+    return ch;
+}
+
+bool ESPNowController::sendChannelChangeNotification(uint8_t oldChannel, uint8_t newChannel, uint8_t reason) {
+    if (!initialized || oldChannel < 1 || oldChannel > 13 || newChannel < 1 || newChannel > 13) {
+        return false;
+    }
+
+    Serial.println("\n📢 === NOTIFICANDO MUDANÇA DE CANAL ===");
+    Serial.printf("   Canal Anterior: %u\n", oldChannel);
+    Serial.printf("   Novo Canal: %u\n", newChannel);
+    Serial.printf("   Motivo: %u\n", reason);
+
+    ChannelChangeNotification notification = {};
+    notification.oldChannel = oldChannel;
+    notification.newChannel = newChannel;
+    notification.reason = reason;
+    notification.changeTime = millis();
+    notification.checksum = 0;
+    {
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&notification);
+        uint8_t cs = 0;
+        for (size_t i = 0; i < sizeof(notification) - 1; ++i) {
+            cs ^= raw[i];
+        }
+        notification.checksum = cs;
+    }
+
+    ESPNowMessage message = {};
+    message.type = MessageType::CHANNEL_CHANGE;
+    getLocalMac(message.senderId);
+    uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    memcpy(message.targetId, broadcastMac, 6);
+    message.messageId = ++messageCounter;
+    message.timestamp = millis();
+    message.dataSize = sizeof(notification);
+    memcpy(message.data, &notification, sizeof(notification));
+    message.checksum = calculateChecksum(message);
+
+    const uint8_t savedChannel = getCurrentRadioChannel();
+    if (savedChannel != oldChannel) {
+        Serial.printf("⚠️ Hop temporário para canal %u (notificar slaves)\n", oldChannel);
+        hopToChannel(oldChannel);
+        delay(50);
+    }
+
+    int successCount = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (sendMessage(message, broadcastMac)) {
+            successCount++;
+        }
+        delay(100);
+    }
+
+    if (savedChannel != newChannel) {
+        Serial.printf("📶 Retornando para canal %u\n", newChannel);
+        hopToChannel(newChannel);
+    }
+
+    const bool ok = successCount > 0;
+    Serial.printf("%s Notificação CHANNEL_CHANGE (%d/3)\n", ok ? "✅" : "❌", successCount);
+    Serial.println("=====================================\n");
+    return ok;
 }
 
 bool ESPNowController::addPeer(const uint8_t* macAddress, const String& deviceName) {

@@ -43,6 +43,12 @@
 #ifndef MQTT_HEARTBEAT_INTERVAL_MS
 #define MQTT_HEARTBEAT_INTERVAL_MS 60000UL
 #endif
+#ifndef MQTT_KEEPALIVE_SEC
+#define MQTT_KEEPALIVE_SEC 60
+#endif
+#ifndef MQTT_WIFI_CLIENT_TIMEOUT_SEC
+#define MQTT_WIFI_CLIENT_TIMEOUT_SEC 15
+#endif
 // 0 = bivalente: MQTT telemetry (hydro + environment) + HTTPS paralelo
 // 1 = só MQTT; HTTPS hydro/environment só se MQTT desconectado (fallback procedural)
 #ifndef MQTT_HYDRO_ONLY
@@ -73,6 +79,11 @@
 #endif
 #ifndef MQTT_COMMAND_PATH_STABLE_MS
 #define MQTT_COMMAND_PATH_STABLE_MS 60000UL
+#endif
+// 1 = cloud runtime só MQTT (telemetria + heartbeat). Sem HTTPS procedural se broker cair.
+// Boot: autoRegisterDevice e patchBootInterrupted mantidos.
+#ifndef HTTPS_RUNTIME_FALLBACK_DISABLED
+#define HTTPS_RUNTIME_FALLBACK_DISABLED 1
 #endif
 #endif
 
@@ -152,12 +163,44 @@
 #define MAX_RETRY_ATTEMPTS 3
 
 // ===== CONFIGURAÇÕES ESP-NOW UNIFICADAS =====
+// 1 = Master ESP-NOW activo | 0 = bancada MQTT/WiFi sin radio ESP-NOW (secrets.ini / platformio)
+#ifndef ENABLE_ESPNOW
+#define ENABLE_ESPNOW 1
+#endif
 #define ESPNOW_CHANNEL 1                    // Canal WiFi (1-14)
 #define MAX_ESPNOW_PEERS 10                 // Máximo de peers ESP-NOW
 #define MESSAGE_TIMEOUT_MS 300000            // Timeout para mensagens (5 minutos)
 #define PEER_OFFLINE_TIMEOUT 60000          // Timeout para considerar peer offline (60s)
 #define DISCOVERY_INTERVAL_MS 30000         // Intervalo de descoberta (30 segundos)
 #define STATUS_BROADCAST_INTERVAL 30000    // Intervalo de broadcast de status (30s)
+/** Master: após discovery inicial no boot, intervalo lento se slave em NVS mas offline */
+#ifndef ESPNOW_DISCOVERY_SLOW_MS
+#define ESPNOW_DISCOVERY_SLOW_MS 300000UL   // 5 min
+#endif
+#ifndef ESPNOW_DISCOVERY_IDLE_MS
+#define ESPNOW_DISCOVERY_IDLE_MS 600000UL   // 10 min (bancada sem slave ligado)
+#endif
+#ifndef ESPNOW_DISCOVERY_BOOT_GRACE_MS
+#define ESPNOW_DISCOVERY_BOOT_GRACE_MS 180000UL  // 3 min janela pós-boot
+#endif
+
+/** Marco cero: canal fixo de provisioning ESP-NOW (master + slave) */
+#ifndef ESPNOW_CONFIG_CHANNEL
+#define ESPNOW_CONFIG_CHANNEL 11
+#endif
+#ifndef ESPNOW_PROVISIONING_ENABLED
+#define ESPNOW_PROVISIONING_ENABLED 1
+#endif
+#ifndef ESPNOW_PROVISIONING_BURST_MS
+#define ESPNOW_PROVISIONING_BURST_MS 30000UL
+#endif
+/** 1 = log PING/PONG e peer repetido; 0 = só eventos novos/erros */
+#ifndef ESPNOW_LINK_VERBOSE
+#define ESPNOW_LINK_VERBOSE 0
+#endif
+#ifndef ESPNOW_CHANNEL_POLL_MS
+#define ESPNOW_CHANNEL_POLL_MS 5000UL
+#endif
 
 // Master STA+ESP-NOW: no cambiar canal WiFi dinámicamente (evita peer channel mismatch)
 #ifndef ESPNOW_LOCK_WIFI_CHANNEL
@@ -272,6 +315,12 @@
 #define RELAY_CHECK_INTERVAL_MS 5000      // 5 segundos
 #define STATUS_PRINT_INTERVAL_MS 60000    // 1 minuto
 #define WIFI_RETRY_INTERVAL_MS 10000      // 10 segundos
+#ifndef WIFI_RECONNECT_TIMEOUT_MS
+#define WIFI_RECONNECT_TIMEOUT_MS 20000   // Paridad con boot (HydroStateManager::begin)
+#endif
+#ifndef WIFI_RECONNECT_MAX_ATTEMPTS
+#define WIFI_RECONNECT_MAX_ATTEMPTS 3
+#endif
 #define API_RETRY_INTERVAL_MS 5000        // 5 segundos
 #define SUPABASE_STATUS_INTERVAL_MS 30000 // 30 segundos
 
@@ -497,6 +546,38 @@ static const RelayPinMap RELAY_PIN_MAPPING[MAX_RELAYS] = {
 // ===== CONFIGURAÇÕES DO SAVEMANAGER =====
 #define PREFERENCES_NAMESPACE "espnow_cfg"  // Namespace para Preferences
 #define CONFIG_VERSION 1                     // Versão da configuração
+
+// ===== HMI UART (JC3248W535 ↔ Master) =====
+#ifndef ENABLE_HMI_UART
+#define ENABLE_HMI_UART 1
+#endif
+#if ENABLE_HMI_UART
+#ifndef HMI_UART_RX_PIN
+#define HMI_UART_RX_PIN 17
+#endif
+#ifndef HMI_UART_TX_PIN
+#define HMI_UART_TX_PIN 18
+#endif
+#ifndef HMI_UART_BAUD
+#define HMI_UART_BAUD 115200
+#endif
+#ifndef HMI_TELEMETRY_INTERVAL_MS
+#define HMI_TELEMETRY_INTERVAL_MS 2000UL
+#endif
+#ifndef UART_BRINGUP
+#define UART_BRINGUP 0
+#endif
+#ifndef UART_LINK_DEBUG
+#if UART_BRINGUP
+#define UART_LINK_DEBUG 1
+#else
+#define UART_LINK_DEBUG 0
+#endif
+#endif
+#ifndef UART_LINK_DEBUG_INTERVAL_MS
+#define UART_LINK_DEBUG_INTERVAL_MS 5000UL
+#endif
+#endif
 
 // ===== MACROS DE DEBUG =====
 #ifndef HYDRO_DEBUG_PRINTLN

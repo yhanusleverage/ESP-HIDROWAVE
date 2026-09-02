@@ -1,4 +1,5 @@
 #include "HydroSystemCore.h"
+#include "EspNowChannelPolicy.h"
 #include "ResourceTelemetry.h"
 #include "HydroControl.h"
 #include "SupabaseClient.h"
@@ -139,6 +140,44 @@ bool ecConfigUnchanged(const ECConfig& config) {
 
 static bool relaySyncInProgress = false;
 
+#if ENABLE_HMI_UART
+HydroSystemCore* HydroSystemCore::hmiBridgeInstance = nullptr;
+
+bool HydroSystemCore::isHmiCloudOk() const {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+#if ENABLE_MQTT
+    if (mqttClient.isConnected()) {
+        return true;
+    }
+#endif
+    return supabaseConnected;
+}
+
+bool HydroSystemCore::hmiCloudOkStatic() {
+    return hmiBridgeInstance ? hmiBridgeInstance->isHmiCloudOk() : false;
+}
+
+String HydroSystemCore::hmiDeviceIdStatic() {
+    return getDeviceID();
+}
+
+#if UART_BRINGUP
+void HydroSystemCore::dumpHmiUartLinkStatus(Stream& out) const {
+    hmiUartBridge.dumpLinkStatus(out);
+}
+
+void HydroSystemCore::dumpHmiUartLinkStatusStatic(Stream& out) {
+    if (hmiBridgeInstance) {
+        hmiBridgeInstance->dumpHmiUartLinkStatus(out);
+    } else {
+        out.println("[HMI UART STATUS] bridge no init (esperar HYDRO_ACTIVE)");
+    }
+}
+#endif
+#endif
+
 // ===== CONSTRUTOR E DESTRUTOR =====
 HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNow, MasterSlaveManager* masterMgr) : 
     webServerTask(webTask),
@@ -159,6 +198,7 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     lastStatusPrint(0),
     lastRulesCheck(0),  // ✅ NOVO: Inicializar controle de verificação de regras
     lastMemoryProtection(0),
+    lastEspNowChannelPollMs(0),
     lastMqttTelemetrySend(0),
     lastMqttHeartbeatSend(0),
     lastMqttCloudLastSeen(0),
@@ -206,6 +246,9 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     if (masterManager) {
         Serial.println("✅ HydroSystemCore: MasterSlaveManager injetado");
     }
+#if ENABLE_HMI_UART
+    hmiBridgeInstance = this;
+#endif
 }
 
 void HydroSystemCore::wireMasterManagerIntegration() {
@@ -418,13 +461,17 @@ bool HydroSystemCore::begin() {
 #if ENABLE_MQTT
     {
         const char* hydroMode =
-#if MQTT_HYDRO_ONLY
+#if MQTT_HYDRO_ONLY && HTTPS_RUNTIME_FALLBACK_DISABLED
+            "mqtt_only";
+#elif MQTT_HYDRO_ONLY
             "mqtt+https_fallback";
 #else
             "bivalente";
 #endif
         const char* healthMode =
-#if MQTT_HEALTH_ONLY
+#if MQTT_HEALTH_ONLY && HTTPS_RUNTIME_FALLBACK_DISABLED
+            "mqtt_only";
+#elif MQTT_HEALTH_ONLY
             "mqtt+https_fallback";
 #else
             "bivalente";
@@ -441,7 +488,11 @@ bool HydroSystemCore::begin() {
             publishMqttHeartbeat();
             lastMqttHeartbeatSend = millis();
         } else {
+#if HTTPS_RUNTIME_FALLBACK_DISABLED
+            Serial.println("⚠️ MQTT client não conectou — sem fallback HTTPS em runtime");
+#else
             Serial.println("⚠️ MQTT client não conectou — continuando com HTTPS");
+#endif
         }
     }
 #endif
@@ -454,7 +505,11 @@ bool HydroSystemCore::begin() {
     printSensorReadings();
 
     lastRelayStatesSync = 0;
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+    saveMasterRelayStatesToNVS();
+#else
     syncAllRelayStatesToSupabase();
+#endif
     if (bootOperationInterrupted) {
         syncEcOperationStateToSupabase();
         syncPhOperationStateToSupabase();
@@ -463,6 +518,20 @@ bool HydroSystemCore::begin() {
         }
         bootOperationInterrupted = false;
     }
+
+#if ENABLE_HMI_UART
+    {
+        HmiUartBridge::Context hmiCtx;
+        hmiCtx.hydro = &hydroControl;
+        hmiCtx.coordinator = &relayCoordinator;
+        hmiCtx.masterManager = masterManager;
+        hmiCtx.supabase = &supabase;
+        hmiCtx.cloudOkFn = &HydroSystemCore::hmiCloudOkStatic;
+        hmiCtx.deviceIdFn = &HydroSystemCore::hmiDeviceIdStatic;
+        hmiUartBridge.attach(hmiCtx);
+        hmiUartBridge.begin();
+    }
+#endif
     
     return true;
 }
@@ -492,6 +561,11 @@ void HydroSystemCore::loop() {
     finishStatusLedSendPulseIfDue();
     updateStatusLedFromWifi();
     statusLed.update();
+
+#if ENABLE_HMI_UART
+    hmiUartBridge.loop();
+    hmiUartBridge.maybePublishTelemetry(now);
+#endif
     
     // ===== PROTEÇÃO DE MEMÓRIA (10s) =====
     if (now - lastMemoryProtection >= MEMORY_CHECK_INTERVAL) {
@@ -514,6 +588,20 @@ void HydroSystemCore::loop() {
     } else {
         mqttConnectedSinceMs = 0;
     }
+    EspNowChannelPolicy::setMqttConnected(mqttClient.isConnected());
+#else
+    EspNowChannelPolicy::setMqttConnected(true);
+#endif
+
+#if ENABLE_ESPNOW
+    if (masterManager && espNowController &&
+        (now - lastEspNowChannelPollMs >= ESPNOW_CHANNEL_POLL_MS)) {
+        EspNowChannelPolicy::checkStaChannelChange(espNowController, masterManager);
+        lastEspNowChannelPollMs = now;
+    }
+#endif
+
+#if ENABLE_MQTT
     if (now - lastMqttTelemetrySend >= MQTT_TELEMETRY_INTERVAL_MS) {
         if (masterManager && masterManager->isEspNowLockWindowActive()) {
 #if ESPNOW_LOCK_DEBUG
@@ -531,7 +619,8 @@ void HydroSystemCore::loop() {
     }
 #endif
     
-    // ===== SENSORES → SUPABASE — skip se MQTT OK; se offline, intervalo maior + sem SSL hot path =====
+    // ===== SENSORES → SUPABASE — só HTTPS se HTTPS_RUNTIME_FALLBACK_DISABLED=0 =====
+#if !(ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED)
     {
         bool sendHydroHttps = true;
         unsigned long hydroInterval = SENSOR_SEND_INTERVAL;
@@ -547,10 +636,17 @@ void HydroSystemCore::loop() {
             lastSensorSend = now;
         }
     }
+#endif
     
     // ===== STATUS DEVICE → SUPABASE =====
-    // MQTT_HEALTH_ONLY + broker OK: no TLS cada 60s (heartbeat ya pinta device_status).
-    // Fallback: MQTT caído → HTTPS 120s. Seguro last_seen: ≤4 min si MQTT OK.
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+    if (now - lastStatusSend >= STATUS_SEND_INTERVAL) {
+        saveMasterRelayStatesToNVS();
+        lastStatusSend = now;
+    }
+#else
+    // MQTT_HEALTH_ONLY + broker OK: heartbeat MQTT pinta device_status via bridge.
+    // Fallback HTTPS só se HTTPS_RUNTIME_FALLBACK_DISABLED=0.
     {
         unsigned long statusInterval = STATUS_SEND_INTERVAL;
 #if ENABLE_MQTT
@@ -568,8 +664,10 @@ void HydroSystemCore::loop() {
             lastStatusSend = now;
         }
     }
+#endif
     
     // ===== SINCRONIZAÇÃO UNIFICADA DE RELAY STATES (30s) — adia se ACK cloud pendente =====
+#if !(ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED)
     {
         bool skipRelayHttpsSync = false;
 #if ENABLE_MQTT
@@ -583,15 +681,10 @@ void HydroSystemCore::loop() {
             lastRelayStatesSync = now;
         }
     }
+#endif
 
     // ===== EC operation heartbeat — activo 12s / idle 30s (limpa estado huérfano MQTT) =====
     {
-        if (!hydroControl.isAutoECEnabled() && hydroControl.isDosageActive()) {
-            hydroControl.cancelCurrentDosage();
-            syncEcOperationStateToSupabase();
-            lastEcOperationIdleSync = now;
-        }
-
         const char* opState = hydroControl.getEcOperationStateName();
         const bool cycleActive = hydroControl.isDosageActive() ||
             hydroControl.isDilutionActive() ||
@@ -1209,6 +1302,7 @@ void HydroSystemCore::updateStatusLedFromWifi() {
     if (st == WL_CONNECTED) {
         if (previousWifi != -1 && previousWifi != WL_CONNECTED && masterManager) {
             masterManager->refreshEspNowPeersOnCurrentChannel();
+            masterManager->saveEspNowLastChannel(WiFi.channel());
         }
         statusLed.setConnected();
     } else if (st == WL_IDLE_STATUS || st == WL_DISCONNECTED || st == WL_NO_SSID_AVAIL ||
@@ -1435,6 +1529,10 @@ void HydroSystemCore::sendSensorDataToSupabase() {
 }
 
 void HydroSystemCore::sendDeviceStatusToSupabase() {
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+    saveMasterRelayStatesToNVS();
+    return;
+#endif
     if (!supabaseConnected || !hasEnoughMemoryForHTTPS()) {
         return;
     }
@@ -1604,9 +1702,15 @@ void HydroSystemCore::syncPhOperationStateToSupabase() {
         if (mqttClient.publishPhOperation(reading)) {
             return;
         }
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+        Serial.println("⚠️ [PH OP] MQTT publish falhou — sem fallback HTTPS");
+        return;
+#else
         Serial.println("⚠️ [PH OP] MQTT publish falhou — fallback HTTPS");
+#endif
     }
 
+#if !(ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED)
     if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
         return;
     }
@@ -1617,6 +1721,7 @@ void HydroSystemCore::syncPhOperationStateToSupabase() {
         nextCheckSec,
         bootOperationInterrupted
     );
+#endif
 }
 
 
@@ -1993,9 +2098,15 @@ void HydroSystemCore::syncEcOperationStateToSupabase() {
         if (mqttClient.publishEcOperation(reading)) {
             return;
         }
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+        Serial.println("⚠️ [EC OP] MQTT publish falhou — sem fallback HTTPS");
+        return;
+#else
         Serial.println("⚠️ [EC OP] MQTT publish falhou — fallback HTTPS");
+#endif
     }
 
+#if !(ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED)
     if (!supabaseConnected || !hasEnoughMemoryForHTTPS() || !supabase.isReady()) {
         return;
     }
@@ -2008,6 +2119,7 @@ void HydroSystemCore::syncEcOperationStateToSupabase() {
         dilProgress,
         bootOperationInterrupted
     );
+#endif
 }
 
 // ===== ✅ NOVO: SINCRONIZAÇÃO UNIFICADA DE TODOS OS RELAY STATES =====
@@ -2094,6 +2206,10 @@ static bool relayStatesUnchanged(const uint8_t* mac, const bool states[8]) {
 
 // Atualiza master relays + slave relays juntos no Supabase a cada 10 segundos
 void HydroSystemCore::syncAllRelayStatesToSupabase() {
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+    saveMasterRelayStatesToNVS();
+    return;
+#endif
     static const uint32_t MIN_HEAP_FOR_RELAY_SYNC = 60000;
 
     if (!supabaseConnected || !hasEnoughMemoryForHTTPS()) {
@@ -2494,11 +2610,16 @@ void HydroSystemCore::tryRegisterEndpoints() {
     endpointsRegistered = true;
     
     Serial.println("✅ Sistema configurado com sucesso!");
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+    Serial.println("   ✓ Cloud runtime: MQTT only (telemetry + heartbeat)");
+    Serial.println("   ✓ Boot: autoRegisterDevice mantido");
+#else
     Serial.println("   ✓ Supabase: device_status (escrita cada 60s)");
 #if ENABLE_MQTT && MQTT_HYDRO_ONLY
     Serial.println("   ✓ Sensores: MQTT (hydro + ambiente) + HTTPS fallback se broker cair");
 #else
     Serial.println("   ✓ Sensores: bivalente MQTT 30s + HTTPS hydro/environment 30s");
+#endif
 #endif
     Serial.println("   ✓ Supabase: relay_states (escrita quando muda estado)");
     Serial.println("   ✓ Comandos relé: MQTT hidrowave/{id}/command (sem poll HTTPS)");
@@ -3412,9 +3533,6 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
     hydroControl.setECSetpoint(config.ec_setpoint, false);
     hydroControl.setECTolerance((float)config.tolerance, false);
     hydroControl.setAutoECEnabled(config.auto_enabled, false);
-    if (!config.auto_enabled) {
-        hydroControl.cancelCurrentDosage();
-    }
     hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);
     hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
     hydroControl.setMaxStepEcFraction((float)config.aggressiveness);

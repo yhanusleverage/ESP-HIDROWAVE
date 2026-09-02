@@ -22,6 +22,9 @@
 #include "StateCacheTypes.h"
 #include "StatePersistenceManager.h"
 #include "StatusLED.h"
+#if ENABLE_HMI_UART
+#include "HmiUartBridge.h"
+#endif
 
 // Forward declarations para evitar dependencias circulares
 class WebServerTask;
@@ -56,6 +59,7 @@ private:
     unsigned long lastStatusPrint;
     unsigned long lastRulesCheck;      // ✅ NOVO: Controle de verificação de regras (decision_rules)
     unsigned long lastMemoryProtection;
+    unsigned long lastEspNowChannelPollMs;
     unsigned long lastMqttTelemetrySend;
     unsigned long lastMqttHeartbeatSend;
     unsigned long lastMqttCloudLastSeen;
@@ -288,6 +292,11 @@ public:
     void printSystemStatus();
     void printSensorReadings();
     void testSupabaseConnection();
+
+#if ENABLE_HMI_UART && UART_BRINGUP
+    void dumpHmiUartLinkStatus(Stream& out) const;
+    static void dumpHmiUartLinkStatusStatic(Stream& out);
+#endif
     
 private:
     // Operações principais
@@ -303,6 +312,14 @@ private:
     static void mqttIncomingReceived(const char* topic, const char* payload, size_t length, void* userData);
     void handleMqttIncoming(const char* topic, const char* payload, size_t length);
     void handleMqttCommandPayload(const char* payload, size_t length);
+
+#if ENABLE_HMI_UART
+    HmiUartBridge hmiUartBridge;
+    bool isHmiCloudOk() const;
+    static bool hmiCloudOkStatic();
+    static String hmiDeviceIdStatic();
+    static HydroSystemCore* hmiBridgeInstance;
+#endif
     
     // ✅ FORK: Processamento separado por tipo de comando
     void processManualCommand(const RelayCommand& cmd, bool isSlave);      // Comando manual (botão)

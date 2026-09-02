@@ -43,6 +43,7 @@ enum class MessageType : uint8_t {
     CONNECTIVITY_REPORT = 0x0D, // Relatório de conectividade
     ALL_RELAYS_STATUS = 0x0E,   // slave → Master: estado real 8 relés
     SET_RELAY_MASK = 0x0F,       // Master → slave: máscara atómica (contrato SLAVE)
+    CHANNEL_CHANGE = 0x10,       // Master → slave: novo canal operativo
     PERSISTENT_STATE_SYNC = 0x11 // NVS persistente (não usar 0x0F)
 };
 
@@ -300,6 +301,21 @@ public:
      * @return true se credenciais foram enviadas
      */
     bool sendWiFiCredentialsBroadcast(const String& ssid, const String& password, uint8_t channel = 0);
+
+    /**
+     * @brief Salta temporariamente para um canal WiFi (sem desconectar STA)
+     */
+    bool hopToChannel(uint8_t channel);
+
+    /**
+     * @brief Canal RF actual del ESP32
+     */
+    uint8_t getCurrentRadioChannel() const;
+
+    /**
+     * @brief Notifica slaves no canal antigo sobre mudança de canal (3× broadcast)
+     */
+    bool sendChannelChangeNotification(uint8_t oldChannel, uint8_t newChannel, uint8_t reason = 1);
     
     /**
      * @brief Valida credenciais WiFi recebidas (verifica checksum)

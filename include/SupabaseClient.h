@@ -275,6 +275,10 @@ public:
                             bool clearResetFlag = false);
     bool patchEcConfigGain(const String& deviceId, float kValue);
 #endif
+    /** PATCH ec_config_view.nutrients (calib caudal HMI/web parity). */
+    bool patchEcConfigNutrients(const String& deviceId, const String& nutrientsJson);
+    /** PATCH ph_config_view flow_rate_ph_up/down. */
+    bool patchPhConfigFlowRates(const String& deviceId, float flowUp, float flowDown);
 
     // Utilitários
     bool testConnection();

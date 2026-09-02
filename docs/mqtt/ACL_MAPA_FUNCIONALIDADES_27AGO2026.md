@@ -134,6 +134,25 @@ Heartbeat       ──pub───────►  …/heartbeat         ──�
 
 ---
 
+## 4b. Incidente 28/08/2026 — typo `hidrowa_ve/+/command`
+
+**Síntoma:** `[MQTT CMD] published` na UI (id 1350/1351), ESP com `mqtt=1`, serial **sem** `[MQTT] rx topic` / `[CMD mqtt]`.
+
+**Causa:** ACL user `hidrowave` com typo:
+
+```diff
+- topic write hidrowa_ve/+/command
++ topic write hidrowave/+/command
+```
+
+EC/pH config (`hidrowave/+/ec/config`) continuavam OK — só comandos de relé (cebar, manual) falhavam.
+
+**Fix:** corrigir linha no ACL + `sudo systemctl restart mosquitto`.
+
+Guia debug completo: [MQTT_COMANDOS_DEBUG_ACL.md](../../../HIDROWAVE-main/docs/MQTT_COMANDOS_DEBUG_ACL.md).
+
+---
+
 ## 5. Gate bancada (cuando ACL + firmware estén)
 
 Serial ESP:

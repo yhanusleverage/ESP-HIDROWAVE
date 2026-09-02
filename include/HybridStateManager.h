@@ -21,6 +21,12 @@ enum HydroSystemState {
     ADMIN_PANEL_MODE     // Modo debug: painel WebSocket temporário
 };
 
+enum WifiReconnectPhase {
+    WIFI_RECONNECT_IDLE = 0,
+    WIFI_RECONNECT_IN_PROGRESS,
+    WIFI_RECONNECT_COOLDOWN
+};
+
 class HydroStateManager {
 private:
     HydroSystemState currentState;
@@ -38,6 +44,11 @@ private:
     
     Preferences preferences;
     String deviceID;
+
+    WifiReconnectPhase wifiReconnectPhase;
+    unsigned long wifiReconnectStartedMs;
+    unsigned long wifiLastAttemptMs;
+    uint8_t wifiReconnectAttempts;
     
     // Timeouts
     static const unsigned long WIFI_CONFIG_TIMEOUT = 600000;  // 10 min (mais tempo para configurar)
@@ -79,11 +90,18 @@ public:
     
     // ESP-NOW Status
     void printESPNowStatus();
+
+    void dumpWifiReconnectStatus(Stream& out) const;
     
 private:
     void cleanup();
     bool hasWiFiCredentials();
     void autoSwitchIfNeeded();
+    void handleWifiReconnectRuntime(unsigned long now);
+    void startWifiReconnectAttempt(unsigned long now);
+    void resetWifiReconnectState();
+    void armWifiStation(const String& ssid, const String& password);
+    static const char* wifiStatusString(wl_status_t status);
     String getDeviceID();
 };
 

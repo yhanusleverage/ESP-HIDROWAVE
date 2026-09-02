@@ -36,6 +36,7 @@ HydroControl::HydroControl()
     ecSetpoint = 0.0;
     ecTolerance = 50.0f;
     autoECEnabled = false;
+    autoECGracefulStopPending = false;
     lastECCheck = 0;
     lastECCheckAtMs = 0;
     autoECIntervalSeconds = 30;  // Padrão: 30 segundos
@@ -142,6 +143,9 @@ HydroControl::HydroControl()
     // ✅ Inicializar proporções dinâmicas
     activeNutrientsCount = 0;
     totalMlPerLiter = 0.0;
+    for (int i = 0; i < 6; i++) {
+        pumpFlowGhostMlPerSec[i] = 0.0f;
+    }
     for (int i = 0; i < 16; i++) {
         dynamicProportions[i].name = "";
         dynamicProportions[i].relay = i;
@@ -363,6 +367,7 @@ bool HydroControl::begin() {
     loadLevelInterlockModeFromNVS();
     loadECControllerConfig();
     loadNutrientProportions();
+    loadPumpFlowGhosts();
     loadPHControllerConfig();
     adaptivePhController.loadFromNVS();
     if (adaptivePhController.getValidLearningCycles() == 0) {
@@ -1048,6 +1053,20 @@ void HydroControl::checkAutoEC() {
     emitEcControllerMetric(needsAdj, applied, dosageML, dosageTime, ecError, seqForMetric);
 }
 
+bool HydroControl::isAutoEcCycleActive() const {
+    return currentState != IDLE || dilutionState != DILUTION_IDLE;
+}
+
+void HydroControl::completeAutoEcGracefulStopIfNeeded() {
+    if (!autoECGracefulStopPending) {
+        return;
+    }
+    autoECGracefulStopPending = false;
+    Serial.println(
+        "✅ [AUTO EC] Secuencia proporcional/recirc concluida apos desativar — parado");
+    notifyEcOperationChanged();
+}
+
 // ✅ Máquina de estados para dosagem sequencial
 void HydroControl::beginEcNutrientPulses() {
     if (currentNutrientIndex < 0 || currentNutrientIndex >= totalNutrients) {
@@ -1118,6 +1137,7 @@ void HydroControl::advanceAfterEcNutrientComplete(unsigned long now) {
             currentSequenceId = "";
             showMessage("Sequencia OK!");
             learnEcGainAfterSequence();
+            completeAutoEcGracefulStopIfNeeded();
             notifyEcOperationChanged();
         }
     } else {
@@ -1147,6 +1167,7 @@ void HydroControl::processSimpleSequential() {
             currentSequenceId = "";
             showMessage("Recirc OK");
             learnEcGainAfterSequence();
+            completeAutoEcGracefulStopIfNeeded();
             notifyEcOperationChanged();
         }
         return;
@@ -1369,7 +1390,7 @@ void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
     }
 }
 
-// ✅ Cancelar dosagem em andamento
+// ✅ Cancelar dosagem em andamento (aborto imediato — boot / emergencia)
 void HydroControl::cancelCurrentDosage() {
     if (dilutionState != DILUTION_IDLE) {
         Serial.println("\n🛑 CANCELANDO DILUIÇÃO EC...");
@@ -1400,6 +1421,7 @@ void HydroControl::cancelCurrentDosage() {
         ecGainLearnPending = false;
         
         Serial.println("✅ DOSAGEM CANCELADA - Sistema resetado para IDLE");
+        autoECGracefulStopPending = false;
         notifyEcOperationChanged();
     } else {
         Serial.println("ℹ️  Nenhuma dosagem ativa para cancelar");
@@ -1787,6 +1809,147 @@ float HydroControl::nutrientFlowRateMlPerSec(int idx) const {
     return 0.0f;
 }
 
+float HydroControl::getFlowRateMlPerSecForRelay(int relay) const {
+    if (relay < 0 || relay >= NUM_RELAYS) {
+        return 0.0f;
+    }
+    for (int i = 0; i < activeNutrientsCount; i++) {
+        if (dynamicProportions[i].active && dynamicProportions[i].relay == relay &&
+            dynamicProportions[i].flowRate > 0.01f) {
+            return dynamicProportions[i].flowRate;
+        }
+    }
+    if (relay >= 0 && relay < 6 && pumpFlowGhostMlPerSec[relay] > 0.01f) {
+        return pumpFlowGhostMlPerSec[relay];
+    }
+    if (relay == relayPhUp && flowRatePhUp > 0.01f) {
+        return flowRatePhUp;
+    }
+    if (relay == relayPhDown && flowRatePhDown > 0.01f) {
+        return flowRatePhDown;
+    }
+    return 0.0f;
+}
+
+void HydroControl::loadPumpFlowGhosts() {
+    for (int r = 0; r < 6; r++) {
+        const String key = "pump_flow_r" + String(r);
+        float q = 0.0f;
+        if (PreferencesManager::loadConfigFloat(key, q) && q > 0.01f) {
+            pumpFlowGhostMlPerSec[r] = q;
+        }
+    }
+    float qUp = 0.0f;
+    float qDown = 0.0f;
+    if (PreferencesManager::loadConfigFloat("ph_flow_up", qUp) && qUp > 0.01f) {
+        flowRatePhUp = qUp;
+    }
+    if (PreferencesManager::loadConfigFloat("ph_flow_down", qDown) && qDown > 0.01f) {
+        flowRatePhDown = qDown;
+    }
+}
+
+void HydroControl::savePumpFlowGhost(int relay) {
+    if (relay < 0 || relay >= 6) {
+        return;
+    }
+    const String key = "pump_flow_r" + String(relay);
+    PreferencesManager::saveConfigFloat(key, pumpFlowGhostMlPerSec[relay]);
+}
+
+void HydroControl::savePhFlowRatesToNVS() {
+    PreferencesManager::saveConfigFloat("ph_flow_up", flowRatePhUp);
+    PreferencesManager::saveConfigFloat("ph_flow_down", flowRatePhDown);
+}
+
+static float roundFlowMlPerSec(float v) {
+    return roundf(v * 1000.0f) / 1000.0f;
+}
+
+int HydroControl::applyPumpFlowCalib(int relay, float flowMlPerSec) {
+    if (relay < 0 || relay >= 6 || !(flowMlPerSec > 0.01f) || !isfinite(flowMlPerSec)) {
+        return 0;
+    }
+    flowMlPerSec = roundFlowMlPerSec(flowMlPerSec);
+
+    if (relayPhUp >= 0 && relay == relayPhUp) {
+        flowRatePhUp = flowMlPerSec;
+        setPhPumpConfig(relayPhUp, relayPhDown, flowRatePhUp, flowRatePhDown,
+                        mlPerPhUnitAcid, mlPerPhUnitBase);
+        savePhFlowRatesToNVS();
+        Serial.printf("[PUMP CALIB] pH Up R%d q=%.4f ml/s\n", relay + 1, flowMlPerSec);
+        return 2;
+    }
+    if (relayPhDown >= 0 && relay == relayPhDown) {
+        flowRatePhDown = flowMlPerSec;
+        setPhPumpConfig(relayPhUp, relayPhDown, flowRatePhUp, flowRatePhDown,
+                        mlPerPhUnitAcid, mlPerPhUnitBase);
+        savePhFlowRatesToNVS();
+        Serial.printf("[PUMP CALIB] pH Down R%d q=%.4f ml/s\n", relay + 1, flowMlPerSec);
+        return 2;
+    }
+
+    for (int i = 0; i < activeNutrientsCount; i++) {
+        if (dynamicProportions[i].active && dynamicProportions[i].relay == relay) {
+            dynamicProportions[i].flowRate = flowMlPerSec;
+            saveNutrientProportions();
+            pumpFlowGhostMlPerSec[relay] = 0.0f;
+            savePumpFlowGhost(relay);
+            Serial.printf("[PUMP CALIB] nutrient %s R%d q=%.4f ml/s\n",
+                          dynamicProportions[i].name.c_str(), relay + 1, flowMlPerSec);
+            return 1;
+        }
+    }
+
+    pumpFlowGhostMlPerSec[relay] = flowMlPerSec;
+    savePumpFlowGhost(relay);
+    Serial.printf("[PUMP CALIB] ghost R%d q=%.4f ml/s\n", relay + 1, flowMlPerSec);
+    return 1;
+}
+
+bool HydroControl::buildNutrientsJsonForCloud(String& out) const {
+    StaticJsonDocument<1536> doc;
+    JsonArray arr = doc.to<JsonArray>();
+    bool usedRelay[6] = {false, false, false, false, false, false};
+
+    for (int i = 0; i < activeNutrientsCount; i++) {
+        if (!dynamicProportions[i].active) {
+            continue;
+        }
+        const int relay = dynamicProportions[i].relay;
+        if (relay < 0 || relay >= 6) {
+            continue;
+        }
+        JsonObject o = arr.createNestedObject();
+        o["name"] = dynamicProportions[i].name;
+        o["relay"] = relay;
+        o["mlPerLiter"] = dynamicProportions[i].mlPerLiter;
+        o["active"] = true;
+        if (dynamicProportions[i].flowRate > 0.01f) {
+            o["flowRate"] = roundFlowMlPerSec(dynamicProportions[i].flowRate);
+        }
+        usedRelay[relay] = true;
+    }
+
+    for (int r = 0; r < 6; r++) {
+        if (usedRelay[r] || pumpFlowGhostMlPerSec[r] <= 0.01f) {
+            continue;
+        }
+        JsonObject o = arr.createNestedObject();
+        char nm[16];
+        snprintf(nm, sizeof(nm), "pump_r%d", r + 1);
+        o["name"] = nm;
+        o["relay"] = r;
+        o["mlPerLiter"] = 0;
+        o["active"] = false;
+        o["flowRate"] = roundFlowMlPerSec(pumpFlowGhostMlPerSec[r]);
+    }
+
+    out = "";
+    serializeJson(arr, out);
+    return out.length() > 2;
+}
+
 // ✅ Implementação dos setters com persistência automática
 void HydroControl::setECSetpoint(float setpoint, bool saveToNVS) {
     ecSetpoint = setpoint;
@@ -1803,8 +1966,16 @@ void HydroControl::setECTolerance(float tolerance, bool saveToNVS) {
 }
 
 void HydroControl::setAutoECEnabled(bool enabled, bool saveToNVS) {
-    if (!enabled && autoECEnabled) {
-        cancelCurrentDosage();
+    if (!enabled) {
+        if (isAutoEcCycleActive()) {
+            autoECGracefulStopPending = true;
+            Serial.println(
+                "⏸️ [AUTO EC] Desativado — a concluir secuencia proporcional/recirc em curso");
+        } else {
+            autoECGracefulStopPending = false;
+        }
+    } else {
+        autoECGracefulStopPending = false;
     }
     autoECEnabled = enabled;
     dilutionAutoEnabled = enabled || dilutionAutoEnabled;
@@ -2159,9 +2330,6 @@ const char* HydroControl::getEcOperationStateName() const {
     }
     if (dilutionState == DILUTION_RECIRCULATING) {
         return "recirculating";
-    }
-    if (!autoECEnabled && currentState != IDLE) {
-        return "idle";
     }
     switch (currentState) {
         case DOSING:
@@ -3257,6 +3425,7 @@ void HydroControl::processDilution() {
             lastECCheck = now;
             lastECCheckAtMs = now;
             showMessage("Diluicao OK");
+            completeAutoEcGracefulStopIfNeeded();
             notifyEcOperationChanged();
         }
     }

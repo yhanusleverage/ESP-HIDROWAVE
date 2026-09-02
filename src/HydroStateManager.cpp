@@ -1,4 +1,5 @@
 #include "HybridStateManager.h"
+#include "Config.h"
 #include <SPIFFS.h>
 #include <esp_task_wdt.h>  // ✅ CRÍTICO: Para esp_task_wdt_reset()
 #include "DeviceRegistration.h" // ✅ NOVO: Sistema de registro por email
@@ -17,7 +18,11 @@ HydroStateManager::HydroStateManager() :
     adminServer(nullptr),
     webServerTask(nullptr),
     espNowController(nullptr),
-    masterManager(nullptr) {  // ✅ NOVO: Inicializar como nullptr
+    masterManager(nullptr),
+    wifiReconnectPhase(WIFI_RECONNECT_IDLE),
+    wifiReconnectStartedMs(0),
+    wifiLastAttemptMs(0),
+    wifiReconnectAttempts(0) {
     
     deviceID = "ESP32_HIDRO_" + String((uint32_t)ESP.getEfuseMac(), HEX);
     Serial.println("🏗️ HydroStateManager inicializado");
@@ -102,55 +107,38 @@ void HydroStateManager::begin() {
             Serial.println("   Tentando continuar mesmo assim...");
         }
         
-        // Configurar WiFi em modo Station
-        WiFi.mode(WIFI_STA);
-        delay(100);  // ✅ Dar tempo ao WiFi processar mudança de modo
-        WiFi.begin(ssid.c_str(), password.c_str());
+        // Configurar WiFi em modo Station (mesma sequência que runtime reconnect)
+        armWifiStation(ssid, password);
         
         Serial.println("🔄 Conectando ao WiFi...");
         
-        // ✅ MELHORADO: Aguardar conexão por 20 segundos com feedback e reset de watchdog
         unsigned long startTime = millis();
         int dotCount = 0;
-        const unsigned long WIFI_TIMEOUT = 20000;  // ✅ AUMENTADO: 20 segundos (era 15s)
         
-        while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < WIFI_TIMEOUT) {
+        while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < WIFI_RECONNECT_TIMEOUT_MS) {
             delay(500);
-            esp_task_wdt_reset();  // ✅ CRÍTICO: Resetar watchdog durante espera
+            esp_task_wdt_reset();
             
             Serial.print(".");
             dotCount++;
             
-            // ✅ NOVO: Resetar WiFi se timeout parcial (15s) e ainda não conectado
             if ((millis() - startTime) > 15000 && WiFi.status() != WL_CONNECTED && dotCount % 10 == 0) {
                 Serial.println("\n⚠️ Timeout parcial - resetando WiFi...");
                 WiFi.disconnect();
                 delay(1000);
-                WiFi.begin(ssid.c_str(), password.c_str());
+                armWifiStation(ssid, password);
                 esp_task_wdt_reset();
             }
             
-            // Status detalhado a cada 5 tentativas (2.5s)
             if (dotCount % 5 == 0) {
-                wl_status_t status = WiFi.status();
-                Serial.print(" [");
-                switch (status) {
-                    case WL_IDLE_STATUS: Serial.print("IDLE"); break;
-                    case WL_NO_SSID_AVAIL: Serial.print("NO_SSID"); break;
-                    case WL_SCAN_COMPLETED: Serial.print("SCAN_DONE"); break;
-                    case WL_CONNECTED: Serial.print("CONNECTED"); break;
-                    case WL_CONNECT_FAILED: Serial.print("FAILED"); break;
-                    case WL_CONNECTION_LOST: Serial.print("LOST"); break;
-                    case WL_DISCONNECTED: Serial.print("DISCONNECTED"); break;
-                    default: Serial.print("UNKNOWN"); break;
-                }
-                Serial.print("] ");
+                Serial.printf(" [%s] ", wifiStatusString(WiFi.status()));
             }
         }
         
         Serial.println(); // Nova linha após os pontos
         
         if (WiFi.status() == WL_CONNECTED) {
+            WiFi.setSleep(WIFI_PS_NONE);
             Serial.println("\n🎉 === CONEXÃO WiFi ESTABELECIDA ===");
             Serial.println("✅ WiFi conectado com sucesso!");
             Serial.println("🌐 SSID: " + WiFi.SSID());
@@ -276,6 +264,7 @@ void HydroStateManager::switchToHydroActive() {
     cleanup();
     currentState = HYDRO_ACTIVE_MODE;
     stateStartTime = millis();
+    resetWifiReconnectState();
     
     // Verificar conexão WiFi
     if (!WiFi.isConnected()) {
@@ -532,27 +521,149 @@ void HydroStateManager::autoSwitchIfNeeded() {
             break;
             
         case HYDRO_ACTIVE_MODE:
-            // Verificar se WiFi ainda está conectado
-            if (!WiFi.isConnected()) {
-                Serial.println("❌ WiFi desconectado - Tentando reconectar...");
-                
-                // Tentar reconectar uma vez
-                String ssid = preferences.getString("ssid", "");
-                String password = preferences.getString("password", "");
-                
-                if (ssid.length() > 0) {
-                    WiFi.begin(ssid.c_str(), password.c_str());
-                    Serial.println("🔄 Tentando reconectar WiFi...");
-                    
-                    // ✅ CORRIGIDO: Reconexão não-bloqueante
-                    // A verificação será feita no próximo loop
-                    Serial.println("💡 Reconexão iniciada - será verificada no próximo ciclo");
-                } else {
+            handleWifiReconnectRuntime(now);
+            break;
+    }
+}
+
+const char* HydroStateManager::wifiStatusString(wl_status_t status) {
+    switch (status) {
+        case WL_IDLE_STATUS: return "IDLE";
+        case WL_NO_SSID_AVAIL: return "NO_SSID";
+        case WL_SCAN_COMPLETED: return "SCAN_DONE";
+        case WL_CONNECTED: return "CONNECTED";
+        case WL_CONNECT_FAILED: return "FAILED";
+        case WL_CONNECTION_LOST: return "LOST";
+        case WL_DISCONNECTED: return "DISCONNECTED";
+        default: return "UNKNOWN";
+    }
+}
+
+void HydroStateManager::armWifiStation(const String& ssid, const String& password) {
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    WiFi.setSleep(WIFI_PS_NONE);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid.c_str(), password.c_str());
+}
+
+void HydroStateManager::resetWifiReconnectState() {
+    wifiReconnectPhase = WIFI_RECONNECT_IDLE;
+    wifiReconnectStartedMs = 0;
+    wifiLastAttemptMs = 0;
+    wifiReconnectAttempts = 0;
+}
+
+void HydroStateManager::startWifiReconnectAttempt(unsigned long now) {
+    String ssid = preferences.getString("ssid", "");
+    String password = preferences.getString("password", "");
+    if (ssid.length() == 0) {
+        return;
+    }
+
+    WiFi.disconnect(false);
+    armWifiStation(ssid, password);
+
+    wifiReconnectPhase = WIFI_RECONNECT_IN_PROGRESS;
+    wifiReconnectStartedMs = now;
+
+    Serial.printf("[WiFi] Reconnect intento %u/%u SSID=%s\n",
+                  static_cast<unsigned>(wifiReconnectAttempts + 1),
+                  static_cast<unsigned>(WIFI_RECONNECT_MAX_ATTEMPTS),
+                  ssid.c_str());
+}
+
+void HydroStateManager::handleWifiReconnectRuntime(unsigned long now) {
+    if (WiFi.isConnected()) {
+        if (wifiReconnectPhase != WIFI_RECONNECT_IDLE) {
+            WiFi.setSleep(WIFI_PS_NONE);
+            Serial.println("[WiFi] Reconectado: " + WiFi.localIP().toString() +
+                           " RSSI=" + String(WiFi.RSSI()) + " dBm");
+        }
+        resetWifiReconnectState();
+        return;
+    }
+
+    switch (wifiReconnectPhase) {
+        case WIFI_RECONNECT_IDLE:
+            if (wifiLastAttemptMs == 0 ||
+                (now - wifiLastAttemptMs) >= WIFI_RETRY_INTERVAL_MS) {
+                if (!hasWiFiCredentials()) {
                     Serial.println("❌ Sem credenciais para reconexão");
                     switchToWiFiConfig();
+                    return;
                 }
+                startWifiReconnectAttempt(now);
             }
             break;
+
+        case WIFI_RECONNECT_IN_PROGRESS: {
+            wl_status_t st = WiFi.status();
+            if (st == WL_CONNECTED) {
+                WiFi.setSleep(WIFI_PS_NONE);
+                Serial.println("[WiFi] Reconectado: " + WiFi.localIP().toString() +
+                               " RSSI=" + String(WiFi.RSSI()) + " dBm");
+                resetWifiReconnectState();
+                return;
+            }
+
+            const bool authFailed = (st == WL_CONNECT_FAILED);
+            const bool timedOut =
+                (now - wifiReconnectStartedMs) >= WIFI_RECONNECT_TIMEOUT_MS;
+
+            if (authFailed || timedOut) {
+                wifiReconnectAttempts++;
+                Serial.printf("[WiFi] Intento %u/%u falló (%s)\n",
+                              static_cast<unsigned>(wifiReconnectAttempts),
+                              static_cast<unsigned>(WIFI_RECONNECT_MAX_ATTEMPTS),
+                              wifiStatusString(st));
+                wifiLastAttemptMs = now;
+
+                if (wifiReconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
+                    Serial.println("[WiFi] Max intentos — reiniciando...");
+                    delay(500);
+                    ESP.restart();
+                }
+
+                wifiReconnectPhase = WIFI_RECONNECT_COOLDOWN;
+            }
+            break;
+        }
+
+        case WIFI_RECONNECT_COOLDOWN:
+            if ((now - wifiLastAttemptMs) >= WIFI_RETRY_INTERVAL_MS) {
+                wifiReconnectPhase = WIFI_RECONNECT_IDLE;
+            }
+            break;
+    }
+}
+
+void HydroStateManager::dumpWifiReconnectStatus(Stream& out) const {
+    const char* phaseStr = "unknown";
+    switch (wifiReconnectPhase) {
+        case WIFI_RECONNECT_IDLE: phaseStr = "idle"; break;
+        case WIFI_RECONNECT_IN_PROGRESS: phaseStr = "in_progress"; break;
+        case WIFI_RECONNECT_COOLDOWN: phaseStr = "cooldown"; break;
+    }
+
+    out.printf("[WiFi STATUS] connected=%d wl=%s phase=%s attempts=%u/%u\n",
+               WiFi.isConnected() ? 1 : 0,
+               wifiStatusString(WiFi.status()),
+               phaseStr,
+               static_cast<unsigned>(wifiReconnectAttempts),
+               static_cast<unsigned>(WIFI_RECONNECT_MAX_ATTEMPTS));
+
+    if (WiFi.isConnected()) {
+        out.printf("  IP=%s SSID=%s RSSI=%d ch=%d\n",
+                   WiFi.localIP().toString().c_str(),
+                   WiFi.SSID().c_str(),
+                   WiFi.RSSI(),
+                   WiFi.channel());
+    } else if (wifiReconnectPhase == WIFI_RECONNECT_IN_PROGRESS) {
+        unsigned long elapsed = millis() - wifiReconnectStartedMs;
+        out.printf("  in_progress_ms=%lu timeout_ms=%u\n",
+                   static_cast<unsigned long>(elapsed),
+                   static_cast<unsigned>(WIFI_RECONNECT_TIMEOUT_MS));
     }
 }
 

@@ -558,12 +558,20 @@ public:
      * @brief Força re-descoberta de todos os Slaves
      */
     void rediscoverSlaves();
-    
+
+    /**
+     * @brief Ventana CONFIG: envia credenciais + discovery no canal marco cero
+     */
+    void runProvisioningIfNeeded();
+
+    uint8_t getLastEspNowChannel() const { return lastEspNowChannel; }
+    void saveEspNowLastChannel(uint8_t channel);
 
 private:
     ESPNowController* espNowController;  // Instância do ESPNowController
     bool initialized;                  // Status de inicialização
     unsigned long espnowLockWindowUntil;
+    uint8_t lastEspNowChannel;
     
     // ✅ PROTEÇÃO MULTI-CORE: Mutex para proteger trustedSlaves
     SemaphoreHandle_t trustedSlavesMutex;  // Mutex para acesso thread-safe

@@ -15,6 +15,7 @@
 // ✅ ESTRUCTURA SIMPLE DE MASTER-TASK (100% funcional)
 #include "ESPNowController.h"       // 📡 Controlador ESP-NOW (Core 0)
 #include "MasterSlaveManager.h"     // 🎯 Sistema inteligente Master (Core 0)
+#include "EspNowChannelPolicy.h"
 #include "WebServerTask.h"          // 🌐 WebServer Task (Core 1)
 #include "ObjectPoolManager.h"      // ✅ Object Pool Pattern (SSL, HTTP, JSON)
 #include "ResourceTelemetry.h"
@@ -42,7 +43,10 @@ int globalRebootCount = 0;  // Contador de reinícios (carregado do NVS no setup
 
 // ===== PROTÓTIPOS DE FUNÇÃO =====
 #ifdef MASTER_MODE
+#if ENABLE_ESPNOW
 void setupCallbacks();
+void espNowTask(void* parameter);
+#endif
 void onChannelChange(uint8_t newChannel);
 void addSlaveToList(const uint8_t* macAddress, const String& deviceName, const String& deviceType, uint8_t numRelays);
 uint8_t* findSlaveMac(const String& slaveName);
@@ -58,8 +62,6 @@ void printSystemStatus();
 // ✅ Forward declarations para funciones usadas por printHelp() y printSystemStatus()
 void printMasterHelp();  // ✅ Forward declaration para printHelp()
 void printMasterStatus();  // ✅ Forward declaration para printSystemStatus()
-// ✅ Task dedicada para ESP-NOW (Core 0)
-void espNowTask(void* parameter);
 #endif
 
 #ifdef SLAVE_MODE
@@ -70,10 +72,9 @@ void handleSlaveRelayCommand(const String& command);
 
 #ifdef MASTER_MODE
     // ✅ ESTRUCTURA PROFESIONAL: ESP-NOW en Task dedicada (Core 0)
-    // 📡 ESP-NOW Task en Core 0 (mismo core que WiFi)
-    ESPNowController master("MasterController", 1);  // Instancia para ESP-NOW
-    
-    // 🎯 SISTEMA PROFESIONAL MASTER-SLAVE (Core 0)
+#if ENABLE_ESPNOW
+    ESPNowController master("MasterController", 1);
+#endif
     MasterSlaveManager* masterManager = nullptr;
 
     static void runSlaveRelayMask(uint8_t mask, const char* tag) {
@@ -279,6 +280,7 @@ void emergencyProtection() {
 // ===== FUNCIONES ESPECÍFICAS PARA MODO MASTER ESP-NOW =====
 #ifdef MASTER_MODE
 
+#if ENABLE_ESPNOW
 void setupCallbacks() {
     // ✅ CRÍTICO: Configurar callbacks do MasterSlaveManager (recebe notificações do ESPNowController)
     if (masterManager) {
@@ -416,6 +418,8 @@ void setupCallbacks() {
         });
     }
 }
+
+#endif  // ENABLE_ESPNOW
 
 void addSlaveToList(const uint8_t* macAddress, const String& deviceName, 
                    const String& deviceType, uint8_t numRelays) {
@@ -1893,6 +1897,11 @@ void handleGlobalSerialCommands() {
         Serial.println("   auto_reconnect   - Reconexão automática");
         Serial.println("   discovery_stats  - Estatísticas de descoberta");
         Serial.println("   connection_health - Saúde da conexão");
+#if ENABLE_HMI_UART && UART_BRINGUP
+        Serial.println("\n🔌 UART BRINGUP:");
+        Serial.println("   uart_status      - Contadores RX + pines HMI link");
+        Serial.println("   wifi_status      - Fase reconnect WiFi + WL status");
+#endif
         Serial.println("   help             - Esta ajuda");
         Serial.println("===============================\n");
     }
@@ -1919,6 +1928,14 @@ void handleGlobalSerialCommands() {
         Serial.println("⬇️ Mínimo: " + String(minHeapSeen) + " bytes");
         Serial.println("============================\n");
     }
+#if ENABLE_HMI_UART && UART_BRINGUP
+    else if (command == "uart_status") {
+        HydroSystemCore::dumpHmiUartLinkStatusStatic(Serial);
+    }
+    else if (command == "wifi_status") {
+        stateManager.dumpWifiReconnectStatus(Serial);
+    }
+#endif
     else if (command == "reset") {
         Serial.println("🔄 REINICIANDO ESP32...");
         delay(1000);
@@ -2450,6 +2467,7 @@ void setup() {
     
     // ===== INICIALIZAÇÃO ESP-NOW (ESTRUCTURA DE MASTER-TASK) =====
 #ifdef MASTER_MODE
+#if ENABLE_ESPNOW
     // ⭐ POTENCIA MÁXIMA: Leer device_name de Preferences y actualizar Master
     Preferences prefs;
     if (prefs.begin("hydro_system", true)) {
@@ -2660,6 +2678,17 @@ void setup() {
     Serial.println();
     Serial.print("> ");
     
+#else  // !ENABLE_ESPNOW
+    Serial.println();
+    Serial.println("╔════════════════════════════════════════════════════╗");
+    Serial.println("║   📡 ESP-NOW DESACTIVADO (ENABLE_ESPNOW=0)         ║");
+    Serial.println("╚════════════════════════════════════════════════════╝");
+    Serial.println("   Modo bancada: WiFi + MQTT sin radio ESP-NOW");
+    Serial.println("   Para reactivar: env esp32dev | espn ow en secrets=1");
+    stateManager.setESPNowController(nullptr);
+    stateManager.setMasterManager(nullptr);
+#endif  // ENABLE_ESPNOW
+    
 #if ENABLE_LOCAL_ADMIN_HTTP
     // 🌐 FASE 3: Inicializar WebServerTask en Core 1 (AsyncWebServer + REST API)
     Serial.println();
@@ -2785,6 +2814,7 @@ void loop() {
 // Nota: handleRelayCommand já está implementada acima na linha 711
 
 #ifdef MASTER_MODE
+#if ENABLE_ESPNOW
 /**
  * @brief Task dedicada para ESP-NOW (Core 0)
  * Esta task processa toda a comunicação ESP-NOW de forma dedicada
@@ -2797,12 +2827,13 @@ void espNowTask(void* parameter) {
     // Variáveis para timing
     unsigned long lastDiscovery = 0;
     unsigned long lastStatsUpdate = 0;
-    const unsigned long DISCOVERY_INTERVAL = 120000;     // 120 segundos
-    const unsigned long STATS_UPDATE_INTERVAL = 120000;  // 2 minutos
+    const unsigned long bootMs = millis();
     
     while (true) {
         // ✅ Processar ESP-NOW de forma dedicada
         if (masterManager) {
+            EspNowChannelPolicy::tickProvisioningCountdown();
+            masterManager->runProvisioningIfNeeded();
             masterManager->update();        // Sistema de retry, ACKs, status
         }
         
@@ -2810,13 +2841,26 @@ void espNowTask(void* parameter) {
             master.update();                // ESPNowController (cleanup peers, discovery)
         }
         
-        // Monitorar slaves periodicamente
         monitorSlaves();
         
-        // ✅ Discovery automático (a cada 30s) — único owner; skip se todos online
+        // Discovery automático — rápido no boot; depois lento se slave offline (libera radio p/ MQTT)
         unsigned long now = millis();
-        if (now - lastDiscovery > DISCOVERY_INTERVAL) {
-            if (masterManager) {
+        unsigned long discoveryInterval = ESPNOW_DISCOVERY_IDLE_MS;
+        if (masterManager) {
+            const int trusted = masterManager->getTrustedSlaveCount();
+            const int online = masterManager->getOnlineSlaveCount();
+            if (now - bootMs < ESPNOW_DISCOVERY_BOOT_GRACE_MS) {
+                discoveryInterval = DISCOVERY_INTERVAL_MS;
+            } else if (trusted == 0) {
+                discoveryInterval = ESPNOW_DISCOVERY_IDLE_MS;
+            } else if (online == 0) {
+                discoveryInterval = ESPNOW_DISCOVERY_IDLE_MS;
+            } else if (online < trusted) {
+                discoveryInterval = ESPNOW_DISCOVERY_SLOW_MS;
+            }
+        }
+        if (now - lastDiscovery > discoveryInterval) {
+            if (masterManager && EspNowChannelPolicy::canRunEspNowDiscovery()) {
                 const int trusted = masterManager->getTrustedSlaveCount();
                 const int online = masterManager->getOnlineSlaveCount();
                 if (trusted == 0 || online < trusted) {
@@ -2826,7 +2870,8 @@ void espNowTask(void* parameter) {
             lastDiscovery = now;
         }
         
-        // ✅ Estatísticas periódicas (a cada 2 minutos)
+        // Estatísticas periódicas (a cada 2 minutos)
+        const unsigned long STATS_UPDATE_INTERVAL = 120000;
         if (now - lastStatsUpdate > STATS_UPDATE_INTERVAL) {
             if (masterManager) {
                 Serial.printf("\n📊 [TASK] Slaves online: %d / %d\n", 
@@ -2840,7 +2885,8 @@ void espNowTask(void* parameter) {
         vTaskDelay(pdMS_TO_TICKS(50)); // 50ms - permite processamento de callbacks ESP-NOW
     }
 }
-#endif
+#endif  // ENABLE_ESPNOW
+#endif  // MASTER_MODE
 
 #ifdef SLAVE_MODE
 void handleSlaveSerialCommands() {

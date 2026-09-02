@@ -1,4 +1,6 @@
 #include "MasterSlaveManager.h"
+#include "EspNowChannelPolicy.h"
+#include "PreferencesManager.h"
 #include "Config.h"
 #include <WiFi.h>
 #include "MASTER_CONFIG.h"
@@ -23,7 +25,7 @@ static String resolveSlaveEspAction(const String& action, const String& commandM
 
 MasterSlaveManager::MasterSlaveManager(ESPNowController* espNowController) 
     : espNowController(espNowController), initialized(false),
-      espnowLockWindowUntil(0),
+      espnowLockWindowUntil(0), lastEspNowChannel(0),
       totalPingsReceived(0), totalPongsSent(0), totalAcksSent(0), 
       totalAcksReceived(0), totalErrors(0), commandIdCounter(0),
       processingStatusResponse(false), lastEspNowSendAt_(0) {
@@ -93,6 +95,11 @@ bool MasterSlaveManager::begin() {
         Serial.println("✅ Peers confiáveis restaurados");
     } else {
         Serial.println("💡 Nenhum peer em cache (primeira inicialização)");
+    }
+
+    lastEspNowChannel = EspNowChannelPolicy::loadLastChannelFromNvs();
+    if (lastEspNowChannel > 0) {
+        Serial.printf("📶 Canal ESP-NOW NVS: %u\n", lastEspNowChannel);
     }
 
     // ✅ NOVO: Carregar cache de estados de slaves de NVS
@@ -387,6 +394,62 @@ void MasterSlaveManager::refreshEspNowPeersOnCurrentChannel() {
         Serial.printf("   peer %s → ch %u\n",
                       ESPNowController::macToString(slave.macAddress).c_str(), channel);
     });
+    saveEspNowLastChannel(channel);
+}
+
+void MasterSlaveManager::saveEspNowLastChannel(uint8_t channel) {
+    if (channel < 1 || channel > 13) {
+        return;
+    }
+    lastEspNowChannel = channel;
+    EspNowChannelPolicy::saveLastChannelToNvs(channel);
+}
+
+void MasterSlaveManager::runProvisioningIfNeeded() {
+#if !ENABLE_ESPNOW || !ESPNOW_PROVISIONING_ENABLED
+    return;
+#endif
+    if (!initialized || !espNowController) {
+        return;
+    }
+
+    static unsigned long lastBurstMs = 0;
+    static const unsigned long bootMs = millis();
+    const unsigned long now = millis();
+
+    if (now - bootMs > ESPNOW_PROVISIONING_BURST_MS) {
+        return;
+    }
+
+    const int trusted = getTrustedSlaveCount();
+    const int online = getOnlineSlaveCount();
+    if (trusted > 0 && online >= trusted) {
+        return;
+    }
+
+    if (lastBurstMs != 0 && (now - lastBurstMs) < 4000UL) {
+        return;
+    }
+    lastBurstMs = now;
+
+    String ssid;
+    String password;
+    uint8_t storedChannel = 0;
+    if (!EspNowChannelPolicy::loadWifiCredentials(ssid, password, storedChannel)) {
+        return;
+    }
+
+    uint8_t opChannel = ESPNOW_CHANNEL;
+    if (WiFi.isConnected()) {
+        opChannel = WiFi.channel();
+    } else if (storedChannel >= 1 && storedChannel <= 13) {
+        opChannel = storedChannel;
+    }
+
+    EspNowChannelPolicy::runProvisioningBurst(espNowController, this, ssid, password, opChannel);
+    if (WiFi.isConnected()) {
+        saveEspNowLastChannel(opChannel);
+    }
 }
 
 bool MasterSlaveManager::forEachTrustedSlave(const std::function<void(const TrustedSlave&)>& visitor) {
@@ -1019,8 +1082,10 @@ void MasterSlaveManager::touchSlaveLink(const uint8_t* mac, const char* reason) 
 // ===== MÉTODOS PRIVADOS =====
 
 void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t pingId) {
+#if ESPNOW_LINK_VERBOSE
     Serial.printf("[ESPNOW] PING rx %s id=%u\n",
                   ESPNowController::macToString(senderMac).c_str(), pingId);
+#endif
     LOG_ESPNOW_DEBUG("\n🏓 PING RECEBIDO DO SLAVE: " + ESPNowController::macToString(senderMac));
     
     // ✅ PROTEÇÃO MULTI-CORE: Lock mutex antes de verificar/adicionar
@@ -1183,8 +1248,10 @@ void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t 
 }
 
 void MasterSlaveManager::processPongReceived(const uint8_t* senderMac, uint32_t pongId) {
+#if ESPNOW_LINK_VERBOSE
     Serial.printf("[ESPNOW] PONG rx %s id=%u\n",
                   ESPNowController::macToString(senderMac).c_str(), pongId);
+#endif
 
     if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         TrustedSlave* slave = findTrustedSlaveUnsafe(senderMac);
@@ -1279,12 +1346,7 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
             Serial.println("==============================================\n");
         }
     } else if (espNowController && espNowController->peerExists(senderMac)) {
-        // 🚨 CRÍTICO: Verificar se canal mudou e atualizar peer se necessário
         if (peerChannel > 0 && peerChannel <= 13) {
-            Serial.println("✅ Slave já está registrado como peer ESP-NOW");
-            Serial.println("📶 Canal WiFi do Slave: " + String(peerChannel));
-            
-            // 🚨 CRÍTICO: Verificar se o canal do peer precisa ser atualizado
             esp_now_peer_info_t peerInfo;
             if (esp_now_get_peer(senderMac, &peerInfo) == ESP_OK) {
                 if (peerInfo.channel != peerChannel) {
@@ -1294,11 +1356,9 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
                     Serial.println("   📶 Canal atual do peer: " + String(peerInfo.channel));
                     Serial.println("   📶 Canal real do Slave: " + String(peerChannel));
                     Serial.println("   🔄 Atualizando peer para sincronizar canais...");
-                    
-                    // Remover peer existente
+
                     esp_now_del_peer(senderMac);
-                    
-                    // Adicionar peer com canal correto
+
                     if (espNowController->addPeerWithChannel(senderMac, peerChannel, deviceName)) {
                         Serial.println("   ✅ Peer actualizado al canal " + String(peerChannel) + "!");
                         Serial.println("   📡 Comunicação bidirecional sincronizada!");
@@ -1306,12 +1366,18 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
                         Serial.println("   ❌ Falha ao actualizar peer");
                     }
                     Serial.println("========================================\n");
+#if ESPNOW_LINK_VERBOSE
                 } else {
+                    Serial.println("✅ Slave já está registrado como peer ESP-NOW");
+                    Serial.println("📶 Canal WiFi do Slave: " + String(peerChannel));
                     Serial.println("   ✅ Canal do peer já está sincronizado (canal " + String(peerChannel) + ")");
+#endif
                 }
             }
+#if ESPNOW_LINK_VERBOSE
         } else {
             Serial.println("✅ Slave já está registrado como peer ESP-NOW\n");
+#endif
         }
     }
     
@@ -1390,8 +1456,10 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
         
         if (isNewSlave) {
             Serial.println("📊 Slave configurado na lista confiável");
+#if ESPNOW_LINK_VERBOSE
         } else {
             Serial.println("📊 Informações atualizadas na lista confiável");
+#endif
         }
     } else {
         xSemaphoreGive(trustedSlavesMutex);
@@ -1401,8 +1469,10 @@ void MasterSlaveManager::processDeviceInfoReceived(const uint8_t* senderMac, con
     if (deviceInfoCallback && !isNewSlave) {
         deviceInfoCallback(senderMac, deviceName, deviceType, numRelays, operational, wifiChannel);
     }
-    
+
+#if ESPNOW_LINK_VERBOSE
     Serial.println("========================================\n");
+#endif
 }
 
 void MasterSlaveManager::processRelayStatusReceived(const uint8_t* senderMac, int relayNumber, bool state, bool hasTimer, int remainingTime, const String& name) {
@@ -1579,8 +1649,9 @@ void MasterSlaveManager::resendPendingAcks() {
 
 void MasterSlaveManager::onPingReceivedStatic(const uint8_t* senderMac) {
     if (instance) {
-        // ✅ CORREÇÃO CRÍTICA: Log para diagnosticar se callback está sendo chamado
+#if ESPNOW_LINK_VERBOSE
         Serial.println("\n🔔 [CALLBACK] onPingReceivedStatic chamado para: " + ESPNowController::macToString(senderMac));
+#endif
         // O ESPNowController já responde automaticamente ao PING com PONG
         // Aqui processamos nossa lógica adicional
         instance->processPingReceived(senderMac, millis());  // Usar timestamp como ID
@@ -1746,6 +1817,34 @@ void MasterSlaveManager::rediscoverSlaves() {
     if (getTrustedSlaveCount() > 0 && getOnlineSlaveCount() >= getTrustedSlaveCount()) {
         LOG_ESPNOW_DEBUG("Discovery skip: todos slaves online");
         return;
+    }
+
+    static unsigned long lastOfflineDiscoverMs = 0;
+    static uint8_t offlineDiscoverStreak = 0;
+    const int trusted = getTrustedSlaveCount();
+    const int online = getOnlineSlaveCount();
+
+    if (trusted > 0 && online == 0) {
+        unsigned long minGap = ESPNOW_DISCOVERY_SLOW_MS;
+        if (offlineDiscoverStreak >= 2) {
+            minGap = ESPNOW_DISCOVERY_IDLE_MS;
+        }
+        const unsigned long since = millis() - lastOfflineDiscoverMs;
+        if (lastOfflineDiscoverMs != 0 && since < minGap) {
+            LOG_ESPNOW_DEBUG("Discovery skip: slave offline (backoff)");
+            return;
+        }
+        lastOfflineDiscoverMs = millis();
+        offlineDiscoverStreak++;
+        const unsigned long nextInSec =
+            (since < minGap) ? ((minGap - since) / 1000UL) : 0UL;
+        Serial.printf("[ESPNOW] Discovery lento (slave offline %u/%u, streak=%u, próx em %lus)\n",
+                      static_cast<unsigned>(online),
+                      static_cast<unsigned>(trusted),
+                      static_cast<unsigned>(offlineDiscoverStreak),
+                      nextInSec);
+    } else if (online > 0) {
+        offlineDiscoverStreak = 0;
     }
     
     // ✅ PATRÓN MASTER-TASK: Verificar se peer de broadcast está registrado
