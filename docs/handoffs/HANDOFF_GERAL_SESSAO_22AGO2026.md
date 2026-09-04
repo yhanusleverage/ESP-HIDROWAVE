@@ -69,6 +69,7 @@ UI  ←WSS/REST→  Supabase  ←bridge←  Mosquitto  ←  Core  ←ESP-NOW→ 
 | 5 | `performRediscoveryIfNeeded` | Não hop se já no canal NVS; 180 s se NVS vazio |
 
 Docs: [ESPNOW_LOCK_WINDOW.md](espnow/ESPNOW_LOCK_WINDOW.md).  
+Provisioning ciclo 11→op: [HANDOFF_PROVISIONING_CICLO_11.md](espnow/HANDOFF_PROVISIONING_CICLO_11.md) (`ESPNOW_PROVISIONING_STA_SUSPEND=1`).  
 Debug: `ESPNOW_LOCK_DEBUG` / `[LOCK]` `[SCAN]`. Depois: `0` só no Master.
 
 **Bug que já se corrigiu no Slave:** `waitForMasterResponse()` zerava `masterFound` a cada espera.

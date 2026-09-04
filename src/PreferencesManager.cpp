@@ -367,6 +367,10 @@ bool PreferencesManager::loadConfig(const String& key, String& value) {
         }
         return false;
     } else {
+        // Evita log ERROR Preferences getString NOT_FOUND (ex.: circ_slave_mac antes da tipagem)
+        if (!preferences.isKey(key.c_str())) {
+            return false;
+        }
         value = preferences.getString(key.c_str(), "");
         return !value.isEmpty();
     }

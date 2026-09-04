@@ -168,6 +168,62 @@ Guardar: Ctrl+O, Enter, Ctrl+X.
 
 ```bash
 sudo systemctl restart mosquitto
+sudo grep -n 'ec_gain\|ph_gain' /var/lib/mosquitto/acl
+```
+
+---
+
+## 2b. circ/config + rules/# (tipagem / Motor → Core)
+
+`write hidrowave/{id}/#` del ESP **no** da **subscribe**. Railway tampoco puede publicar `circ/config` ni `rules/#` sin write explícito.
+
+### Opción A — script (recomendado)
+
+**PowerShell:**
+
+```powershell
+scp -i $pem -o StrictHostKeyChecking=accept-new `
+  "$root\infra\mqtt\mosquitto\patch-acl-rules-circ.sh" `
+  "${sshHost}:/tmp/patch-acl-rules-circ.sh"
+```
+
+**VM:**
+
+```bash
+sed -i 's/\r$//' /tmp/patch-acl-rules-circ.sh
+sudo bash /tmp/patch-acl-rules-circ.sh
+sudo grep -n 'circ/config\|rules' /var/lib/mosquitto/acl
+sudo systemctl is-active mosquitto
+```
+
+Esperado: líneas `write hidrowave/+/circ/config`, `write hidrowave/+/rules/#`, y `read …/circ/config` + `read …/rules/#` por cada master.
+
+### Opción B — nano manual
+
+En bloque `user hidrowave`, después de `ph/config`:
+
+```text
+topic write hidrowave/+/circ/config
+topic write hidrowave/+/rules/#
+```
+
+En **cada** master, antes del `write …/#`:
+
+```text
+topic read hidrowave/ESP32_HIDRO_XXXXXX/circ/config
+topic read hidrowave/ESP32_HIDRO_XXXXXX/rules/#
+```
+
+Luego: `sudo systemctl restart mosquitto`.
+
+---
+
+## 3. Verificar bridge / gain (sin cambiar ACL de tipagem)
+
+Tras el patch de gains (§2), confirmar:
+
+```bash
+sudo systemctl restart mosquitto
 sudo grep -n ec_gain /var/lib/mosquitto/acl
 ```
 
@@ -185,7 +241,7 @@ Esperado: `[bridge] ec_gain PATCH ec_config_view ... k_value=...`
 
 ---
 
-## 3. Atajo script (solo index.js)
+## 3b. Atajo script (solo index.js)
 
 ```powershell
 cd "$root\infra\mqtt\bridge\scripts"
@@ -224,6 +280,8 @@ user hidrowave
 topic write hidrowave/+/command
 topic write hidrowave/+/ec/config
 topic write hidrowave/+/ph/config
+topic write hidrowave/+/circ/config
+topic write hidrowave/+/rules/#
 topic read hidrowave/+/#
 
 # --- Master ESP32_HIDRO_1A575C ---
@@ -231,6 +289,8 @@ user mqtt_ESP32_HIDRO_1A575C
 topic read hidrowave/ESP32_HIDRO_1A575C/command
 topic read hidrowave/ESP32_HIDRO_1A575C/ec/config
 topic read hidrowave/ESP32_HIDRO_1A575C/ph/config
+topic read hidrowave/ESP32_HIDRO_1A575C/circ/config
+topic read hidrowave/ESP32_HIDRO_1A575C/rules/#
 topic write hidrowave/ESP32_HIDRO_1A575C/#
 
 # --- Master ESP32_HIDRO_269844 ---
@@ -238,10 +298,12 @@ user mqtt_ESP32_HIDRO_269844
 topic read hidrowave/ESP32_HIDRO_269844/command
 topic read hidrowave/ESP32_HIDRO_269844/ec/config
 topic read hidrowave/ESP32_HIDRO_269844/ph/config
+topic read hidrowave/ESP32_HIDRO_269844/circ/config
+topic read hidrowave/ESP32_HIDRO_269844/rules/#
 topic write hidrowave/ESP32_HIDRO_269844/#
 ```
 
-`write hidrowave/{id}/#` del ESP **no** alcanza para **leer** `ec/config`.
+`write hidrowave/{id}/#` del ESP **no** alcanza para **leer** `ec/config`, `circ/config` ni `rules/#`.
 
 ---
 
@@ -262,8 +324,10 @@ topic write hidrowave/ESP32_HIDRO_269844/#
 ```text
 sudo systemctl is-active mosquitto hidrowave-bridge  → active active
 sudo grep ec/config /var/lib/mosquitto/acl           → write + read por device
-serial ESP: subscribe ec/config
+sudo grep 'circ/config\|rules' /var/lib/mosquitto/acl → write Railway + read por device
+serial ESP: subscribe ec/config + circ/config + rules/#
 Guardar Auto EC en web → [MQTT] rx …/ec/config → apply via=mqtt
+Tipagem / Resync ↻ → [MQTT] rules upsert … ok
 Auto EC aprende K → [MQTT] ec_gain → bridge PATCH k_value
 ```
 

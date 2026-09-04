@@ -20,6 +20,8 @@ struct MqttTelemetryReading {
     bool phValid;      // lectura fresca y plausible (no caché stale)
     bool ecValid;
     bool tempValid;
+    bool circulationTyped;
+    bool circulationMixOk;
 };
 
 struct MqttHeartbeatReading {
@@ -79,6 +81,8 @@ struct MqttLevelsReading {
     const char* waterLevel;
     bool levelsSimulated;
     const char* interlockMode;  // normal|carrera
+    bool circulationTyped;
+    bool circulationMixOk;
 };
 
 struct MqttPhDoseReading {
@@ -126,6 +130,18 @@ struct MqttPhMetricReading {
     bool adjustmentNeeded;
     bool adjustmentApplied;
     const char* sequenceId;
+};
+
+/** hidrowave/{id}/rule_executed — DE local → bridge INSERT relay_commands (completed) */
+struct MqttRuleExecutedReading {
+    const char* event_id;
+    const char* rule_id;
+    int relay_index;
+    const char* action;
+    bool current_state;
+    bool success;
+    uint32_t duration_sec;
+    const char* slave_mac;
 };
 
 /** hidrowave/{id}/command_ack — bridge → complete_relay_command */
@@ -188,6 +204,8 @@ public:
     /** hidrowave/{id}/ph_gain — bridge → PATCH ph_config_view k_acid/k_base */
     bool publishPhGain(float kAcid, float kBase);
     bool publishCommandAck(const MqttCommandAckReading& reading);
+    /** hidrowave/{id}/rule_executed — espejo historial DE local (fire-and-forget) */
+    bool publishRuleExecuted(const MqttRuleExecutedReading& reading);
     bool publishRelayState(const MqttRelayStateReading& reading);
 
     void setIncomingHandler(MqttIncomingHandler handler, void* userData);
@@ -204,6 +222,9 @@ private:
     String commandTopic;
     String ecConfigTopic;
     String phConfigTopic;
+    String circConfigTopic;
+    String rulesWildcardTopic;
+    String rulesManifestTopic;
     String ecOperationTopic;
     String doseTopic;
     String phOperationTopic;
@@ -214,6 +235,7 @@ private:
     String phGainTopic;
     String ecDilutionTopic;
     String commandAckTopic;
+    String ruleExecutedTopic;
     String relayStateTopic;
     char lwtPayload[128];
     unsigned long lastReconnectAttempt;
@@ -255,6 +277,7 @@ public:
     bool publishEcGain(float) { return false; }
     bool publishPhGain(float, float) { return false; }
     bool publishCommandAck(const MqttCommandAckReading&) { return false; }
+    bool publishRuleExecuted(const MqttRuleExecutedReading&) { return false; }
     bool publishRelayState(const MqttRelayStateReading&) { return false; }
     void setIncomingHandler(MqttIncomingHandler, void*) {}
 };

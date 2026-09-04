@@ -130,7 +130,7 @@ private:
         bool currentState;
         uint8_t attempts;
     };
-    static const size_t PENDING_CLOUD_ACK_CAP = 8;
+    static const size_t PENDING_CLOUD_ACK_CAP = 32;
     static const uint8_t PENDING_CLOUD_ACK_MAX_ATTEMPTS = 20;
     PendingCloudAck pendingCloudAckQueue[PENDING_CLOUD_ACK_CAP];
     uint8_t pendingCloudAckHead;
@@ -181,9 +181,14 @@ private:
     SemaphoreHandle_t mappingsMutex;
     
     // ✅ NOVO: Funções de mapeamento
-    void addCommandMapping(uint32_t espNowCommandId, int supabaseCommandId);
+    void addCommandMapping(uint32_t espNowCommandId, int supabaseCommandId, bool quiet = false);
     int findSupabaseCommandId(uint32_t espNowCommandId);
+    /** Remove todos os mapeamentos de um espNow id (batch mask ACK). */
+    void drainSupabaseMappingsForEspNow(uint32_t espNowCommandId, std::vector<int>& out);
     void cleanupExpiredMappings();
+    /** Fecha todos os tickets Supabase pendentes de um batch (ACK relé 255 / máscara). */
+    void completePendingAcksForEspNowCommand(uint32_t espNowCommandId, const uint8_t* slaveMac,
+                                             const char* via);
 
     /** Espera de ACK slave (fallback via ALL_RELAYS_STATUS) */
     struct PendingSlaveCommandAck {
@@ -227,9 +232,12 @@ private:
     void markRecentlyClosedCloudAck(int supabaseCommandId);
 #if ENABLE_MQTT
     unsigned long mqttConnectedSinceMs;
+    unsigned long lastRuleExecutedMirrorMs;
     bool mqttEcConfigReceived;
     bool mqttPhConfigReceived;
     bool isMqttCommandPathStable() const;
+    static void onRuleExecutedMirrorStatic(const RuleExecutedMirrorEvent& event, void* userData);
+    void mirrorRuleExecuted(const RuleExecutedMirrorEvent& event);
     bool tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
                                    const uint8_t* slaveMac, int relayNumber, bool currentState,
                                    const char* status = "completed");
@@ -265,6 +273,36 @@ private:
                                        const int remaining[8], uint8_t numRelays, bool linkOnline) const;
     void rememberPublishedRelayState(const uint8_t* mac, const bool states[8], const bool timers[8],
                                      const int remaining[8], uint8_t numRelays, bool linkOnline);
+#endif
+
+#if ESPNOW_RELAY_BATCH_ENABLED
+    struct EspNowRelayBatchItem {
+        int supabaseCommandId;
+        int relayNumber;
+        bool wantOn;
+    };
+    static const size_t ESPNOW_RELAY_BATCH_SLOTS = 4;
+    static const size_t ESPNOW_RELAY_BATCH_MAX_ITEMS = 8;
+    struct EspNowRelayBatchSlot {
+        uint8_t mac[6];
+        bool active;
+        unsigned long flushAtMs;
+        unsigned long openedAtMs;
+        uint8_t desiredMask;
+        bool maskInitialized;
+        RelayOwner owner;
+        EspNowRelayBatchItem items[ESPNOW_RELAY_BATCH_MAX_ITEMS];
+        size_t itemCount;
+    };
+    EspNowRelayBatchSlot espNowRelayBatchSlots_[ESPNOW_RELAY_BATCH_SLOTS];
+
+    static bool isEspNowRelayBatchEligible(const RelayCommand& cmd, bool isSlave);
+    int findEspNowRelayBatchSlot(const uint8_t* mac, bool create);
+    bool initEspNowRelayBatchMask(EspNowRelayBatchSlot& slot);
+    bool tryQueueEspNowRelayBatch(const RelayCommand& cmd, const uint8_t* targetMac, RelayOwner owner);
+    void flushEspNowRelayBatchSlot(EspNowRelayBatchSlot& slot, const char* reason);
+    void flushEspNowRelayBatchesDue(unsigned long now);
+    void flushAllEspNowRelayBatches(const char* reason);
 #endif
     
 public:
@@ -331,9 +369,16 @@ private:
     // Operações principais
     void applyBootPolicies();
     void initDecisionEngine();
-    void checkSupabaseRules();  // sync config only (decision_rules → LittleFS)
+    void wireRelayCoordinatorPolicyCallbacks();
+    void checkSupabaseRules();  // stub HTTPS; tipagem via MQTT circ/config
     bool applyECConfig(const ECConfig& config, const char* via);
     bool applyPHConfig(const PHConfig& config, const char* via);
+    bool applyCirculationConfigMqtt(const char* payload, size_t length);
+    bool upsertFnCirculationRule(const char* slaveMac, int relayIndex, bool enabled);
+    bool applyRuleUpsertMqtt(const char* payload, size_t length);
+    bool applyRulesManifestMqtt(const char* payload, size_t length);
+    /** Ao desactivar regra: OFF dos relés que a regra mantinha em ON. */
+    void releaseDecisionRuleActuators(const DecisionRule& rule);
     bool parseMqttEcConfigJson(const char* json, size_t len, ECConfig& config);
     bool parseMqttPhConfigJson(const char* json, size_t len, PHConfig& config);
     void processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via = "mqtt");

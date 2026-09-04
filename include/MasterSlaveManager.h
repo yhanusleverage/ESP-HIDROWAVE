@@ -50,6 +50,8 @@ struct TrustedSlave {
     uint32_t lastPongId;       // ID do último PONG enviado
     bool waitingForPong;       // Se está aguardando PONG
     unsigned long pongTimeout; // Timeout para PONG
+    unsigned long lastDeviceInfoRequestMs; // cooldown handshake DEVICE_INFO
+    unsigned long lastAllRelaysReceivedMs; // 0 = nunca recebeu ALL_RELAYS → batch desabilitado
     
     // Estatísticas de comunicação
     uint32_t pingsReceived;    // PINGs recebidos do Slave (quando Slave envia PING)
@@ -91,6 +93,8 @@ struct TrustedSlave {
         lastPongId = 0;
         waitingForPong = false;
         pongTimeout = 0;
+        lastDeviceInfoRequestMs = 0;
+        lastAllRelaysReceivedMs = 0;
         pingsReceived = 0;
         pingsSent = 0;
         pongsReceived = 0;
@@ -129,6 +133,8 @@ struct TrustedSlave {
         lastPongId = 0;
         waitingForPong = false;
         pongTimeout = 0;
+        lastDeviceInfoRequestMs = 0;
+        lastAllRelaysReceivedMs = 0;
         pingsReceived = 0;
         pingsSent = 0;
         pongsReceived = 0;
@@ -275,8 +281,8 @@ public:
     void notifyEspNowSendFail(const uint8_t* mac, uint8_t consecutiveFails);
     
     /**
-     * @brief Obtém lista de todos os Slaves confiáveis
-     * @return Vector com todos os Slaves
+     * @brief Copia todos los Slaves (caro en heap). Preferir forEachTrustedSlave / getTrustedSlave.
+     * @deprecated Heap fase A — solo fallback legacy; no usar en hot path.
      */
     std::vector<TrustedSlave> getAllTrustedSlaves();
 
@@ -522,7 +528,8 @@ public:
 
     void addToRetryQueue(const uint8_t* targetMac, int relayNumber, const String& action, int duration,
                          uint32_t commandId, int supabaseCommandId = 0, bool waitingForAck = false,
-                         int cycleOffDuration = 0, const String& commandMode = "");
+                         int cycleOffDuration = 0, const String& commandMode = "",
+                         uint8_t relayMask = 0);
     void removeFromRetryQueue(uint32_t commandId, bool currentState = false, bool notifySupabase = true);
     
     /**
@@ -623,11 +630,12 @@ private:
      */
     struct PendingRelayCommand {
         uint8_t targetMac[6];        // MAC do Slave destino
-        int relayNumber;             // Número do relé (0-7)
-        String action;               // Ação: "on", "off", "toggle", "timed_on", "cycle", ...
+        int relayNumber;             // 0-7 = relé; 255 = SET_RELAY_MASK
+        String action;               // "on"/"off"/... ou "mask"/"on_all"/"off_all"
         int duration;                // Duração em segundos
         int cycleOffDuration;        // OFF phase for cycle mode
         String commandMode;          // instant, timed_on, cycle, ...
+        uint8_t relayMask;           // Máscara real se relayNumber==255 (nunca reinventar 0xFF no retry)
         unsigned long enqueuedAt;        // Quando foi criado o comando
         unsigned long ackWaitStartedAt;  // Quando entrou em waitingForAck
         unsigned long nextRetry;     // Quando fazer próximo retry

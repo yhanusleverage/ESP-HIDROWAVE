@@ -75,6 +75,7 @@ Guía extendida: [`UART_BRINGUP.md`](UART_BRINGUP.md).
 | HMI TX OK, Master RX 0 | Revisar HMI TX GPIO17 → Master RX GPIO17 |
 | Espejo muestra LIVE + EC 470 sin UART | Usar env `-bringup`; fuente SIM hasta primer telemetry |
 | Monitor Master inundado con `Tentando reconectar WiFi` | Bug reconnect corregido; usar `wifi_status` en bring-up para ver fase |
+| HMI a saltos / botones sin ACK + USB lleno de `[Cache]` / `[HMI UART TX]` / `mutex_timeout` | **No es el mismo UART.** USB `Serial` bloquea el `loop()` y puede overflow del FIFO HMI. Ver [`handoffs/HANDOFF_HMI_UART_VS_SERIAL_SPAM.md`](handoffs/HANDOFF_HMI_UART_VS_SERIAL_SPAM.md) |
 
 ## Archivos
 

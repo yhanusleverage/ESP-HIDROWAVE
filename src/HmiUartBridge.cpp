@@ -125,15 +125,14 @@ void HmiUartBridge::sendSlavesList() {
     local["numRelays"] = 8;
 
     if (ctx_.masterManager) {
-        const std::vector<TrustedSlave> slaves = ctx_.masterManager->getAllTrustedSlaves();
-        for (const TrustedSlave& slave : slaves) {
+        ctx_.masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
             JsonObject o = arr.createNestedObject();
             o["mac"] = ESPNowController::macToString(slave.macAddress);
             o["name"] = slave.deviceName;
             o["local"] = false;
             o["online"] = ctx_.masterManager->isSlaveReachable(slave);
             o["numRelays"] = slave.numRelays > 0 ? slave.numRelays : 8;
-        }
+        });
     }
     emitJson(doc);
 }

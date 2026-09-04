@@ -70,6 +70,12 @@ typedef void (*NutrientDoseCallback)(const NutrientDoseEvent* event, void* userD
 typedef void (*EcOperationSyncCallback)(void* userData);
 typedef void (*PhOperationSyncCallback)(void* userData);
 typedef void (*PhysicalRecircCallback)(bool starting, const char* domain, void* userData);
+/** true = recirculación activa (o no requerida) → Auto EC/pH puede dosificar.
+ *  Preferir CirculationMixStatusCallback (0=ok, 1=no tipada, 2=OFF).
+ */
+typedef bool (*CirculationMixOkCallback)(void* userData);
+/** 0=Ok, 1=NotTyped, 2=Inactive — mismo contrato que CirculationMixGate. */
+typedef uint8_t (*CirculationMixStatusCallback)(void* userData);
 
 /** Evento emitido ao completar dosagem pH (para Supabase ph_dosages). */
 struct PhDoseEvent {
@@ -174,8 +180,15 @@ public:
     bool setLevelInterlockMode(LevelInterlockMode mode);
     LevelInterlockMode getLevelInterlockMode() const { return levelInterlockMode; }
     const char* getLevelInterlockModeName() const;
-    /** true si nivel bajo o procedimiento de tanque/dilución activo — pausa Auto EC/pH. */
+    /**
+     * true si nivel bajo, dilución/P1, o bomba de circulación OFF (si tipada).
+     * Pausa Auto EC/pH. No confundir con tempo_recirculacao post-dosis.
+     */
     bool isAutoDosingPausedByInterlock() const;
+    void setCirculationMixOkCallback(CirculationMixOkCallback cb, void* userData);
+    void setCirculationMixStatusCallback(CirculationMixStatusCallback cb, void* userData);
+    /** 0=ok, 1=no tipada, 2=OFF; 0 si no hay callback de status/mix. */
+    uint8_t getCirculationMixStatus() const;
     /**
      * Gate P1: pausa Auto EC/pH mientras un procedimiento secuencial de tanque está activo.
      * Sin timers — liberar con setTankProcedureActive(false) al terminar el script.
@@ -436,6 +449,10 @@ private:
     void* ecOperationSyncCallbackUserData;
     PhysicalRecircCallback physicalRecircCallback;
     void* physicalRecircCallbackUserData;
+    CirculationMixOkCallback circulationMixOkCallback;
+    void* circulationMixOkCallbackUserData;
+    CirculationMixStatusCallback circulationMixStatusCallback;
+    void* circulationMixStatusCallbackUserData;
 
     // ✅ Auto pH adaptativo
     AdaptivePHController adaptivePhController;

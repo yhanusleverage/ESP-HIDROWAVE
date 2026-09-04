@@ -9,6 +9,7 @@
 
 namespace {
     bool mqttConnectedFlag = false;
+    bool provisioningStaSuspendActive = false;
     const unsigned long bootMs = millis();
 
     static constexpr const char* NVS_CH_KEY = "espnow_ch";
@@ -29,6 +30,82 @@ namespace {
             }
         }
     }
+
+#if ESPNOW_PROVISIONING_STA_SUSPEND
+    bool runStaSuspendProvisioningBurst(ESPNowController* controller,
+                                        MasterSlaveManager* manager,
+                                        const String& ssid,
+                                        const String& password,
+                                        uint8_t opChannel) {
+        if (!controller || !manager || ssid.length() == 0 || password.length() == 0) {
+            return false;
+        }
+        if (opChannel < 1 || opChannel > 13 || opChannel == ESPNOW_CONFIG_CHANNEL) {
+            return false;
+        }
+        if (!WiFi.isConnected()) {
+            return false;
+        }
+
+        provisioningStaSuspendActive = true;
+        const unsigned long suspendStart = millis();
+
+        Serial.printf("[PROV] STA suspend start op=%u config=%u\n",
+                      static_cast<unsigned>(opChannel),
+                      static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL));
+
+        WiFi.disconnect(false);
+        delay(50);
+
+        if (!EspNowChannelPolicy::hopToConfigChannel(controller)) {
+            Serial.println("[PROV] STA suspend hop config fail");
+            WiFi.begin(ssid.c_str(), password.c_str());
+            provisioningStaSuspendActive = false;
+            return false;
+        }
+
+        Serial.printf("[CHANNEL] hop config=%u ok (STA down)\n",
+                      static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL));
+        delay(50);
+        Serial.printf("[PROV] burst creds+disc ch%u payload_op=%u\n",
+                      static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL),
+                      static_cast<unsigned>(opChannel));
+        sendProvisioningBurstOnCurrentChannel(controller, ssid, password, opChannel);
+
+        if (!EspNowChannelPolicy::hopToOperationalChannel(controller, opChannel)) {
+            Serial.printf("[PROV] hop op=%u fail after burst\n", static_cast<unsigned>(opChannel));
+        } else {
+            Serial.printf("[CHANNEL] hop op=%u\n", static_cast<unsigned>(opChannel));
+        }
+        delay(50);
+
+        WiFi.begin(ssid.c_str(), password.c_str());
+        const unsigned long reconnectStart = millis();
+        while (WiFi.status() != WL_CONNECTED &&
+               (millis() - reconnectStart) < ESPNOW_PROVISIONING_WIFI_RECONNECT_MS) {
+            delay(100);
+        }
+
+        if (WiFi.isConnected()) {
+            Serial.printf("[PROV] WiFi reconnect ok ch=%u (+%lums)\n",
+                          static_cast<unsigned>(WiFi.channel()),
+                          millis() - reconnectStart);
+            EspNowChannelPolicy::saveLastChannelToNvs(opChannel);
+        } else {
+            Serial.println("[PROV] WiFi reconnect fail — runtime recovery");
+        }
+
+        manager->refreshEspNowPeersOnCurrentChannel();
+
+        const unsigned long suspendMs = millis() - suspendStart;
+        if (suspendMs > ESPNOW_PROVISIONING_STA_SUSPEND_MS) {
+            Serial.printf("[PROV] STA suspend budget exceeded (%lums)\n", suspendMs);
+        }
+        Serial.println("[PROV] STA suspend end");
+        provisioningStaSuspendActive = false;
+        return true;
+    }
+#endif
 }
 
 uint8_t EspNowChannelPolicy::getOperationalChannel() {
@@ -89,6 +166,29 @@ bool EspNowChannelPolicy::loadWifiCredentials(String& ssid, String& password, ui
     return false;
 }
 
+bool EspNowChannelPolicy::loadWifiCredentialsForProvisioning(String& ssid, String& password, uint8_t& channel) {
+    ssid = "";
+    password = "";
+    channel = 0;
+
+    Preferences hydro;
+    if (hydro.begin("hydro_system", true)) {
+        ssid = hydro.getString("ssid", "");
+        password = hydro.getString("password", "");
+        channel = hydro.getUChar("wifi_chan", 0);
+        hydro.end();
+        if (ssid.length() > 0 && password.length() > 0) {
+            return true;
+        }
+    }
+
+    if (PreferencesManager::loadWiFiCredentials(ssid, password, channel)) {
+        return ssid.length() > 0 && password.length() > 0;
+    }
+
+    return false;
+}
+
 void EspNowChannelPolicy::runProvisioningBurst(ESPNowController* controller,
                                                MasterSlaveManager* manager,
                                                const String& ssid,
@@ -115,6 +215,14 @@ void EspNowChannelPolicy::runProvisioningBurst(ESPNowController* controller,
             delay(50);
         }
     } else if (staUp) {
+#if ESPNOW_PROVISIONING_STA_SUSPEND
+        if (password.length() > 0 &&
+            opChannel != ESPNOW_CONFIG_CHANNEL &&
+            runStaSuspendProvisioningBurst(controller, manager, ssid, password, opChannel)) {
+            Serial.println("[RES] radio=provisioning (STA suspend)");
+            return;
+        }
+#endif
         Serial.printf("[CHANNEL] hop config skip (STA ch=%u) — burst op direct\n",
                       static_cast<unsigned>(WiFi.channel()));
         sendProvisioningBurstOnCurrentChannel(controller, ssid, password, opChannel);
@@ -124,7 +232,7 @@ void EspNowChannelPolicy::runProvisioningBurst(ESPNowController* controller,
     }
 
     manager->refreshEspNowPeersOnCurrentChannel();
-    if (staUp) {
+    if (staUp || WiFi.isConnected()) {
         saveLastChannelToNvs(opChannel);
     }
     Serial.println("[RES] radio=provisioning");
@@ -177,6 +285,10 @@ bool EspNowChannelPolicy::isProvisioningWindowActive() {
 #else
     return false;
 #endif
+}
+
+bool EspNowChannelPolicy::isProvisioningStaSuspendActive() {
+    return provisioningStaSuspendActive;
 }
 
 void EspNowChannelPolicy::tickProvisioningCountdown() {

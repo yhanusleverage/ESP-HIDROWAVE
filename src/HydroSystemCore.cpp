@@ -25,6 +25,7 @@
 #include "WebServerTask.h"      // ✅ Include completo para usar métodos
 #include "ESPNowController.h"   // ✅ Include completo para usar métodos
 #include "MasterSlaveManager.h" // ✅ Para integración ESP-NOW
+#include "ScriptRunner.h"
 #include <math.h>
 #include <cstdio>
 // ✅ NÃO incluir ESPNowTypes.h aqui - master relays são LOCAIS, não ESP-NOW
@@ -218,6 +219,7 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     recentlyClosedCount(0),
 #if ENABLE_MQTT
     mqttConnectedSinceMs(0),
+    lastRuleExecutedMirrorMs(0),
     mqttEcConfigReceived(false),
     mqttPhConfigReceived(false),
 #endif
@@ -262,30 +264,37 @@ void HydroSystemCore::wireMasterManagerIntegration() {
 
     masterManager->setRelayAckCallback([this](const uint8_t* senderMac, uint32_t commandId,
                                               bool success, uint8_t relayNumber, uint8_t currentState) {
-        Serial.println("\n🎊 === ACK DE RELAY RECEBIDO (EVENT-DRIVEN) ===");
-        Serial.printf("[CMD ACK-DIRECT] espnow_id=%u supabase=%d R%d state=%s\n",
-                      (unsigned)commandId, findSupabaseCommandId(commandId), relayNumber,
-                      currentState ? "ON" : "OFF");
+        if (relayNumber == 255 || relayNumber > 7) {
+            Serial.printf("[CMD ACK] MASK esp=%u ok=%u\n",
+                          (unsigned)commandId, (unsigned)success);
+        } else {
+            Serial.printf("[CMD ACK] esp=%u R%u state=%s ok=%u\n",
+                          (unsigned)commandId, static_cast<unsigned>(relayNumber),
+                          currentState ? "ON" : "OFF", (unsigned)success);
+        }
 
         hydroControl.notifyDilutionRelayAck(commandId, success, currentState != 0);
 
-        int supabaseCommandId = findSupabaseCommandId(commandId);
-
-        if (supabaseCommandId > 0 && success) {
-            completeSlaveCommand(supabaseCommandId, commandId, senderMac, relayNumber,
-                                 currentState != 0, "ACK");
-        } else if (supabaseCommandId > 0 && !success) {
+        // Batch SET_RELAY_MASK → ACK relé 255: bridge rejeita relay_index>15; fechar todos os tickets.
+        if (relayNumber == 255 || relayNumber > 7) {
+            if (success) {
+                completePendingAcksForEspNowCommand(commandId, senderMac, "ACK-MASK");
+            }
+        } else {
+            int supabaseCommandId = findSupabaseCommandId(commandId);
+            if (supabaseCommandId > 0 && success) {
+                completeSlaveCommand(supabaseCommandId, commandId, senderMac, relayNumber,
+                                     currentState != 0, "ACK");
+            } else if (supabaseCommandId > 0 && !success) {
 #if ENABLE_MQTT
-            tryPublishCloudAckViaMqtt(supabaseCommandId, commandId, senderMac, relayNumber,
-                                       currentState != 0, "failed");
+                tryPublishCloudAckViaMqtt(supabaseCommandId, commandId, senderMac, relayNumber,
+                                           currentState != 0, "failed");
 #endif
-            Serial.println("❌ [CALLBACK] Slave NACK — failed via MQTT (sin HTTPS)");
-        } else if (supabaseCommandId == 0 && !hydroControl.isDilutionAwaitingValve()) {
-            Serial.println("⚠️ [CALLBACK] Mapeamento não encontrado para commandId=" + String(commandId));
-            Serial.println("💡 Comando pode ter sido processado antes do mapeamento ser criado");
+                Serial.println("❌ [CALLBACK] Slave NACK — failed via MQTT (sin HTTPS)");
+            } else if (supabaseCommandId == 0 && !hydroControl.isDilutionAwaitingValve()) {
+                Serial.println("⚠️ [CALLBACK] Mapeamento não encontrado para commandId=" + String(commandId));
+            }
         }
-
-        Serial.println("========================================\n");
     });
 
     masterManager->setSupabaseCommandCallback([this](int supabaseCommandId, bool success, const String& errorMessage) {
@@ -344,15 +353,19 @@ void HydroSystemCore::setMasterManager(MasterSlaveManager* masterMgr) {
     }
     Serial.println("✅ HydroSystemCore: MasterSlaveManager atualizado (late bind)");
     relayCoordinator.begin(&hydroControl, masterMgr);
+    wireRelayCoordinatorPolicyCallbacks();
     if (supabaseConnected) {
         wireMasterManagerIntegration();
     }
     if (webServerManager) {
         webServerManager->setMasterManager(masterMgr);
     }
+    // Sempre late-bind no DE (mesmo se já iniciado) — senão regras remotas ficam com MSM=null.
+    decisionIntegration.setMasterManager(masterMgr);
     if (!decisionEngineReady) {
-        decisionIntegration.setMasterManager(masterMgr);
         initDecisionEngine();
+    } else {
+        Serial.println("✅ DecisionEngine: MasterSlaveManager late-bind atualizado");
     }
 }
 
@@ -409,6 +422,7 @@ bool HydroSystemCore::begin() {
     hydroControl.setPhysicalRecircCallback(&HydroSystemCore::onPhysicalRecircStatic, this);
 
     relayCoordinator.begin(&hydroControl, masterManager);
+    wireRelayCoordinatorPolicyCallbacks();
     initDecisionEngine();
     
     // ===== CONECTAR SUPABASE =====
@@ -433,6 +447,11 @@ bool HydroSystemCore::begin() {
     } else {
         Serial.println("❌ Erro ao conectar Supabase - Sistema continuará sem cloud");
         supabaseConnected = false;
+    }
+
+    // ACK cloud via MQTT mesmo se HTTPS/Supabase falhou no boot
+    if (masterManager) {
+        wireMasterManagerIntegration();
     }
     
     // ===== INICIALIZAR SERVIDOR WEB ADMIN =====
@@ -509,6 +528,9 @@ bool HydroSystemCore::begin() {
     printSensorReadings();
 
     lastRelayStatesSync = 0;
+#if ESPNOW_RELAY_BATCH_ENABLED
+    memset(espNowRelayBatchSlots_, 0, sizeof(espNowRelayBatchSlots_));
+#endif
 #if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
     saveMasterRelayStatesToNVS();
 #else
@@ -548,13 +570,86 @@ void HydroSystemCore::applyBootPolicies() {
 void HydroSystemCore::initDecisionEngine() {
     decisionIntegration.setRelayCoordinator(&relayCoordinator);
     decisionIntegration.setMasterManager(masterManager);
+#if ENABLE_MQTT && RULE_EXECUTED_MIRROR_ENABLED
+    decisionEngine.setRuleExecutedMirrorCallback(&HydroSystemCore::onRuleExecutedMirrorStatic, this);
+#endif
     if (decisionEngine.begin() && decisionIntegration.begin()) {
         decisionEngineReady = true;
         Serial.println("✅ DecisionEngine local ativo");
+        // fn_* chegam via MQTT rules upsert (não inventar no boot a partir de NVS).
     } else {
         Serial.println("⚠️ DecisionEngine não iniciou — automação local desativada");
     }
 }
+
+void HydroSystemCore::wireRelayCoordinatorPolicyCallbacks() {
+    relayCoordinator.setSlaveReachableCallback([this](const uint8_t mac[6]) -> bool {
+        if (!masterManager || !mac) {
+            return false;
+        }
+        TrustedSlave* slave = masterManager->getTrustedSlave(mac);
+        if (!slave) {
+            return false;
+        }
+        return masterManager->isSlaveReachable(*slave);
+    });
+    // Water interlock default off (hook preparado; no romper bancada).
+    relayCoordinator.setWaterLevelOkCallback(
+        [this]() -> bool {
+            return hydroControl.isWaterLevelOk();
+        },
+        false);
+
+    hydroControl.setCirculationMixStatusCallback(
+        [](void* userData) -> uint8_t {
+            if (!userData) {
+                return 1;  // NotTyped
+            }
+            const CirculationMixGate gate =
+                static_cast<HydroSystemCore*>(userData)->relayCoordinator.getCirculationMixGate();
+            return static_cast<uint8_t>(gate);
+        },
+        this);
+}
+
+#if ENABLE_MQTT && RULE_EXECUTED_MIRROR_ENABLED
+void HydroSystemCore::onRuleExecutedMirrorStatic(const RuleExecutedMirrorEvent& event, void* userData) {
+    if (userData) {
+        static_cast<HydroSystemCore*>(userData)->mirrorRuleExecuted(event);
+    }
+}
+
+void HydroSystemCore::mirrorRuleExecuted(const RuleExecutedMirrorEvent& event) {
+    if (!mqttClient.isConnected()) {
+        Serial.println("[MQTT] rule_executed skipped (offline)");
+        return;
+    }
+
+    const unsigned long now = millis();
+    if (lastRuleExecutedMirrorMs > 0 &&
+        (now - lastRuleExecutedMirrorMs) < RULE_EXECUTED_MIRROR_RATE_LIMIT_MS) {
+        return;
+    }
+
+    char eventId[64];
+    snprintf(eventId, sizeof(eventId), "%s-%lu-%d",
+             event.rule_id.c_str(), static_cast<unsigned long>(now), event.relay_index);
+
+    MqttRuleExecutedReading reading = {};
+    reading.event_id = eventId;
+    reading.rule_id = event.rule_id.c_str();
+    reading.relay_index = event.relay_index;
+    reading.action = event.action.c_str();
+    reading.current_state = event.current_state;
+    reading.success = event.success;
+    reading.duration_sec = event.duration_sec;
+    reading.slave_mac = event.slave_mac.length() > 0 ? event.slave_mac.c_str() : nullptr;
+
+    if (mqttClient.publishRuleExecuted(reading)) {
+        lastRuleExecutedMirrorMs = now;
+    }
+}
+#endif
 
 void HydroSystemCore::loop() {
     if (!systemReady) return;
@@ -607,9 +702,14 @@ void HydroSystemCore::loop() {
 
 #if ENABLE_MQTT
     if (now - lastMqttTelemetrySend >= MQTT_TELEMETRY_INTERVAL_MS) {
-        if (masterManager && masterManager->isEspNowLockWindowActive()) {
+        const bool cloudPaused =
+            (masterManager && masterManager->isEspNowLockWindowActive()) ||
+            EspNowChannelPolicy::isProvisioningStaSuspendActive();
+        if (cloudPaused) {
 #if ESPNOW_LOCK_DEBUG
-            Serial.println("[LOCK] skip MQTT telemetry (window 5s)");
+            if (masterManager && masterManager->isEspNowLockWindowActive()) {
+                Serial.println("[LOCK] skip MQTT telemetry (window 5s)");
+            }
 #endif
         } else {
             publishMqttTelemetry();
@@ -618,8 +718,10 @@ void HydroSystemCore::loop() {
     }
     maybePublishMqttLevelsOnChange();
     if (now - lastMqttHeartbeatSend >= MQTT_HEARTBEAT_INTERVAL_MS) {
-        publishMqttHeartbeat();
-        lastMqttHeartbeatSend = now;
+        if (!EspNowChannelPolicy::isProvisioningStaSuspendActive()) {
+            publishMqttHeartbeat();
+            lastMqttHeartbeatSend = now;
+        }
     }
 #endif
     
@@ -728,10 +830,18 @@ void HydroSystemCore::loop() {
     // Heartbeat relay/state periódico — mantém last_update fresco na cloud/UI
     if (masterManager && mqttClient.isConnected() &&
         now - lastSlaveRelayHeartbeat >= SLAVE_RELAY_HEARTBEAT_INTERVAL) {
-        std::vector<TrustedSlave> slaves = masterManager->getAllTrustedSlaves();
-        for (const auto& slave : slaves) {
-            // Sempre publicar: offline deve ir com link_online=false (não silenciar).
-            publishSlaveRelayStateMqtt(slave.macAddress, -1, false, true);
+        // Só MACs sob mutex — publish fora (evita deadlock + sem fotocópia)
+        uint8_t macList[8][6];
+        int macCount = 0;
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (macCount >= 8) {
+                return;
+            }
+            memcpy(macList[macCount], slave.macAddress, 6);
+            macCount++;
+        });
+        for (int i = 0; i < macCount; i++) {
+            publishSlaveRelayStateMqtt(macList[i], -1, false, true);
         }
         lastSlaveRelayHeartbeat = now;
     }
@@ -739,11 +849,19 @@ void HydroSystemCore::loop() {
     // Sync completo relay_states[] via RF + MQTT (60s) — evita UI stale (só link-only)
     if (masterManager && mqttClient.isConnected() &&
         now - lastSlaveRelayFullSync >= RELAY_STATES_SYNC_FORCE_RF_MS) {
-        forceSlaveRelayMqttFullSync();
+        const bool skipFullSync = hasPendingCloudAcks() || hasPendingSlaveAcks() ||
+                                  ESP.getFreeHeap() < 60000;
+        if (!skipFullSync) {
+            forceSlaveRelayMqttFullSync();
+        }
         lastSlaveRelayFullSync = now;
     }
 
     flushPendingRelayStateMqtt();
+#endif
+
+#if ESPNOW_RELAY_BATCH_ENABLED
+    flushEspNowRelayBatchesDue(now);
 #endif
     
     // ===== DEBUG PERIÓDICO (30s) =====
@@ -816,8 +934,9 @@ void HydroSystemCore::loop() {
     // ✅ TÓPICO 4: ACTUALIZAR CACHE DEL SISTEMA (Core 0 → Core 1)
     // ✅ CORREÇÃO CRÍTICA: Aumentar intervalo para 5s e verificar memória antes de copiar
     static unsigned long lastCacheUpdate = 0;
-    if (now - lastCacheUpdate >= 5000) {  // ✅ AUMENTADO: Actualizar cada 5 segundos (era 2s)
-        if (webServerManager) {
+    if (now - lastCacheUpdate >= 5000) {
+        const bool webPanelLive = webServerTask && webServerTask->isInitialized();
+        if (webServerManager && webPanelLive) {
             SystemDataCache cache;
             cache.uptime = getUptime();
             cache.freeHeap = ESP.getFreeHeap();
@@ -834,104 +953,67 @@ void HydroSystemCore::loop() {
                 cache.totalSlaves = masterManager->getTrustedSlaveCount();
                 cache.onlineSlaves = masterManager->getOnlineSlaveCount();
                 cache.offlineSlaves = cache.totalSlaves - cache.onlineSlaves;
-                Serial.printf("📊 [Cache] masterManager disponível: %d slaves (online: %d, offline: %d)\n", 
-                             cache.totalSlaves, cache.onlineSlaves, cache.offlineSlaves);
                 
-                // ✅ CORREÇÃO CRÍTICA: Verificar memória antes de copiar vetor
                 uint32_t freeHeap = ESP.getFreeHeap();
-                if (freeHeap < 50000) {  // ✅ Se menos de 50KB livres, pular atualização
-                    Serial.printf("⚠️ [Cache] Memória baixa (%u bytes), pulando atualização de cache\n", freeHeap);
+                if (freeHeap < 50000) {
                     cache.slavesJson = "{\"slaves\":[]}";
                     cache.slavesLastUpdate = 0;
                 } else {
-                    // ✅ NOVO: Usar Object Pool para DynamicJsonDocument
                     ObjectPoolManager* poolMgr = ObjectPoolManager::getInstance();
-                    DynamicJsonDocument* slavesDoc = nullptr;
+                    DynamicJsonDocument* pooledDoc = nullptr;
                     bool usingPool = false;
-                    
+
                     if (poolMgr && poolMgr->isInitialized()) {
-                        slavesDoc = poolMgr->acquireJsonDocument(4096);
-                        if (slavesDoc) {
-                            usingPool = true;
-                        }
+                        pooledDoc = poolMgr->acquireJsonDocument(4096);
+                        usingPool = (pooledDoc != nullptr);
                     }
-                    
-                    // ✅ FALLBACK: Criar localmente se pool não disponível
-                    DynamicJsonDocument localDoc(4096);
-                    if (!usingPool) {
-                        slavesDoc = &localDoc;
-                    }
-                    
-                    if (!slavesDoc) {
-                        Serial.println("⚠️ [Cache] Falha ao obter documento JSON (pool esgotado)");
-                        cache.slavesJson = "{\"slaves\":[]}";
-                        cache.slavesLastUpdate = 0;
-                    } else {
-                        // ✅ CACHE DE SLAVES: Serializar lista completa para JSON (thread-safe)
-                        // ✅ CORREÇÃO CRÍTICA: Criar OBJETO com "slaves" array (não array direto)
-                        JsonObject rootObj = slavesDoc->to<JsonObject>();
+
+                    auto fillSlavesJson = [&](DynamicJsonDocument& doc) {
+                        JsonObject rootObj = doc.to<JsonObject>();
                         JsonArray slavesArray = rootObj.createNestedArray("slaves");
-                        
-                        std::vector<TrustedSlave> slaves = masterManager->getAllTrustedSlaves();
-                        Serial.printf("📊 [Cache] Serializando %d slave(s) para JSON...\n", slaves.size());
-                        
-                        if (slaves.size() == 0) {
-                            Serial.println("⚠️ [Cache] NENHUM SLAVE encontrado no masterManager!");
-                            Serial.println("   💡 Verifique se:");
-                            Serial.println("      1. Slaves estão ligados");
-                            Serial.println("      2. Slaves estão no mesmo canal ESP-NOW (canal " +
-                                           String(WiFi.channel()) + ")");
-                            Serial.println("      3. Discovery foi executado (masterManager->rediscoverSlaves())");
-                        }
-                        
-                        for (const auto& slave : slaves) {
-                            Serial.printf("   📋 Processando slave: %s (MAC: %s)\n", 
-                                         slave.deviceName.c_str(), 
-                                         ESPNowController::macToString(slave.macAddress).c_str());
-                            // ✅ CORREÇÃO: Gerar device_id correto (ESP32_SLAVE_XX_XX_XX_XX_XX_XX)
+                        // forEach: sem fotocópia do vector (mutex curto; JSON sob lock OK aqui)
+                        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
                             String deviceId = "ESP32_SLAVE_" + ESPNowController::macToString(slave.macAddress);
                             deviceId.replace(":", "_");
-                            
                             JsonObject slaveObj = slavesArray.createNestedObject();
-                            slaveObj["device_id"] = deviceId;  // ✅ CORRETO: device_id gerado
-                            slaveObj["device_name"] = slave.deviceName;  // ✅ CORRETO: nome do dispositivo
-                            slaveObj["device_type"] = slave.deviceType;  // ✅ CORRETO: tipo do dispositivo
-                            slaveObj["mac_address"] = ESPNowController::macToString(slave.macAddress);  // ✅ CORRETO: mac_address
-                            slaveObj["is_online"] = slave.isOnline();  // ✅ CORRETO: is_online
-                            slaveObj["num_relays"] = slave.numRelays;  // ✅ CORRETO: num_relays
-                            slaveObj["last_seen"] = slave.lastSeen;  // ✅ Timestamp Unix (frontend aceita)
-                            slaveObj["operational"] = slave.operational;  // ✅ Campo adicional
-                            
-                            // ✅ CORREÇÃO: Adicionar estados dos relés com formato correto
+                            slaveObj["device_id"] = deviceId;
+                            slaveObj["device_name"] = slave.deviceName;
+                            slaveObj["device_type"] = slave.deviceType;
+                            slaveObj["mac_address"] = ESPNowController::macToString(slave.macAddress);
+                            slaveObj["is_online"] = slave.isOnline();
+                            slaveObj["num_relays"] = slave.numRelays;
+                            slaveObj["last_seen"] = slave.lastSeen;
+                            slaveObj["operational"] = slave.operational;
                             JsonArray relaysArray = slaveObj.createNestedArray("relays");
-                            for (int i = 0; i < slave.numRelays && i < 8; i++) {  // ✅ Limitar a 8 (tamanho do array)
+                            for (int i = 0; i < slave.numRelays && i < 8; i++) {
                                 JsonObject relayObj = relaysArray.createNestedObject();
-                                relayObj["relay_number"] = i;  // ✅ CORRETO: relay_number (não "number")
-                                relayObj["state"] = slave.relayStates[i].state;  // ✅ Estado do relé
-                                relayObj["has_timer"] = slave.relayStates[i].hasTimer;  // ✅ Tem timer?
-                                relayObj["remaining_time"] = slave.relayStates[i].remainingTime;  // ✅ Tempo restante
-                                relayObj["name"] = slave.relayStates[i].name.length() > 0 ? slave.relayStates[i].name : ("Relé " + String(i));
+                                relayObj["relay_number"] = i;
+                                relayObj["state"] = slave.relayStates[i].state;
+                                relayObj["has_timer"] = slave.relayStates[i].hasTimer;
+                                relayObj["remaining_time"] = slave.relayStates[i].remainingTime;
+                                relayObj["name"] = slave.relayStates[i].name.length() > 0
+                                    ? slave.relayStates[i].name
+                                    : ("Relé " + String(i));
                             }
-                        }
-                        
+                        });
                         String slavesJson;
-                        if (serializeJson(*slavesDoc, slavesJson) > 0) {
+                        if (serializeJson(doc, slavesJson) > 0) {
                             cache.slavesJson = slavesJson;
                             cache.slavesLastUpdate = millis();
-                            Serial.printf("✅ [Cache] JSON criado: %d bytes\n", slavesJson.length());
-                            Serial.printf("📄 [Cache] Primeiros 200 chars: %s\n", slavesJson.substring(0, 200).c_str());
                         } else {
-                            Serial.println("❌ [Cache] Falha ao serializar JSON de slaves!");
                             cache.slavesJson = "{\"slaves\":[]}";
                             cache.slavesLastUpdate = 0;
                         }
-                        
-                        // ✅ Liberar pool se estava em uso
-                        if (usingPool && poolMgr) {
-                            poolMgr->releaseJsonDocument(slavesDoc);
-                        }
+                    };
+
+                    if (usingPool && pooledDoc) {
+                        fillSlavesJson(*pooledDoc);
+                        poolMgr->releaseJsonDocument(pooledDoc);
+                    } else {
+                        DynamicJsonDocument localDoc(4096);
+                        fillSlavesJson(localDoc);
                     }
-                }  // ✅ Fechar bloco else (verificação de memória)
+                }
             } else {
                 cache.totalSlaves = 0;
                 cache.onlineSlaves = 0;
@@ -961,9 +1043,10 @@ void HydroSystemCore::loop() {
         mqttUp = mqttClient.isConnected();
 #endif
         const int slavesOnline = masterManager ? masterManager->getOnlineSlaveCount() : 0;
+        // sslBusy = TLS real (não confundir com ACK/retry ESP-NOW pendentes)
         ResourceTelemetry::setContext(
             mqttUp,
-            isSslHotPathBusy(),
+            isSslTransportBusy(),
             hydroControl.getDilutionPhaseName(),
             WiFi.status() == WL_CONNECTED,
             slavesOnline);
@@ -1018,6 +1101,8 @@ void HydroSystemCore::printSensorReadings() {
     reading.level4Wet = hydroControl.isLevelWet(4);
     reading.waterLevel = hydroControl.getWaterLevelAggregate();
     reading.interlockMode = hydroControl.getLevelInterlockModeName();
+    reading.circulationTyped = relayCoordinator.isCirculationConfigured();
+    reading.circulationMixOk = relayCoordinator.isCirculationMixActiveForDosing();
     reading.airTemperature = NAN;
     reading.humidity = NAN;
     printTelemetrySerialLine(reading);
@@ -1046,13 +1131,264 @@ void HydroSystemCore::testSupabaseConnection() {
 
 // ===== OPERAÇÕES PRINCIPAIS =====
 
-// Sync config only — execução local via DecisionEngine + LittleFS
+// Sync config only — execução local via DecisionEngine + SPIFFS (/rules.json)
+// HTTPS poll decision_rules desativado (heap/SSL). Tipagem → MQTT circ/config retained.
 void HydroSystemCore::checkSupabaseRules() {
     if (!supabaseConnected) {
         return;
     }
-    Serial.println("📋 [REGRAS] Cloud sync desativado — DecisionEngine local ativo");
+    static unsigned long lastLogMs = 0;
+    const unsigned long now = millis();
+    if (now - lastLogMs < 300000UL) {
+        return;
+    }
+    lastLogMs = now;
+    Serial.println("📋 [REGRAS] Cloud HTTPS desativado — use MQTT circ/config / SPIFFS local");
 }
+
+#if ESPNOW_RELAY_BATCH_ENABLED
+
+bool HydroSystemCore::isEspNowRelayBatchEligible(const RelayCommand& cmd, bool isSlave) {
+    if (!isSlave || cmd.id <= 0) {
+        return false;
+    }
+    if (cmd.durationSeconds != 0 || cmd.cycleOffSeconds != 0) {
+        return false;
+    }
+    if (cmd.action != "on" && cmd.action != "off") {
+        return false;
+    }
+    if (cmd.commandMode.length() > 0 && cmd.commandMode != "instant") {
+        return false;
+    }
+    return true;
+}
+
+int HydroSystemCore::findEspNowRelayBatchSlot(const uint8_t* mac, bool create) {
+    if (!mac) {
+        return -1;
+    }
+    int freeIdx = -1;
+    int oldestIdx = -1;
+    unsigned long oldestAt = ULONG_MAX;
+    for (size_t i = 0; i < ESPNOW_RELAY_BATCH_SLOTS; i++) {
+        EspNowRelayBatchSlot& slot = espNowRelayBatchSlots_[i];
+        if (slot.active && memcmp(slot.mac, mac, 6) == 0) {
+            return static_cast<int>(i);
+        }
+        if (!slot.active && freeIdx < 0) {
+            freeIdx = static_cast<int>(i);
+        }
+        if (slot.active && slot.openedAtMs < oldestAt) {
+            oldestAt = slot.openedAtMs;
+            oldestIdx = static_cast<int>(i);
+        }
+    }
+    if (!create) {
+        return -1;
+    }
+    if (freeIdx >= 0) {
+        return freeIdx;
+    }
+    if (oldestIdx >= 0) {
+        flushEspNowRelayBatchSlot(espNowRelayBatchSlots_[oldestIdx], "slot-pressure");
+        return oldestIdx;
+    }
+    return -1;
+}
+
+bool HydroSystemCore::initEspNowRelayBatchMask(EspNowRelayBatchSlot& slot) {
+    slot.desiredMask = 0;
+    if (!masterManager) {
+        return false;
+    }
+    TrustedSlave* slave = masterManager->getTrustedSlave(slot.mac);
+    if (!slave) {
+        return false;
+    }
+    for (int i = 0; i < 8 && i < slave->numRelays; i++) {
+        if (slave->relayStates[i].state) {
+            slot.desiredMask |= static_cast<uint8_t>(1u << i);
+        }
+    }
+    slot.maskInitialized = true;
+    return true;
+}
+
+bool HydroSystemCore::tryQueueEspNowRelayBatch(const RelayCommand& cmd, const uint8_t* targetMac,
+                                               RelayOwner owner) {
+    // Opção 2+3: sem ALL_RELAYS recebido → forçar envio individual (máscara seria imprecisa)
+    if (masterManager) {
+        TrustedSlave* sl = masterManager->getTrustedSlave(targetMac);
+        if (!sl || sl->lastAllRelaysReceivedMs == 0) {
+            return false;
+        }
+    }
+
+    const int idx = findEspNowRelayBatchSlot(targetMac, true);
+    if (idx < 0) {
+        return false;
+    }
+
+    EspNowRelayBatchSlot& slot = espNowRelayBatchSlots_[idx];
+    const unsigned long now = millis();
+    if (!slot.active) {
+        slot.active = true;
+        memcpy(slot.mac, targetMac, 6);
+        slot.openedAtMs = now;
+        slot.itemCount = 0;
+        slot.maskInitialized = false;
+        slot.owner = owner;
+    }
+
+    const bool wantOn = (cmd.action == "on");
+    bool updated = false;
+    for (size_t i = 0; i < slot.itemCount; i++) {
+        if (slot.items[i].relayNumber == cmd.relayNumber) {
+            slot.items[i].supabaseCommandId = cmd.id;
+            slot.items[i].wantOn = wantOn;
+            updated = true;
+            break;
+        }
+    }
+    if (!updated) {
+        if (slot.itemCount >= ESPNOW_RELAY_BATCH_MAX_ITEMS) {
+            flushEspNowRelayBatchSlot(slot, "batch-full");
+            return tryQueueEspNowRelayBatch(cmd, targetMac, owner);
+        }
+        EspNowRelayBatchItem& item = slot.items[slot.itemCount++];
+        item.supabaseCommandId = cmd.id;
+        item.relayNumber = cmd.relayNumber;
+        item.wantOn = wantOn;
+    }
+
+    initEspNowRelayBatchMask(slot);
+    for (size_t i = 0; i < slot.itemCount; i++) {
+        const EspNowRelayBatchItem& item = slot.items[i];
+        if (item.relayNumber < 0 || item.relayNumber > 7) {
+            continue;
+        }
+        if (item.wantOn) {
+            slot.desiredMask |= static_cast<uint8_t>(1u << item.relayNumber);
+        } else {
+            slot.desiredMask &= static_cast<uint8_t>(~(1u << item.relayNumber));
+        }
+    }
+
+    slot.flushAtMs = now + ESPNOW_RELAY_BATCH_MS;
+#if ESPNOW_RELAY_BATCH_COMPACT_LOG
+    Serial.printf("[BATCH] queue mac=%s R%d %s id=%d n=%u flush_in=%lums\n",
+                  ESPNowController::macToString(targetMac).c_str(),
+                  cmd.relayNumber,
+                  cmd.action.c_str(),
+                  cmd.id,
+                  static_cast<unsigned>(slot.itemCount),
+                  static_cast<unsigned long>(ESPNOW_RELAY_BATCH_MS));
+#else
+    Serial.printf("[BATCH] queued supabase_id=%d relay=%d action=%s (n=%u)\n",
+                  cmd.id, cmd.relayNumber, cmd.action.c_str(),
+                  static_cast<unsigned>(slot.itemCount));
+#endif
+    return true;
+}
+
+void HydroSystemCore::flushEspNowRelayBatchSlot(EspNowRelayBatchSlot& slot, const char* reason) {
+    if (!slot.active || slot.itemCount == 0) {
+        slot.active = false;
+        slot.itemCount = 0;
+        return;
+    }
+
+    initEspNowRelayBatchMask(slot);
+    for (size_t i = 0; i < slot.itemCount; i++) {
+        const EspNowRelayBatchItem& item = slot.items[i];
+        if (item.relayNumber < 0 || item.relayNumber > 7) {
+            continue;
+        }
+        if (item.wantOn) {
+            slot.desiredMask |= static_cast<uint8_t>(1u << item.relayNumber);
+        } else {
+            slot.desiredMask &= static_cast<uint8_t>(~(1u << item.relayNumber));
+        }
+    }
+
+    const unsigned long elapsedMs = millis() - slot.openedAtMs;
+    const uint8_t sendMask = slot.desiredMask;
+    const size_t itemCount = slot.itemCount;
+    const RelayOwner owner = slot.owner;
+    uint8_t macCopy[6];
+    memcpy(macCopy, slot.mac, 6);
+
+    EspNowRelayBatchItem itemsCopy[ESPNOW_RELAY_BATCH_MAX_ITEMS];
+    memcpy(itemsCopy, slot.items, itemCount * sizeof(EspNowRelayBatchItem));
+
+    slot.active = false;
+    slot.itemCount = 0;
+    slot.maskInitialized = false;
+
+    const uint32_t espNowCommandId =
+        relayCoordinator.requestMask(owner, macCopy, sendMask, 0);
+
+#if ESPNOW_RELAY_BATCH_COMPACT_LOG
+    Serial.printf("[BATCH] flush mac=%s mask=0x%02X n=%u esp=%u reason=%s (+%lums)\n",
+                  ESPNowController::macToString(macCopy).c_str(),
+                  sendMask,
+                  static_cast<unsigned>(itemCount),
+                  static_cast<unsigned>(espNowCommandId),
+                  reason ? reason : "due",
+                  elapsedMs);
+#else
+    Serial.printf("[BATCH] flush mask=0x%02X items=%u esp=%u\n",
+                  sendMask, static_cast<unsigned>(itemCount),
+                  static_cast<unsigned>(espNowCommandId));
+#endif
+
+    if (espNowCommandId == 0) {
+        Serial.println("[BATCH] flush failed — retry queue may resend mask");
+        return;
+    }
+
+    const bool quietMap = ESPNOW_RELAY_BATCH_COMPACT_LOG != 0;
+    for (size_t i = 0; i < itemCount; i++) {
+        const EspNowRelayBatchItem& item = itemsCopy[i];
+        if (item.supabaseCommandId <= 0) {
+            continue;
+        }
+        addCommandMapping(espNowCommandId, item.supabaseCommandId, quietMap);
+        registerPendingSlaveAck(item.supabaseCommandId, espNowCommandId, macCopy,
+                                item.relayNumber, item.wantOn ? "on" : "off");
+    }
+
+#if ESPNOW_RELAY_BATCH_COMPACT_LOG
+    Serial.print("[CMD done] batch ids=");
+    for (size_t i = 0; i < itemCount; i++) {
+        if (i > 0) {
+            Serial.print(",");
+        }
+        Serial.print(itemsCopy[i].supabaseCommandId);
+    }
+    Serial.printf(" (+ %lums)\n", elapsedMs);
+#endif
+}
+
+void HydroSystemCore::flushEspNowRelayBatchesDue(unsigned long now) {
+    for (size_t i = 0; i < ESPNOW_RELAY_BATCH_SLOTS; i++) {
+        EspNowRelayBatchSlot& slot = espNowRelayBatchSlots_[i];
+        if (slot.active && slot.itemCount > 0 && now >= slot.flushAtMs) {
+            flushEspNowRelayBatchSlot(slot, "due");
+        }
+    }
+}
+
+void HydroSystemCore::flushAllEspNowRelayBatches(const char* reason) {
+    for (size_t i = 0; i < ESPNOW_RELAY_BATCH_SLOTS; i++) {
+        if (espNowRelayBatchSlots_[i].active) {
+            flushEspNowRelayBatchSlot(espNowRelayBatchSlots_[i], reason);
+        }
+    }
+}
+
+#endif  // ESPNOW_RELAY_BATCH_ENABLED
 
 
 void HydroSystemCore::processRelayCommand(const RelayCommand& cmd, bool isSlave, const char* via) {
@@ -1111,25 +1447,33 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
             return;
         }
         
-        // ✅ Verificar se slave está na lista confiável
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
-        bool slaveFound = false;
-        for (const auto& slave : trustedSlaves) {
-            if (memcmp(slave.macAddress, targetMac, 6) == 0) {
-                slaveFound = true;
-                Serial.println("✅ Slave encontrado: " + slave.deviceName);
-                Serial.println("   MAC: " + ESPNowController::macToString(targetMac));
-                break;
-            }
-        }
-        
-        if (!slaveFound) {
+        // ✅ Verificar se slave está na lista confiável (sem copiar o vector inteiro)
+        TrustedSlave* foundSlave = masterManager->getTrustedSlave(targetMac);
+        if (foundSlave) {
+            Serial.println("✅ Slave encontrado: " + foundSlave->deviceName);
+            Serial.println("   MAC: " + ESPNowController::macToString(targetMac));
+        } else {
             Serial.println("⚠️ Slave não está na lista confiável: " + cmd.target_device_id);
             Serial.println("💡 Comando será enviado mesmo assim (pode ser novo slave)");
         }
+
+        const RelayOwner owner = resolveCommandOwner(cmd);
+#if ESPNOW_RELAY_BATCH_ENABLED
+        if (isEspNowRelayBatchEligible(cmd, isSlave)) {
+            if (tryQueueEspNowRelayBatch(cmd, targetMac, owner)) {
+                Serial.printf("[CMD dispatch] supabase_id=%d R%d %s (batch queued)\n",
+                              cmd.id, cmd.relayNumber, cmd.action.c_str());
+                return;
+            }
+        } else {
+            const int batchIdx = findEspNowRelayBatchSlot(targetMac, false);
+            if (batchIdx >= 0 && espNowRelayBatchSlots_[batchIdx].active) {
+                flushEspNowRelayBatchSlot(espNowRelayBatchSlots_[batchIdx], "non-batch");
+            }
+        }
+#endif
         
         // ✅ PASSO 2: Enviar via RelayCoordinator (ESP-NOW + mutex circulación)
-        const RelayOwner owner = resolveCommandOwner(cmd);
         uint32_t espNowCommandId = relayCoordinator.actuateSlave(
             owner,
             targetMac,
@@ -1154,8 +1498,20 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
             Serial.printf("   Slave: %s | Relé %d -> %s\n",
                           cmd.target_device_id.c_str(), cmd.relayNumber, cmd.action.c_str());
         } else {
-            Serial.println("📋 Comando adicionado à fila (slave offline ou falha temporal)");
-            Serial.println("💡 Será enviado quando slave voltar online ou no próximo retry");
+            const RelayDenyReason deny = relayCoordinator.lastDenyReason();
+            if (deny != RelayDenyReason::Ok) {
+                Serial.printf("[COORD] cmd id=%d denied reason=%s — ACK failed\n",
+                              cmd.id, relayDenyReasonName(deny));
+                if (supabaseConnected && cmd.id > 0) {
+#if ENABLE_MQTT
+                    tryPublishCloudAckViaMqtt(
+                        cmd.id, 0, targetMac, cmd.relayNumber, false, "failed");
+#endif
+                }
+            } else {
+                Serial.println("📋 Comando adicionado à fila (slave offline ou falha temporal)");
+                Serial.println("💡 Será enviado quando slave voltar online ou no próximo retry");
+            }
         }
         
     } else {
@@ -1290,7 +1646,13 @@ bool HydroSystemCore::executeLocalRelayCommand(const RelayCommand& cmd) {
     if (success) {
         Serial.println("✅ Comando local executado com sucesso");
     } else {
-        Serial.println("❌ Erro ao executar comando local");
+        const RelayDenyReason deny = relayCoordinator.lastDenyReason();
+        if (deny != RelayDenyReason::Ok) {
+            Serial.printf("[COORD] local deny owner=%s reason=%s R%d\n",
+                          relayOwnerName(owner), relayDenyReasonName(deny), cmd.relayNumber + 1);
+        } else {
+            Serial.println("❌ Erro ao executar comando local");
+        }
     }
     return success;
 }
@@ -1358,6 +1720,8 @@ void HydroSystemCore::publishMqttTelemetry() {
     reading.level4Wet = hydroControl.isLevelWet(4);
     reading.waterLevel = hydroControl.getWaterLevelAggregate();
     reading.interlockMode = hydroControl.getLevelInterlockModeName();
+    reading.circulationTyped = relayCoordinator.isCirculationConfigured();
+    reading.circulationMixOk = relayCoordinator.isCirculationMixActiveForDosing();
     // Sin DHT cableado: no enviar ambiente simulado (evita environment_data basura)
     reading.airTemperature = NAN;
     reading.humidity = NAN;
@@ -1381,6 +1745,8 @@ void HydroSystemCore::publishMqttLevels() {
     reading.level4Wet = hydroControl.isLevelWet(4);
     reading.waterLevel = hydroControl.getWaterLevelAggregate();
     reading.interlockMode = hydroControl.getLevelInterlockModeName();
+    reading.circulationTyped = relayCoordinator.isCirculationConfigured();
+    reading.circulationMixOk = relayCoordinator.isCirculationMixActiveForDosing();
 #if HIDRO_SIMULATE_WATER_LEVELS
     reading.levelsSimulated = true;
 #else
@@ -1684,6 +2050,10 @@ void HydroSystemCore::onPhysicalRecircStatic(bool starting, const char* domain, 
 RelayOwner HydroSystemCore::resolveCommandOwner(const RelayCommand& cmd) {
     String commandType = cmd.command_type.length() > 0 ? cmd.command_type : "manual";
     if (commandType == "rule") {
+        // Bridge scheduler: triggered_by/created_by "scheduler#…" (parser puede dejar "scheduler")
+        if (cmd.triggered_by.startsWith("scheduler")) {
+            return RelayOwner::ScheduleP4;
+        }
         if (cmd.priority >= TANK_SCRIPT_PRIORITY_THRESHOLD) {
             return RelayOwner::TankScriptP1;
         }
@@ -2412,6 +2782,11 @@ void HydroSystemCore::performMemoryProtection() {
         Serial.println("⚠️ Desabilitando Supabase temporariamente - Heap baixo");
         supabaseConnected = false;
     } else if (freeHeap > HEAP_SUPABASE_REENABLE && !supabaseConnected) {
+#if ENABLE_MQTT
+        if (MQTT_COMMAND_BRIDGE_ONLY && isMqttCommandPathStable()) {
+            return;
+        }
+#endif
         Serial.println("✅ Reabilitando Supabase - Heap recuperado");
         supabaseConnected = true;
     }
@@ -2576,7 +2951,7 @@ void HydroSystemCore::tryRegisterEndpoints() {
         // Não logar a cada tentativa para evitar spam no Serial
         static unsigned long lastWarning = 0;
         unsigned long now = millis();
-        if (now - lastWarning >= 10000) {  // Logar apenas a cada 10 segundos
+        if (now - lastWarning >= 30000) {  // Logar apenas a cada 30 segundos
             Serial.println("⚠️ WebServerTask ainda não disponível - endpoints não configurados");
             Serial.printf("   webServerTask: %s\n", webServerTask ? "✅ Disponível" : "❌ nullptr");
             if (webServerTask) {
@@ -2815,7 +3190,7 @@ void HydroSystemCore::updateRelayMasterState(const RelayCommand& cmd) {
 }
 
 // ✅ NOVO: Sistema de mapeamento commandId → supabaseCommandId
-void HydroSystemCore::addCommandMapping(uint32_t espNowCommandId, int supabaseCommandId) {
+void HydroSystemCore::addCommandMapping(uint32_t espNowCommandId, int supabaseCommandId, bool quiet) {
     if (mappingsMutex == nullptr) {
         return;
     }
@@ -2832,8 +3207,10 @@ void HydroSystemCore::addCommandMapping(uint32_t espNowCommandId, int supabaseCo
     
     commandMappings.push_back(mapping);
     
-    Serial.printf("📝 [MAPEAMENTO] Adicionado: ESP-NOW ID=%u → Supabase ID=%d\n", 
-                 espNowCommandId, supabaseCommandId);
+    if (!quiet) {
+        Serial.printf("📝 [MAPEAMENTO] Adicionado: ESP-NOW ID=%u → Supabase ID=%d\n", 
+                     espNowCommandId, supabaseCommandId);
+    }
     
     // Limpar mapeamentos expirados (> 5 minutos)
     cleanupExpiredMappings();
@@ -2864,6 +3241,84 @@ int HydroSystemCore::findSupabaseCommandId(uint32_t espNowCommandId) {
     
     xSemaphoreGive(mappingsMutex);
     return supabaseId;
+}
+
+void HydroSystemCore::drainSupabaseMappingsForEspNow(uint32_t espNowCommandId, std::vector<int>& out) {
+    out.clear();
+    if (mappingsMutex == nullptr) {
+        return;
+    }
+
+    if (xSemaphoreTake(mappingsMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return;
+    }
+
+    for (auto it = commandMappings.begin(); it != commandMappings.end();) {
+        if (it->espNowCommandId == espNowCommandId) {
+            out.push_back(it->supabaseCommandId);
+            it = commandMappings.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    xSemaphoreGive(mappingsMutex);
+}
+
+void HydroSystemCore::completePendingAcksForEspNowCommand(uint32_t espNowCommandId,
+                                                          const uint8_t* slaveMac,
+                                                          const char* via) {
+    std::vector<PendingSlaveCommandAck> toComplete;
+
+    if (pendingAckMutex != nullptr &&
+        xSemaphoreTake(pendingAckMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        cleanupExpiredPendingSlaveAcks();
+        for (auto it = pendingSlaveCommandAcks.begin(); it != pendingSlaveCommandAcks.end();) {
+            if (it->espNowCommandId != espNowCommandId) {
+                ++it;
+                continue;
+            }
+            if (slaveMac && memcmp(it->slaveMac, slaveMac, 6) != 0) {
+                ++it;
+                continue;
+            }
+            toComplete.push_back(*it);
+            it = pendingSlaveCommandAcks.erase(it);
+        }
+        xSemaphoreGive(pendingAckMutex);
+    }
+
+    std::vector<int> orphanIds;
+    drainSupabaseMappingsForEspNow(espNowCommandId, orphanIds);
+
+    // ACK-MASK chega ANTES de ALL_RELAYS: relayStates[] ainda tem estado VELHO.
+    // Fechar cloud com expectedOn (o que o comando pediu), não com snapshot stale.
+    for (const auto& pending : toComplete) {
+        if (wasRecentlyClosedCloudAck(pending.supabaseCommandId)) {
+            continue;
+        }
+        const int relay = pending.relayNumber;
+        const bool state = pending.expectedOn;
+        Serial.printf("[ACK-MASK] closing id=%d relay=%d expect=%s via=%s\n",
+                      pending.supabaseCommandId, relay, state ? "ON" : "OFF",
+                      via ? via : "?");
+        completeSlaveCommand(pending.supabaseCommandId, espNowCommandId, slaveMac,
+                             relay, state, via ? via : "ACK-MASK");
+    }
+
+    for (int sid : orphanIds) {
+        bool already = false;
+        for (const auto& pending : toComplete) {
+            if (pending.supabaseCommandId == sid) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) {
+            Serial.printf("[ACK-MASK] mapping órfão id=%d esp=%u (sem pending)\n",
+                          sid, static_cast<unsigned>(espNowCommandId));
+        }
+    }
 }
 
 void HydroSystemCore::cleanupExpiredMappings() {
@@ -2922,12 +3377,19 @@ bool HydroSystemCore::tryCloseCloudRelayCommand(int supabaseCommandId, const uin
     }
 
 #if ENABLE_MQTT
-    if (MQTT_COMMAND_BRIDGE_ONLY && isMqttCommandPathStable()) {
-        if (tryPublishCloudAckViaMqtt(supabaseCommandId, espNowCommandId, slaveMac, relayNumber, currentState)) {
+    // Com MQTT ligado: só command_ack — nunca HTTPS (evita sslBusy/TLS no hot path)
+    if (MQTT_COMMAND_BRIDGE_ONLY && mqttClient.isConnected()) {
+        if (isMqttCommandPathStable() &&
+            tryPublishCloudAckViaMqtt(supabaseCommandId, espNowCommandId, slaveMac, relayNumber, currentState)) {
             return true;
         }
+        return false;
     }
 #endif
+
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
 
     if (!supabaseConnected || supabase.isRequestInProgress()) {
         return false;
@@ -3002,7 +3464,13 @@ void HydroSystemCore::flushPendingCloudAcks() {
 
     bool canFlushHttps = supabaseConnected && hasEnoughMemoryForHTTPS() && !supabase.isRequestInProgress();
 #if ENABLE_MQTT
-    if (!canFlushHttps && !(MQTT_COMMAND_BRIDGE_ONLY && isMqttCommandPathStable())) {
+    if (MQTT_COMMAND_BRIDGE_ONLY && mqttClient.isConnected()) {
+        if (!isMqttCommandPathStable()) {
+            return;
+        }
+    } else if (WiFi.status() != WL_CONNECTED) {
+        return;
+    } else if (!canFlushHttps) {
         return;
     }
 #else
@@ -3011,29 +3479,34 @@ void HydroSystemCore::flushPendingCloudAcks() {
     }
 #endif
 
-    PendingCloudAck& item = pendingCloudAckQueue[pendingCloudAckHead];
-    const bool hasMac = item.slaveMac[0] != 0 || item.slaveMac[1] != 0 ||
-                        item.slaveMac[2] != 0 || item.slaveMac[3] != 0 ||
-                        item.slaveMac[4] != 0 || item.slaveMac[5] != 0;
-    const uint8_t* macPtr = hasMac ? item.slaveMac : nullptr;
+    const uint8_t burstMax = ESP.getFreeHeap() < 60000 ? 1 : 3;
+    for (uint8_t burst = 0; burst < burstMax && pendingCloudAckCount > 0; burst++) {
+        PendingCloudAck& item = pendingCloudAckQueue[pendingCloudAckHead];
+        const bool hasMac = item.slaveMac[0] != 0 || item.slaveMac[1] != 0 ||
+                            item.slaveMac[2] != 0 || item.slaveMac[3] != 0 ||
+                            item.slaveMac[4] != 0 || item.slaveMac[5] != 0;
+        const uint8_t* macPtr = hasMac ? item.slaveMac : nullptr;
 
-    esp_task_wdt_reset();
-    if (tryCloseCloudRelayCommand(item.supabaseCommandId, macPtr, item.relayNumber, item.currentState,
-                                  item.espNowCommandId)) {
         esp_task_wdt_reset();
-        logCmdCloudAckResult("cloud-retry", item.supabaseCommandId, item.espNowCommandId,
-                             item.relayNumber, item.currentState, true);
-        pendingCloudAckHead = (pendingCloudAckHead + 1) % PENDING_CLOUD_ACK_CAP;
-        pendingCloudAckCount--;
-        return;
-    }
+        if (tryCloseCloudRelayCommand(item.supabaseCommandId, macPtr, item.relayNumber, item.currentState,
+                                      item.espNowCommandId)) {
+            esp_task_wdt_reset();
+            logCmdCloudAckResult("cloud-retry", item.supabaseCommandId, item.espNowCommandId,
+                                 item.relayNumber, item.currentState, true);
+            pendingCloudAckHead = (pendingCloudAckHead + 1) % PENDING_CLOUD_ACK_CAP;
+            pendingCloudAckCount--;
+            continue;
+        }
 
-    item.attempts++;
-    if (item.attempts >= PENDING_CLOUD_ACK_MAX_ATTEMPTS) {
-        Serial.printf("⚠️ [ACK cloud] abandonado após %u tentativas id=%d\n",
-                      item.attempts, item.supabaseCommandId);
-        pendingCloudAckHead = (pendingCloudAckHead + 1) % PENDING_CLOUD_ACK_CAP;
-        pendingCloudAckCount--;
+        item.attempts++;
+        if (item.attempts >= PENDING_CLOUD_ACK_MAX_ATTEMPTS) {
+            Serial.printf("⚠️ [ACK cloud] abandonado após %u tentativas id=%d\n",
+                          item.attempts, item.supabaseCommandId);
+            pendingCloudAckHead = (pendingCloudAckHead + 1) % PENDING_CLOUD_ACK_CAP;
+            pendingCloudAckCount--;
+            continue;
+        }
+        break;
     }
 }
 
@@ -3056,9 +3529,8 @@ void HydroSystemCore::completeSlaveCommand(int supabaseCommandId, uint32_t espNo
         xSemaphoreTake(pendingAckMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         pendingSlaveCommandAcks.erase(
             std::remove_if(pendingSlaveCommandAcks.begin(), pendingSlaveCommandAcks.end(),
-                [supabaseCommandId, espNowCommandId](const PendingSlaveCommandAck& p) {
-                    return p.supabaseCommandId == supabaseCommandId ||
-                           (espNowCommandId > 0 && p.espNowCommandId == espNowCommandId);
+                [supabaseCommandId](const PendingSlaveCommandAck& p) {
+                    return p.supabaseCommandId == supabaseCommandId;
                 }),
             pendingSlaveCommandAcks.end());
         xSemaphoreGive(pendingAckMutex);
@@ -3097,6 +3569,9 @@ bool HydroSystemCore::isSslTransportBusy() {
 }
 
 bool HydroSystemCore::isSslHotPathBusy() {
+    if (EspNowChannelPolicy::isProvisioningStaSuspendActive()) {
+        return true;
+    }
     if (hasPendingCloudAcks()) {
         return true;
     }
@@ -3153,7 +3628,13 @@ void HydroSystemCore::markRecentlyClosedCloudAck(int supabaseCommandId) {
 
 void HydroSystemCore::reconcilePendingSlaveAcks(const uint8_t* slaveMac, const bool relayStates[8],
                                                 uint8_t numRelays) {
-    if (!slaveMac || !relayStates || !supabaseConnected || pendingAckMutex == nullptr) {
+#if ENABLE_MQTT
+    const bool cloudAckPath = supabaseConnected ||
+                              (MQTT_COMMAND_BRIDGE_ONLY && isMqttCommandPathStable());
+#else
+    const bool cloudAckPath = supabaseConnected;
+#endif
+    if (!slaveMac || !relayStates || !cloudAckPath || pendingAckMutex == nullptr) {
         return;
     }
 
@@ -3213,36 +3694,25 @@ void HydroSystemCore::updateRelaySlaveState(const String& slaveDeviceId,
     
     Serial.println("🔄 [SLAVE] Atualizando relay_slaves com estado real...");
     
-    // Buscar estado atual do slave usando MasterSlaveManager
-    // Nota: getAllTrustedSlaves retorna cópia, então vamos buscar diretamente
     bool relayStates[8] = {false};
     bool hasTimers[8] = {false};
     int remainingTimes[8] = {0};
-    
-    // Tentar buscar slave da lista confiável
-    auto trustedSlaves = masterManager->getAllTrustedSlaves();
-    bool slaveFound = false;
-    
-    for (const auto& s : trustedSlaves) {
-        if (memcmp(s.macAddress, slaveMac, 6) == 0) {
-            slaveFound = true;
-            for (int i = 0; i < 8 && i < s.numRelays; i++) {
-                relayStates[i] = s.relayStates[i].state;
-                hasTimers[i] = s.relayStates[i].hasTimer;
-                remainingTimes[i] = s.relayStates[i].remainingTime;
-            }
-            break;
-        }
-    }
+    uint8_t numRelays = 0;
+    bool linkOnline = false;
+    uint16_t linkLastSeenS = 0;
+
+    const bool slaveFound = masterManager->readSlaveRelaySnapshot(
+        slaveMac, relayStates, hasTimers, remainingTimes, numRelays, linkOnline, linkLastSeenS);
     
     if (!slaveFound) {
         Serial.println("⚠️ [SLAVE] Slave não encontrado na lista confiável");
         Serial.println("💡 Inicializando arrays com valores padrão");
-        // Arrays já inicializados com false/0 acima
     }
     
     // Atualizar estado do relay específico
-    relayStates[relayNumber] = state;
+    if (relayNumber >= 0 && relayNumber < 8) {
+        relayStates[relayNumber] = state;
+    }
     
     // ✅ Atualizar no Supabase
     String slaveMacStr = ESPNowController::macToString(slaveMac);
@@ -3289,24 +3759,18 @@ bool HydroSystemCore::tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t 
         return false;
     }
 
-    bool relayStates[8] = {false};
+    if (relayNumber < 0 || relayNumber > 15) {
+        Serial.printf("⚠️ [MQTT ACK] relay_index=%d inválido — id=%d\n",
+                      relayNumber, supabaseCommandId);
+        return false;
+    }
+
     const char* slaveMacStr = nullptr;
     String slaveMacString;
 
     if (slaveMac) {
         slaveMacString = ESPNowController::macToString(slaveMac);
         slaveMacStr = slaveMacString.c_str();
-        if (masterManager) {
-            TrustedSlave* slave = masterManager->getTrustedSlave(slaveMac);
-            if (slave) {
-                for (int i = 0; i < 8 && i < slave->numRelays; i++) {
-                    relayStates[i] = slave->relayStates[i].state;
-                }
-            }
-        }
-        if (relayNumber >= 0 && relayNumber < 8) {
-            relayStates[relayNumber] = currentState;
-        }
     }
 
     MqttCommandAckReading ack = {};
@@ -3316,18 +3780,11 @@ bool HydroSystemCore::tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t 
     ack.action = currentState ? "on" : "off";
     ack.currentState = currentState;
     ack.slaveMac = slaveMacStr;
-    ack.relayStates = slaveMac ? relayStates : nullptr;
-    ack.numRelayStates = slaveMac ? 8 : 0;
+    ack.relayStates = nullptr;
+    ack.numRelayStates = 0;
     ack.espnowId = espNowCommandId;
 
-    if (!mqttClient.publishCommandAck(ack)) {
-        return false;
-    }
-
-    if (slaveMac) {
-        scheduleSlaveRelayStateMqtt(slaveMac, true, false);
-    }
-    return true;
+    return mqttClient.publishCommandAck(ack);
 }
 
 void HydroSystemCore::forceSlaveRelayMqttFullSync() {
@@ -3335,24 +3792,44 @@ void HydroSystemCore::forceSlaveRelayMqttFullSync() {
         return;
     }
 
-    std::vector<TrustedSlave> slaves = masterManager->getAllTrustedSlaves();
-    for (const auto& slave : slaves) {
-        const unsigned long sinceSeen = millis() - slave.lastSeen;
-        if (!slave.isOnline() && sinceSeen >= 60000) {
+#if ESPNOW_RELAY_BATCH_ENABLED
+    flushAllEspNowRelayBatches("sync-60s");
+#endif
+
+    // Coletar MACs sob mutex curto; RF/MQTT fora (sem getAllTrustedSlaves)
+    uint8_t macList[8][6];
+    unsigned long lastSeenList[8];
+    bool onlineList[8];
+    int macCount = 0;
+    masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+        if (macCount >= 8) {
+            return;
+        }
+        memcpy(macList[macCount], slave.macAddress, 6);
+        lastSeenList[macCount] = slave.lastSeen;
+        onlineList[macCount] = slave.isOnline();
+        macCount++;
+    });
+
+    for (int i = 0; i < macCount; i++) {
+        const unsigned long sinceSeen = millis() - lastSeenList[i];
+        if (!onlineList[i] && sinceSeen >= 60000) {
             continue;
         }
 
         masterManager->drainAllRelaysStatusWait();
-        masterManager->requestSlaveStatus(slave.macAddress);
+        Serial.printf("[AUTO-SYNC] request status mac=%s\n",
+                      ESPNowController::macToString(macList[i]).c_str());
+        masterManager->requestSlaveStatus(macList[i]);
         const bool gotStatus = masterManager->waitForAllRelaysStatus(800);
         esp_task_wdt_reset();
 
         if (gotStatus) {
             Serial.printf("[SYNC-MQTT] full relay_states mac=%s\n",
-                          ESPNowController::macToString(slave.macAddress).c_str());
+                          ESPNowController::macToString(macList[i]).c_str());
         } else {
             Serial.printf("[SYNC-MQTT] ALL_RELAYS timeout mac=%s\n",
-                          ESPNowController::macToString(slave.macAddress).c_str());
+                          ESPNowController::macToString(macList[i]).c_str());
         }
     }
 }
@@ -3877,7 +4354,305 @@ void HydroSystemCore::handleMqttIncoming(const char* topic, const char* payload,
         applyPHConfig(config, "mqtt");
         return;
     }
+    if (strstr(topic, "/circ/config") != nullptr) {
+        if (!applyCirculationConfigMqtt(payload, length)) {
+            Serial.println("[MQTT] circ/config JSON inválido ou apply falhou");
+        }
+        return;
+    }
+    if (strstr(topic, "/rules/manifest") != nullptr) {
+        applyRulesManifestMqtt(payload, length);
+        return;
+    }
+    if (strstr(topic, "/rules/") != nullptr) {
+        applyRuleUpsertMqtt(payload, length);
+        return;
+    }
     handleMqttCommandPayload(payload, length);
+}
+
+static const char* FN_RECIRC_RULE_ID = "fn_recirculacao_continua";
+static const char* FN_RECIRC_RULE_ID_LEGACY = "fn_circulation";
+
+bool HydroSystemCore::upsertFnCirculationRule(const char* slaveMac, int relayIndex, bool enabled) {
+    if (!decisionEngineReady) {
+        Serial.println("[CIRC] DecisionEngine não pronto — skip upsert fn_recirculacao_continua");
+        return false;
+    }
+
+    if (!enabled || !slaveMac || strlen(slaveMac) < 11 || relayIndex < 0 || relayIndex >= 8) {
+        bool removed = false;
+        if (decisionEngine.removeRule(FN_RECIRC_RULE_ID)) {
+            removed = true;
+        }
+        if (decisionEngine.removeRule(FN_RECIRC_RULE_ID_LEGACY)) {
+            removed = true;
+        }
+        if (removed) {
+            decisionEngine.saveRulesToFile();
+            Serial.println("[CIRC] regra recirculação removida (bomba não tipada)");
+        }
+        return true;
+    }
+
+    // Migrar legado fora do SPIFFS se existir
+    decisionEngine.removeRule(FN_RECIRC_RULE_ID_LEGACY);
+
+    StaticJsonDocument<768> doc;
+    doc["rule_id"] = FN_RECIRC_RULE_ID;
+    doc["rule_name"] = "Recirculação contínua";
+    doc["rule_description"] =
+        "Bomba de circulação via tipagem. Inativa até ativar no Motor de Regras.";
+    {
+        DecisionRule* existing = decisionEngine.getRule(FN_RECIRC_RULE_ID);
+        doc["enabled"] = existing ? existing->enabled : false;
+    }
+    doc["priority"] = 30;
+    doc["trigger_type"] = "periodic";
+    doc["trigger_interval_ms"] = 60000;
+
+    JsonObject ruleJson = doc.createNestedObject("rule_json");
+    ruleJson["priority"] = 30;
+    ruleJson["source"] = "hydraulic_roles";
+    ruleJson["hydraulic_role"] = "circulation_pump";
+    ruleJson["i18n_key"] = "rules.fn_circulation";
+    ruleJson["interval_between_executions"] = 60;
+
+    JsonObject condition = ruleJson.createNestedObject("condition");
+    condition["type"] = "time_window";
+    condition["sensor_name"] = "time_window";
+
+    JsonArray actions = ruleJson.createNestedArray("actions");
+    JsonObject action = actions.createNestedObject();
+    action["type"] = "relay_on";
+    action["target_relay"] = relayIndex;
+    action["target_device_id"] = slaveMac;
+    action["duration_ms"] = 0;
+
+    return decisionEngine.upsertRuleFromJson(doc.as<JsonObject>(), true);
+}
+
+bool HydroSystemCore::applyCirculationConfigMqtt(const char* payload, size_t length) {
+    if (!payload || length == 0) {
+        return false;
+    }
+
+    StaticJsonDocument<384> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+        return false;
+    }
+
+    const bool enabled = doc["enabled"] | false;
+    const char* macStr = doc["slave_mac"] | doc["slaveMac"] | "";
+    int relayIndex = doc["relay_index"] | doc["relayIndex"] | -1;
+
+    if (!enabled || !macStr || strlen(macStr) < 11 || relayIndex < 0 || relayIndex >= 8) {
+        relayCoordinator.clearCirculationTarget();
+        Serial.println("[MQTT] circ/config → circulation cleared (NVS only)");
+        return true;
+    }
+
+    uint8_t mac[6];
+    int values[6];
+    if (sscanf(macStr, "%x:%x:%x:%x:%x:%x",
+               &values[0], &values[1], &values[2],
+               &values[3], &values[4], &values[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) {
+        mac[i] = static_cast<uint8_t>(values[i]);
+    }
+
+    relayCoordinator.setCirculationTarget(mac, relayIndex);
+    Serial.printf("[MQTT] circ/config → binding NVS R%d (fn_* via rules upsert)\n",
+                  relayIndex + 1);
+    return true;
+}
+
+bool HydroSystemCore::applyRuleUpsertMqtt(const char* payload, size_t length) {
+    if (!payload || length == 0 || !decisionEngineReady) {
+        return false;
+    }
+
+    // Envelope MQTT + rule_json aninhado — 3k estourava e rule_json virava null
+    DynamicJsonDocument doc(8192);
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+        Serial.printf("[MQTT] rules upsert parse: %s (len=%u)\n", err.c_str(),
+                      static_cast<unsigned>(length));
+        return false;
+    }
+    if (doc.overflowed()) {
+        Serial.printf("[MQTT] rules upsert overflow mem=%u len=%u\n",
+                      static_cast<unsigned>(doc.memoryUsage()),
+                      static_cast<unsigned>(length));
+    }
+
+    const char* op = doc["op"] | "upsert";
+    const char* ruleId = doc["rule_id"] | "";
+    if (!ruleId[0] && doc["rule"].is<JsonObject>()) {
+        ruleId = doc["rule"]["rule_id"] | doc["rule"]["id"] | "";
+    }
+
+    if (strcmp(op, "delete") == 0) {
+        if (ruleId[0]) {
+            DecisionRule* existing = decisionEngine.getRule(ruleId);
+            if (existing) {
+                releaseDecisionRuleActuators(*existing);
+            }
+            decisionEngine.removeRule(ruleId);
+            decisionEngine.saveRulesToFile();
+            Serial.printf("[MQTT] rules delete → %s\n", ruleId);
+        }
+        return true;
+    }
+
+    // disable: manter regra no SPIFFS com enabled=false (ativar no Motor sem re-tipar)
+    if (strcmp(op, "disable") == 0) {
+        if (ruleId[0]) {
+            DecisionRule* existing = decisionEngine.getRule(ruleId);
+            if (existing) {
+                releaseDecisionRuleActuators(*existing);
+                existing->enabled = false;
+                ScriptRunnerManager::instance().removeByRuleId(ruleId);
+                decisionEngine.saveRulesToFile();
+                Serial.printf("[MQTT] rules disable (keep) → %s (+OFF actuators)\n", ruleId);
+            } else {
+                Serial.printf("[MQTT] rules disable — %s ausente (noop)\n", ruleId);
+            }
+        }
+        return true;
+    }
+
+    JsonObject ruleObj = doc["rule"].as<JsonObject>();
+    if (ruleObj.isNull()) {
+        ruleObj = doc.as<JsonObject>();
+    }
+    if (ruleObj.isNull()) {
+        return false;
+    }
+
+    const bool wasEnabled = [&]() {
+        DecisionRule* prev = ruleId[0] ? decisionEngine.getRule(ruleId) : nullptr;
+        return prev && prev->enabled;
+    }();
+
+    const bool ok = decisionEngine.upsertRuleFromJson(ruleObj, true);
+    DecisionRule* after = ruleId[0] ? decisionEngine.getRule(ruleId) : nullptr;
+    const bool nowEnabled = after && after->enabled;
+    if (ok && after && wasEnabled && !nowEnabled) {
+        releaseDecisionRuleActuators(*after);
+    }
+    Serial.printf("[MQTT] rules upsert %s enabled=%d → %s\n",
+                  ruleId[0] ? ruleId : "?",
+                  nowEnabled ? 1 : 0,
+                  ok ? "ok" : "fail");
+    return ok;
+}
+
+void HydroSystemCore::releaseDecisionRuleActuators(const DecisionRule& rule) {
+    for (const auto& action : rule.actions) {
+        if (action.type != RELAY_ON && action.type != RELAY_PULSE) {
+            continue;
+        }
+        const String& target = action.target_device_id;
+        if (target.isEmpty() || target.equalsIgnoreCase("local") ||
+            target.equalsIgnoreCase("MASTER")) {
+            const bool ok = relayCoordinator.actuateLocal(
+                RelayOwner::DecisionRule, action.target_relay, "off", 0);
+            Serial.printf("[RULE-OFF] local R%d rule=%s ok=%d\n",
+                          action.target_relay, rule.id.c_str(), ok ? 1 : 0);
+            continue;
+        }
+
+        uint8_t mac[6] = {0};
+        bool macOk = false;
+        if (masterManager) {
+            masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                if (macOk) return;
+                if (slave.deviceName.equalsIgnoreCase(target)) {
+                    memcpy(mac, slave.macAddress, 6);
+                    macOk = true;
+                }
+            });
+        }
+        if (!macOk) {
+            int values[6];
+            String sanitized = target;
+            sanitized.toUpperCase();
+            sanitized.replace("-", ":");
+            while (sanitized.indexOf("::") >= 0) {
+                sanitized.replace("::", ":");
+            }
+            if (sscanf(sanitized.c_str(), "%x:%x:%x:%x:%x:%x",
+                       &values[0], &values[1], &values[2], &values[3], &values[4],
+                       &values[5]) == 6) {
+                for (int i = 0; i < 6; i++) {
+                    mac[i] = static_cast<uint8_t>(values[i]);
+                }
+                macOk = true;
+            }
+        }
+        if (!macOk) {
+            Serial.printf("[RULE-OFF] MAC inválido target=%s rule=%s\n",
+                          target.c_str(), rule.id.c_str());
+            continue;
+        }
+        const uint32_t cmdId = relayCoordinator.actuateSlave(
+            RelayOwner::DecisionRule, mac, action.target_relay, "off", 0);
+        Serial.printf("[RULE-OFF] slave R%d rule=%s cmd=%u\n",
+                      action.target_relay, rule.id.c_str(),
+                      static_cast<unsigned>(cmdId));
+    }
+}
+
+bool HydroSystemCore::applyRulesManifestMqtt(const char* payload, size_t length) {
+    if (!payload || length == 0 || !decisionEngineReady) {
+        return false;
+    }
+
+    StaticJsonDocument<2048> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+        Serial.printf("[MQTT] rules manifest parse: %s\n", err.c_str());
+        return false;
+    }
+
+    JsonArray ids = doc["ids"].as<JsonArray>();
+    if (ids.isNull()) {
+        return false;
+    }
+
+    size_t cloudCount = ids.size();
+    size_t localCount = decisionEngine.getAllRules().size();
+    Serial.printf("[MQTT] rules manifest cloud=%u local=%u — retained upserts aplicam deltas\n",
+                  static_cast<unsigned>(cloudCount),
+                  static_cast<unsigned>(localCount));
+
+    // Desactivar locales que ya no están en el manifesto (o enabled=false en cloud).
+    for (auto& local : decisionEngine.getAllRules()) {
+        bool found = false;
+        bool cloudEnabled = false;
+        for (JsonObject entry : ids) {
+            const char* rid = entry["rule_id"] | "";
+            if (local.id == rid) {
+                found = true;
+                cloudEnabled = entry["enabled"] | false;
+                break;
+            }
+        }
+        if (!found || !cloudEnabled) {
+            if (local.enabled) {
+                releaseDecisionRuleActuators(local);
+                local.enabled = false;
+                ScriptRunnerManager::instance().removeByRuleId(local.id);
+                Serial.printf("[MQTT] manifest → disable local %s (+OFF)\n", local.id.c_str());
+            }
+        }
+    }
+    decisionEngine.saveRulesToFile();
+    return true;
 }
 
 void HydroSystemCore::handleMqttCommandPayload(const char* payload, size_t length) {

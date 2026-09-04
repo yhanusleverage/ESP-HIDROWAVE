@@ -403,20 +403,8 @@ void setupCallbacks() {
     
     // Callback PING: MasterSlaveManager::begin() já registrou onPingReceivedStatic — não sobrescrever aqui
     
-    // 🔄 FASE 2: Callback para ACK de comandos de relay
-    if (masterManager) {
-        masterManager->setRelayAckCallback([](const uint8_t* senderMac, uint32_t commandId, bool success, 
-            uint8_t relayNumber, uint8_t currentState) {
-            
-            Serial.println("\n🎊 === ACK DE RELAY RECEBIDO ===");
-            Serial.println("📱 De: " + ESPNowController::macToString(senderMac));
-            Serial.println("🆔 Command ID: " + String(commandId));
-            Serial.println("🔌 Relé: " + String(relayNumber));
-            Serial.println("✅ Success: " + String(success ? "Sim" : "Não"));
-            Serial.println("💡 Estado: " + String(currentState ? "ON" : "OFF"));
-            Serial.println("==================================\n");
-        });
-    }
+    // ACK de relay: HydroSystemCore::wireMasterManagerIntegration() registra o callback real
+    // (fecha supabase / MQTT). NÃO sobrescrever aqui — só logaria e perderia o cierre cloud.
 }
 
 #endif  // ENABLE_ESPNOW
@@ -533,27 +521,43 @@ void controlAllRelays(int relayNumber, const String& action, int duration) {
     }
     Serial.println("----------------------------------------");
     
-    // ⭐ POTENCIA MÁXIMA: Usar trustedSlaves como fonte principal (mais confiável)
-    auto trustedSlaves = masterManager->getAllTrustedSlaves();
+    // Snapshot leve via forEachTrustedSlave (evita deadlock de mutex)
+    struct SlaveSnap {
+        uint8_t mac[6];
+        String name;
+        uint8_t numRelays;
+        bool online;
+    };
+    SlaveSnap snaps[8];
+    int snapCount = 0;
+    masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+        if (snapCount >= 8) return;
+        memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+        snaps[snapCount].name = slave.deviceName;
+        snaps[snapCount].numRelays = slave.numRelays;
+        snaps[snapCount].online = slave.isOnline();
+        snapCount++;
+    });
+
     int slavesFound = 0;
     int slavesOnline = 0;
     
-    Serial.println("📊 Total de trustedSlaves: " + String(trustedSlaves.size()));
+    Serial.println("📊 Total de trustedSlaves: " + String(snapCount));
     
-    if (trustedSlaves.empty()) {
+    if (snapCount == 0) {
         Serial.println("⚠️ Nenhum slave encontrado em trustedSlaves!");
         Serial.println("💡 Use 'list' ou 'discover' para encontrar slaves");
         Serial.println("========================================\n");
         return;
     }
     
-    for (const auto& slave : trustedSlaves) {
+    for (int i = 0; i < snapCount; i++) {
         slavesFound++;
-        if (slave.isOnline()) {
+        if (snaps[i].online) {
             slavesOnline++;
-            Serial.println("📤 [" + String(slavesOnline) + "] Enviando para: " + slave.deviceName + 
-                          " (" + ESPNowController::macToString(slave.macAddress) + ")");
-            bool success = masterManager->sendRelayCommandToSlave(slave.macAddress, relayNumber, action.c_str(), duration);
+            Serial.println("📤 [" + String(slavesOnline) + "] Enviando para: " + snaps[i].name + 
+                          " (" + ESPNowController::macToString(snaps[i].mac) + ")");
+            bool success = masterManager->sendRelayCommandToSlave(snaps[i].mac, relayNumber, action.c_str(), duration);
             if (success) {
                 Serial.println("   ✅ Comando enviado com sucesso");
             } else {
@@ -561,7 +565,7 @@ void controlAllRelays(int relayNumber, const String& action, int duration) {
             }
             delay(100); // Pequeno delay entre comandos
         } else {
-            Serial.println("⏭️  [" + String(slavesFound) + "] " + slave.deviceName + " está OFFLINE - pulando");
+            Serial.println("⏭️  [" + String(slavesFound) + "] " + snaps[i].name + " está OFFLINE - pulando");
         }
     }
     
@@ -917,10 +921,24 @@ void handleMasterSerialCommands() {
                         
                         Serial.println("🔄 Desligando todos os relés em todos os slaves...");
                         
-                        auto trustedSlaves = masterManager->getAllTrustedSlaves();
+                        struct SlaveSnap {
+                            uint8_t mac[6];
+                            String name;
+                            uint8_t numRelays;
+                            bool online;
+                        };
+                        SlaveSnap snaps[8];
+                        int snapCount = 0;
+                        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                            if (snapCount >= 8) return;
+                            memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+                            snaps[snapCount].name = slave.deviceName;
+                            snaps[snapCount].numRelays = slave.numRelays;
+                            snaps[snapCount].online = slave.isOnline();
+                            snapCount++;
+                        });
                         
-                        // ⭐ DIAGNÓSTICO: Verificar se há slaves
-                        if (trustedSlaves.empty()) {
+                        if (snapCount == 0) {
                             Serial.println("\n⚠️  NENHUM SLAVE DETECTADO!");
                             Serial.println("📋 Total de slaves confiáveis: 0");
                             Serial.println("💡 Ações sugeridas:");
@@ -931,29 +949,20 @@ void handleMasterSerialCommands() {
                             return;
                         }
                         
-                        Serial.println("📋 Total de slaves confiáveis: " + String(trustedSlaves.size()));
+                        Serial.println("📋 Total de slaves confiáveis: " + String(snapCount));
                         int slavesProcessed = 0;
                         int totalCommands = 0;
                         
-                        // Iterar sobre cada slave
-                        for (const auto& slave : trustedSlaves) {
-                            if (slave.isOnline()) {
+                        for (int si = 0; si < snapCount; si++) {
+                            if (snaps[si].online) {
                                 slavesProcessed++;
-                                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                                Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                                Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                                 
-                                // Para cada slave, enviar comando para todos os relés (0-7)
                                 int commandsSent = 0;
-                                for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
-                                    // ⭐ CRÍTICO: Verificar se slave ainda está online antes de cada comando
-                                    auto currentSlaves = masterManager->getAllTrustedSlaves();
-                                    bool slaveStillOnline = false;
-                                    for (const auto& currentSlave : currentSlaves) {
-                                        if (memcmp(currentSlave.macAddress, slave.macAddress, 6) == 0) {
-                                            slaveStillOnline = currentSlave.isOnline();
-                                            break;
-                                        }
-                                    }
+                                for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                                    TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                                    bool slaveStillOnline = cur && cur->isOnline();
                                     
                                     if (!slaveStillOnline) {
                                         Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
@@ -961,7 +970,7 @@ void handleMasterSerialCommands() {
                                     }
                                     
                                     bool success = masterManager->sendRelayCommandToSlave(
-                                        slave.macAddress, 
+                                        snaps[si].mac, 
                                         relayNum, 
                                         "off", 
                                         0,     // duration
@@ -971,9 +980,8 @@ void handleMasterSerialCommands() {
                                     if (success) {
                                         commandsSent++;
                                         totalCommands++;
-                                        delay(50); // Delay para permitir processamento
+                                        delay(50);
                                         
-                                        // ⭐ CRÍTICO: Processar respostas para atualizar lastSeen
                                         if (masterManager) {
                                             masterManager->update();
                                         }
@@ -981,23 +989,21 @@ void handleMasterSerialCommands() {
                                 }
                                 Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
                             } else {
-                                Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                                Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
                             }
                         }
                         
-                        // ✅ Actualizar status UNA SOLA VEZ al final de todos los comandos
                         Serial.println("\n🔄 Actualizando status de todos los slaves (una sola vez)...");
-                        delay(500); // Delay para permitir que todos los comandos sean procesados
+                        delay(500);
                         masterManager->requestAllSlavesRelayStatus();
                         
                         Serial.println("\n📊 Resumo:");
-                        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+                        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
                         Serial.println("   Total de comandos enviados: " + String(totalCommands));
                         Serial.println("✅ Comando relay off_all concluído");
                     }
                     else if (command == "relay on_all") {
                         // 🔌 Ligar todos os relés permanentemente em todos os slaves
-                        // ✅ MESMA LÓGICA que comando simples de relé, mas percorrendo todos os relés
                         if (!masterManager) {
                             Serial.println("❌ MasterSlaveManager não inicializado");
                             return;
@@ -1005,10 +1011,24 @@ void handleMasterSerialCommands() {
                         
                         Serial.println("🔌 Ligando todos os relés permanentemente em todos os slaves...");
                         
-                        auto trustedSlaves = masterManager->getAllTrustedSlaves();
+                        struct SlaveSnap {
+                            uint8_t mac[6];
+                            String name;
+                            uint8_t numRelays;
+                            bool online;
+                        };
+                        SlaveSnap snaps[8];
+                        int snapCount = 0;
+                        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                            if (snapCount >= 8) return;
+                            memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+                            snaps[snapCount].name = slave.deviceName;
+                            snaps[snapCount].numRelays = slave.numRelays;
+                            snaps[snapCount].online = slave.isOnline();
+                            snapCount++;
+                        });
                         
-                        // ⭐ DIAGNÓSTICO: Verificar se há slaves
-                        if (trustedSlaves.empty()) {
+                        if (snapCount == 0) {
                             Serial.println("\n⚠️  NENHUM SLAVE DETECTADO!");
                             Serial.println("📋 Total de slaves confiáveis: 0");
                             Serial.println("💡 Ações sugeridas:");
@@ -1019,29 +1039,20 @@ void handleMasterSerialCommands() {
                             return;
                         }
                         
-                        Serial.println("📋 Total de slaves confiáveis: " + String(trustedSlaves.size()));
+                        Serial.println("📋 Total de slaves confiáveis: " + String(snapCount));
                         int slavesProcessed = 0;
                         int totalCommands = 0;
                         
-                        // Iterar sobre cada slave
-                        for (const auto& slave : trustedSlaves) {
-                            if (slave.isOnline()) {
+                        for (int si = 0; si < snapCount; si++) {
+                            if (snaps[si].online) {
                                 slavesProcessed++;
-                                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                                Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                                Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                                 
-                                // Para cada slave, enviar comando para todos os relés (0-7)
                                 int commandsSent = 0;
-                                for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
-                                    // ⭐ CRÍTICO: Verificar se slave ainda está online antes de cada comando
-                                    auto currentSlaves = masterManager->getAllTrustedSlaves();
-                                    bool slaveStillOnline = false;
-                                    for (const auto& currentSlave : currentSlaves) {
-                                        if (memcmp(currentSlave.macAddress, slave.macAddress, 6) == 0) {
-                                            slaveStillOnline = currentSlave.isOnline();
-                                            break;
-                                        }
-                                    }
+                                for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                                    TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                                    bool slaveStillOnline = cur && cur->isOnline();
                                     
                                     if (!slaveStillOnline) {
                                         Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
@@ -1049,19 +1060,18 @@ void handleMasterSerialCommands() {
                                     }
                                     
                                     bool success = masterManager->sendRelayCommandToSlave(
-                                        slave.macAddress, 
+                                        snaps[si].mac, 
                                         relayNum, 
-                                        "on",  // ON permanente (duration=0)
-                                        0,     // duration
-                                        0,     // supabaseCommandId
-                                        false  // ✅ NO actualizar status después de cada comando (operación en lote)
+                                        "on",
+                                        0,
+                                        0,
+                                        false
                                     );
                                     if (success) {
                                         commandsSent++;
                                         totalCommands++;
-                                        delay(50); // Delay para permitir processamento
+                                        delay(50);
                                         
-                                        // ⭐ CRÍTICO: Processar respostas para atualizar lastSeen
                                         if (masterManager) {
                                             masterManager->update();
                                         }
@@ -1069,17 +1079,16 @@ void handleMasterSerialCommands() {
                                 }
                                 Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
                             } else {
-                                Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                                Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
                             }
                         }
                         
-                        // ✅ Actualizar status UNA SOLA VEZ al final de todos los comandos
                         Serial.println("\n🔄 Actualizando status de todos los slaves (una sola vez)...");
-                        delay(500); // Delay para permitir que todos los comandos sean procesados
+                        delay(500);
                         masterManager->requestAllSlavesRelayStatus();
                         
                         Serial.println("\n📊 Resumo:");
-                        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+                        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
                         Serial.println("   Total de comandos enviados: " + String(totalCommands));
                         Serial.println("✅ Comando relay on_all concluído");
                     }
@@ -1089,7 +1098,6 @@ void handleMasterSerialCommands() {
                 }
                 else if (command == "on_all") {
                     // Ligar todos os relés permanentemente em todos os slaves
-                    // ✅ MESMA LÓGICA que relay on_all
                     if (!masterManager) {
                         Serial.println("❌ MasterSlaveManager não inicializado");
                         return;
@@ -1097,10 +1105,24 @@ void handleMasterSerialCommands() {
                     
                     Serial.println("🔌 Ligando todos os relés permanentemente em todos os slaves...");
                     
-                    auto trustedSlaves = masterManager->getAllTrustedSlaves();
+                    struct SlaveSnap {
+                        uint8_t mac[6];
+                        String name;
+                        uint8_t numRelays;
+                        bool online;
+                    };
+                    SlaveSnap snaps[8];
+                    int snapCount = 0;
+                    masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                        if (snapCount >= 8) return;
+                        memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+                        snaps[snapCount].name = slave.deviceName;
+                        snaps[snapCount].numRelays = slave.numRelays;
+                        snaps[snapCount].online = slave.isOnline();
+                        snapCount++;
+                    });
                     
-                    // ⭐ DIAGNÓSTICO: Verificar se há slaves
-                    if (trustedSlaves.empty()) {
+                    if (snapCount == 0) {
                         Serial.println("\n⚠️  NENHUM SLAVE DETECTADO!");
                         Serial.println("📋 Total de slaves confiáveis: 0");
                         Serial.println("💡 Ações sugeridas:");
@@ -1111,29 +1133,20 @@ void handleMasterSerialCommands() {
                         return;
                     }
                     
-                    Serial.println("📋 Total de slaves confiáveis: " + String(trustedSlaves.size()));
+                    Serial.println("📋 Total de slaves confiáveis: " + String(snapCount));
                     int slavesProcessed = 0;
                     int totalCommands = 0;
                     
-                    // Iterar sobre cada slave
-                    for (const auto& slave : trustedSlaves) {
-                        if (slave.isOnline()) {
+                    for (int si = 0; si < snapCount; si++) {
+                        if (snaps[si].online) {
                             slavesProcessed++;
-                            Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                            Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                            Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                            Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                             
-                            // Para cada slave, enviar comando para todos os relés (0-7)
                             int commandsSent = 0;
-                            for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
-                                // ⭐ CRÍTICO: Verificar se slave ainda está online antes de cada comando
-                                auto currentSlaves = masterManager->getAllTrustedSlaves();
-                                bool slaveStillOnline = false;
-                                for (const auto& currentSlave : currentSlaves) {
-                                    if (memcmp(currentSlave.macAddress, slave.macAddress, 6) == 0) {
-                                        slaveStillOnline = currentSlave.isOnline();
-                                        break;
-                                    }
-                                }
+                            for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                                TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                                bool slaveStillOnline = cur && cur->isOnline();
                                 
                                 if (!slaveStillOnline) {
                                     Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
@@ -1141,19 +1154,18 @@ void handleMasterSerialCommands() {
                                 }
                                 
                                 bool success = masterManager->sendRelayCommandToSlave(
-                                    slave.macAddress, 
+                                    snaps[si].mac, 
                                     relayNum, 
-                                    "on",  // ON permanente (duration=0)
-                                    0,     // duration
-                                    0,     // supabaseCommandId
-                                    false  // ✅ NO actualizar status después de cada comando (operación en lote)
+                                    "on",
+                                    0,
+                                    0,
+                                    false
                                 );
                                 if (success) {
                                     commandsSent++;
                                     totalCommands++;
-                                    delay(50); // Delay para permitir processamento
+                                    delay(50);
                                     
-                                    // ⭐ CRÍTICO: Processar respostas para atualizar lastSeen
                                     if (masterManager) {
                                         masterManager->update();
                                     }
@@ -1161,23 +1173,21 @@ void handleMasterSerialCommands() {
                             }
                             Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
                         } else {
-                            Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                            Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
                         }
                     }
                     
-                    // ✅ Actualizar status UNA SOLA VEZ al final de todos los comandos
                     Serial.println("\n🔄 Actualizando status de todos los slaves (una sola vez)...");
-                    delay(500); // Delay para permitir que todos los comandos sean procesados
+                    delay(500);
                     masterManager->requestAllSlavesRelayStatus();
                     
                     Serial.println("\n📊 Resumo:");
-                    Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+                    Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
                     Serial.println("   Total de comandos enviados: " + String(totalCommands));
                     Serial.println("✅ Comando on_all concluído");
                 }
                 else if (command == "off_all") {
                     // Desligar todos os relés em todos os slaves
-                    // ✅ MESMA LÓGICA que relay off_all
                     if (!masterManager) {
                         Serial.println("❌ MasterSlaveManager não inicializado");
                         return;
@@ -1185,10 +1195,24 @@ void handleMasterSerialCommands() {
                     
                     Serial.println("🔄 Desligando todos os relés em todos os slaves...");
                     
-                    auto trustedSlaves = masterManager->getAllTrustedSlaves();
+                    struct SlaveSnap {
+                        uint8_t mac[6];
+                        String name;
+                        uint8_t numRelays;
+                        bool online;
+                    };
+                    SlaveSnap snaps[8];
+                    int snapCount = 0;
+                    masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                        if (snapCount >= 8) return;
+                        memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+                        snaps[snapCount].name = slave.deviceName;
+                        snaps[snapCount].numRelays = slave.numRelays;
+                        snaps[snapCount].online = slave.isOnline();
+                        snapCount++;
+                    });
                     
-                    // ⭐ DIAGNÓSTICO: Verificar se há slaves
-                    if (trustedSlaves.empty()) {
+                    if (snapCount == 0) {
                         Serial.println("\n⚠️  NENHUM SLAVE DETECTADO!");
                         Serial.println("📋 Total de slaves confiáveis: 0");
                         Serial.println("💡 Ações sugeridas:");
@@ -1199,29 +1223,20 @@ void handleMasterSerialCommands() {
                         return;
                     }
                     
-                    Serial.println("📋 Total de slaves confiáveis: " + String(trustedSlaves.size()));
+                    Serial.println("📋 Total de slaves confiáveis: " + String(snapCount));
                     int slavesProcessed = 0;
                     int totalCommands = 0;
                     
-                    // Iterar sobre cada slave
-                    for (const auto& slave : trustedSlaves) {
-                        if (slave.isOnline()) {
+                    for (int si = 0; si < snapCount; si++) {
+                        if (snaps[si].online) {
                             slavesProcessed++;
-                            Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                            Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                            Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                            Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                             
-                            // Para cada slave, enviar comando para todos os relés (0-7)
                             int commandsSent = 0;
-                            for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
-                                // ⭐ CRÍTICO: Verificar se slave ainda está online antes de cada comando
-                                auto currentSlaves = masterManager->getAllTrustedSlaves();
-                                bool slaveStillOnline = false;
-                                for (const auto& currentSlave : currentSlaves) {
-                                    if (memcmp(currentSlave.macAddress, slave.macAddress, 6) == 0) {
-                                        slaveStillOnline = currentSlave.isOnline();
-                                        break;
-                                    }
-                                }
+                            for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                                TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                                bool slaveStillOnline = cur && cur->isOnline();
                                 
                                 if (!slaveStillOnline) {
                                     Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
@@ -1229,19 +1244,18 @@ void handleMasterSerialCommands() {
                                 }
                                 
                                 bool success = masterManager->sendRelayCommandToSlave(
-                                    slave.macAddress, 
+                                    snaps[si].mac, 
                                     relayNum, 
                                     "off", 
-                                    0,     // duration
-                                    0,     // supabaseCommandId
-                                    false  // ✅ NO actualizar status después de cada comando (operación en lote)
+                                    0,
+                                    0,
+                                    false
                                 );
                                 if (success) {
                                     commandsSent++;
                                     totalCommands++;
-                                    delay(50); // Delay para permitir processamento
+                                    delay(50);
                                     
-                                    // ⭐ CRÍTICO: Processar respostas para atualizar lastSeen
                                     if (masterManager) {
                                         masterManager->update();
                                     }
@@ -1249,17 +1263,16 @@ void handleMasterSerialCommands() {
                             }
                             Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
                         } else {
-                            Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                            Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
                         }
                     }
                     
-                    // ✅ Actualizar status UNA SOLA VEZ al final de todos los comandos
                     Serial.println("\n🔄 Actualizando status de todos los slaves (una sola vez)...");
-                    delay(500); // Delay para permitir que todos los comandos sean procesados
+                    delay(500);
                     masterManager->requestAllSlavesRelayStatus();
                     
                     Serial.println("\n📊 Resumo:");
-                    Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+                    Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
                     Serial.println("   Total de comandos enviados: " + String(totalCommands));
                     Serial.println("✅ Comando off_all concluído");
                 }
@@ -1459,33 +1472,35 @@ void printMasterStatus() {
                   knownSlaves.size(), onlineSlaves, knownSlaves.size() - onlineSlaves);
     Serial.println();
     
-    // ⭐ POTENCIA MÁXIMA: Mostrar estado dos relés remotos dos slaves
+    // ⭐ Mostrar estado dos relés remotos (só Serial.print sob forEach — sem reentrar mutex)
     if (masterManager) {
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
-        if (!trustedSlaves.empty()) {
-            Serial.println("🔌 === ESTADO DOS RELÉS REMOTOS (SLAVES) ===");
-            for (const auto& slave : trustedSlaves) {
-                if (slave.isOnline()) {
-                    Serial.println("\n📡 Slave: " + slave.deviceName + " (" + ESPNowController::macToString(slave.macAddress) + ")");
-                    bool hasActiveRelays = false;
-                    for (int i = 0; i < 8 && i < slave.numRelays; i++) {
-                        if (slave.relayStates[i].lastUpdate > 0) { // Solo mostrar si hay información
-                            hasActiveRelays = true;
-                            String stateIcon = slave.relayStates[i].state ? "🟢 ON" : "🔴 OFF";
-                            String timerInfo = "";
-                            if (slave.relayStates[i].hasTimer) {
-                                timerInfo = " ⏱️ " + String(slave.relayStates[i].remainingTime) + "s";
-                            }
-                            unsigned long age = (millis() - slave.relayStates[i].lastUpdate) / 1000;
-                            Serial.printf("   Relé %d: %s%s (atualizado há %lu s)\n", 
-                                        i, stateIcon.c_str(), timerInfo.c_str(), age);
-                        }
+        bool printedHeader = false;
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (!slave.isOnline()) return;
+            if (!printedHeader) {
+                Serial.println("🔌 === ESTADO DOS RELÉS REMOTOS (SLAVES) ===");
+                printedHeader = true;
+            }
+            Serial.println("\n📡 Slave: " + slave.deviceName + " (" + ESPNowController::macToString(slave.macAddress) + ")");
+            bool hasActiveRelays = false;
+            for (int i = 0; i < 8 && i < slave.numRelays; i++) {
+                if (slave.relayStates[i].lastUpdate > 0) { // Solo mostrar si hay información
+                    hasActiveRelays = true;
+                    String stateIcon = slave.relayStates[i].state ? "🟢 ON" : "🔴 OFF";
+                    String timerInfo = "";
+                    if (slave.relayStates[i].hasTimer) {
+                        timerInfo = " ⏱️ " + String(slave.relayStates[i].remainingTime) + "s";
                     }
-                    if (!hasActiveRelays) {
-                        Serial.println("   ⚠️ Nenhum estado de relé recebido ainda");
-                    }
+                    unsigned long age = (millis() - slave.relayStates[i].lastUpdate) / 1000;
+                    Serial.printf("   Relé %d: %s%s (atualizado há %lu s)\n",
+                                  i, stateIcon.c_str(), timerInfo.c_str(), age);
                 }
             }
+            if (!hasActiveRelays) {
+                Serial.println("   ⚠️ Nenhum estado de relé recebido ainda");
+            }
+        });
+        if (printedHeader) {
             Serial.println("==========================================\n");
         }
     }
@@ -1988,10 +2003,24 @@ void handleGlobalSerialCommands() {
             return;
         }
         
-        // ⭐ PADRÃO MASTER-TASK: Obter todos os slaves primeiro
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
+        struct SlaveSnap {
+            uint8_t mac[6];
+            String name;
+            uint8_t numRelays;
+            bool online;
+        };
+        SlaveSnap snaps[8];
+        int snapCount = 0;
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (snapCount >= 8) return;
+            memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+            snaps[snapCount].name = slave.deviceName;
+            snaps[snapCount].numRelays = slave.numRelays;
+            snaps[snapCount].online = slave.isOnline();
+            snapCount++;
+        });
         
-        if (trustedSlaves.empty()) {
+        if (snapCount == 0) {
             Serial.println("⚠️ Nenhum slave encontrado!");
             Serial.println("💡 Use 'list' ou 'discover' para encontrar slaves");
             Serial.println("========================================\n");
@@ -2001,42 +2030,43 @@ void handleGlobalSerialCommands() {
         int slavesProcessed = 0;
         int totalCommands = 0;
         
-        // Iterar sobre cada slave
-        for (const auto& slave : trustedSlaves) {
-            if (slave.isOnline()) {
+        for (int si = 0; si < snapCount; si++) {
+            if (snaps[si].online) {
                 slavesProcessed++;
-                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                 
-                // Para cada slave, enviar comando para todos os relés (0-7)
-                // ⭐ POTENCIA MÁXIMA: Delay maior para permitir que slave processe e envie ALL_RELAYS_STATUS
                 int commandsSent = 0;
-                for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
+                for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                    TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                    bool online = cur && cur->isOnline();
+                    if (!online) {
+                        Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
+                        break;
+                    }
                     bool success = masterManager->sendRelayCommandToSlave(
-                        slave.macAddress, 
+                        snaps[si].mac, 
                         relayNum, 
-                        "on",  // ✅ CORREÇÃO: "on" com duration=0 (igual a MASTER-TASK) - Slave não aceita "on_forever"
+                        "on",
                         0
                     );
                     if (success) {
                         commandsSent++;
                         totalCommands++;
-                        // ⭐ Delay maior para dar tempo ao slave processar comando e enviar ALL_RELAYS_STATUS
-                        // Com comandos unitários, o delay natural do usuário já permite isso
-                        delay(200); // 200ms entre comandos (aumentado de 50ms)
+                        delay(200);
                     }
                 }
                 Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
             } else {
-                Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
             }
         }
         
         Serial.println("\n📊 Resumo:");
-        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
         Serial.println("   Total de comandos enviados: " + String(totalCommands));
         Serial.println("========================================\n");
-        return; // ✅ CORREÇÃO: Evitar que o comando seja passado ao stateManager
+        return;
     }
     else if (command == "relay off_all") {
         // Comando especial: desligar todos os relés em todos os slaves
@@ -2049,10 +2079,24 @@ void handleGlobalSerialCommands() {
             return;
         }
         
-        // ⭐ PADRÃO MASTER-TASK: Obter todos os slaves primeiro
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
+        struct SlaveSnap {
+            uint8_t mac[6];
+            String name;
+            uint8_t numRelays;
+            bool online;
+        };
+        SlaveSnap snaps[8];
+        int snapCount = 0;
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (snapCount >= 8) return;
+            memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+            snaps[snapCount].name = slave.deviceName;
+            snaps[snapCount].numRelays = slave.numRelays;
+            snaps[snapCount].online = slave.isOnline();
+            snapCount++;
+        });
         
-        if (trustedSlaves.empty()) {
+        if (snapCount == 0) {
             Serial.println("⚠️ Nenhum slave encontrado!");
             Serial.println("💡 Use 'list' ou 'discover' para encontrar slaves");
             Serial.println("========================================\n");
@@ -2062,19 +2106,22 @@ void handleGlobalSerialCommands() {
         int slavesProcessed = 0;
         int totalCommands = 0;
         
-        // Iterar sobre cada slave
-        for (const auto& slave : trustedSlaves) {
-            if (slave.isOnline()) {
+        for (int si = 0; si < snapCount; si++) {
+            if (snaps[si].online) {
                 slavesProcessed++;
-                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                 
-                // Para cada slave, enviar comando para todos os relés (0-7)
-                // ⭐ POTENCIA MÁXIMA: Delay maior para permitir que slave processe e envie ALL_RELAYS_STATUS
                 int commandsSent = 0;
-                for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
+                for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                    TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                    bool online = cur && cur->isOnline();
+                    if (!online) {
+                        Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
+                        break;
+                    }
                     bool success = masterManager->sendRelayCommandToSlave(
-                        slave.macAddress, 
+                        snaps[si].mac, 
                         relayNum, 
                         "off", 
                         0
@@ -2082,29 +2129,26 @@ void handleGlobalSerialCommands() {
                     if (success) {
                         commandsSent++;
                         totalCommands++;
-                        // ⭐ Delay maior para dar tempo ao slave processar comando e enviar ALL_RELAYS_STATUS
-                        // Com comandos unitários, o delay natural do usuário já permite isso
-                        delay(200); // 200ms entre comandos (aumentado de 50ms)
+                        delay(200);
                     }
                 }
                 Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
             } else {
-                Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
             }
         }
         
         Serial.println("\n📊 Resumo:");
-        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
         Serial.println("   Total de comandos enviados: " + String(totalCommands));
         Serial.println("========================================\n");
-        return; // ✅ CORREÇÃO: Evitar que o comando seja passado ao stateManager
+        return;
     }
     else if (command.startsWith("relay ")) {
         handleRelayCommand(command);
     }
     else if (command == "on_all") {
         // Ligar todos os relés permanentemente em todos os slaves
-        // ✅ MESMA LÓGICA que relay on_all
         if (!masterManager) {
             Serial.println("❌ MasterSlaveManager não inicializado");
             return;
@@ -2112,29 +2156,35 @@ void handleGlobalSerialCommands() {
         
         Serial.println("🔌 Ligando todos os relés permanentemente em todos os slaves...");
         
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
+        struct SlaveSnap {
+            uint8_t mac[6];
+            String name;
+            uint8_t numRelays;
+            bool online;
+        };
+        SlaveSnap snaps[8];
+        int snapCount = 0;
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (snapCount >= 8) return;
+            memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+            snaps[snapCount].name = slave.deviceName;
+            snaps[snapCount].numRelays = slave.numRelays;
+            snaps[snapCount].online = slave.isOnline();
+            snapCount++;
+        });
         int slavesProcessed = 0;
         int totalCommands = 0;
         
-        // Iterar sobre cada slave
-        for (const auto& slave : trustedSlaves) {
-            if (slave.isOnline()) {
+        for (int si = 0; si < snapCount; si++) {
+            if (snaps[si].online) {
                 slavesProcessed++;
-                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                 
-                // Para cada slave, enviar comando para todos os relés (0-7)
                 int commandsSent = 0;
-                for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
-                    // ⭐ CRÍTICO: Verificar se slave ainda está online antes de cada comando
-                    auto currentSlaves = masterManager->getAllTrustedSlaves();
-                    bool slaveStillOnline = false;
-                    for (const auto& currentSlave : currentSlaves) {
-                        if (memcmp(currentSlave.macAddress, slave.macAddress, 6) == 0) {
-                            slaveStillOnline = currentSlave.isOnline();
-                            break;
-                        }
-                    }
+                for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                    TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                    bool slaveStillOnline = cur && cur->isOnline();
                     
                     if (!slaveStillOnline) {
                         Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
@@ -2142,19 +2192,18 @@ void handleGlobalSerialCommands() {
                     }
                     
                     bool success = masterManager->sendRelayCommandToSlave(
-                        slave.macAddress, 
+                        snaps[si].mac, 
                         relayNum, 
-                        "on",  // ON permanente (duration=0)
-                        0,     // duration
-                        0,     // supabaseCommandId
-                        false  // ✅ NO actualizar status después de cada comando (operación en lote)
+                        "on",
+                        0,
+                        0,
+                        false
                     );
                     if (success) {
                         commandsSent++;
                         totalCommands++;
-                        delay(50); // Delay para permitir processamento
+                        delay(50);
                         
-                        // ⭐ CRÍTICO: Processar respostas para atualizar lastSeen
                         if (masterManager) {
                             masterManager->update();
                         }
@@ -2162,24 +2211,22 @@ void handleGlobalSerialCommands() {
                 }
                 Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
             } else {
-                Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
             }
         }
         
-        // ✅ Actualizar status UNA SOLA VEZ al final de todos los comandos
         Serial.println("\n🔄 Actualizando status de todos los slaves (una sola vez)...");
-        delay(500); // Delay para permitir que todos los comandos sean procesados
+        delay(500);
         masterManager->requestAllSlavesRelayStatus();
         
         Serial.println("\n📊 Resumo:");
-        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
         Serial.println("   Total de comandos enviados: " + String(totalCommands));
         Serial.println("✅ Comando on_all concluído");
-        return; // ✅ CORREÇÃO: Evitar que o comando seja passado ao stateManager
+        return;
     }
     else if (command == "off_all") {
         // Desligar todos os relés em todos os slaves
-        // ✅ MESMA LÓGICA que relay off_all
         if (!masterManager) {
             Serial.println("❌ MasterSlaveManager não inicializado");
             return;
@@ -2187,29 +2234,35 @@ void handleGlobalSerialCommands() {
         
         Serial.println("🔄 Desligando todos os relés em todos os slaves...");
         
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
+        struct SlaveSnap {
+            uint8_t mac[6];
+            String name;
+            uint8_t numRelays;
+            bool online;
+        };
+        SlaveSnap snaps[8];
+        int snapCount = 0;
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (snapCount >= 8) return;
+            memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+            snaps[snapCount].name = slave.deviceName;
+            snaps[snapCount].numRelays = slave.numRelays;
+            snaps[snapCount].online = slave.isOnline();
+            snapCount++;
+        });
         int slavesProcessed = 0;
         int totalCommands = 0;
         
-        // Iterar sobre cada slave
-        for (const auto& slave : trustedSlaves) {
-            if (slave.isOnline()) {
+        for (int si = 0; si < snapCount; si++) {
+            if (snaps[si].online) {
                 slavesProcessed++;
-                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + slave.deviceName);
-                Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+                Serial.println("\n📡 [" + String(slavesProcessed) + "] Processando: " + snaps[si].name);
+                Serial.println("   MAC: " + ESPNowController::macToString(snaps[si].mac));
                 
-                // Para cada slave, enviar comando para todos os relés (0-7)
                 int commandsSent = 0;
-                for (int relayNum = 0; relayNum < 8 && relayNum < slave.numRelays; relayNum++) {
-                    // ⭐ CRÍTICO: Verificar se slave ainda está online antes de cada comando
-                    auto currentSlaves = masterManager->getAllTrustedSlaves();
-                    bool slaveStillOnline = false;
-                    for (const auto& currentSlave : currentSlaves) {
-                        if (memcmp(currentSlave.macAddress, slave.macAddress, 6) == 0) {
-                            slaveStillOnline = currentSlave.isOnline();
-                            break;
-                        }
-                    }
+                for (int relayNum = 0; relayNum < 8 && relayNum < snaps[si].numRelays; relayNum++) {
+                    TrustedSlave* cur = masterManager->getTrustedSlave(snaps[si].mac);
+                    bool slaveStillOnline = cur && cur->isOnline();
                     
                     if (!slaveStillOnline) {
                         Serial.println("   ⚠️  Slave ficou OFFLINE durante envio - parando");
@@ -2217,7 +2270,7 @@ void handleGlobalSerialCommands() {
                     }
                     
                     bool success = masterManager->sendRelayCommandToSlave(
-                        slave.macAddress, 
+                        snaps[si].mac, 
                         relayNum, 
                         "off", 
                         0
@@ -2225,9 +2278,8 @@ void handleGlobalSerialCommands() {
                     if (success) {
                         commandsSent++;
                         totalCommands++;
-                        delay(50); // Delay para permitir processamento
+                        delay(50);
                         
-                        // ⭐ CRÍTICO: Processar respostas para atualizar lastSeen
                         if (masterManager) {
                             masterManager->update();
                         }
@@ -2235,15 +2287,15 @@ void handleGlobalSerialCommands() {
                 }
                 Serial.println("   ✅ " + String(commandsSent) + " comando(s) enviado(s) para este slave");
             } else {
-                Serial.println("⏭️  " + slave.deviceName + " está OFFLINE - pulando");
+                Serial.println("⏭️  " + snaps[si].name + " está OFFLINE - pulando");
             }
         }
         
         Serial.println("\n📊 Resumo:");
-        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(trustedSlaves.size()));
+        Serial.println("   Slaves processados: " + String(slavesProcessed) + " de " + String(snapCount));
         Serial.println("   Total de comandos enviados: " + String(totalCommands));
         
-        if (trustedSlaves.empty()) {
+        if (snapCount == 0) {
             Serial.println("⚠️  NENHUM SLAVE DETECTADO!");
             Serial.println("📋 Total de slaves confiáveis: 0");
             Serial.println("💡 Ações sugeridas:");
@@ -2258,7 +2310,7 @@ void handleGlobalSerialCommands() {
             Serial.println("✅ Comando off_all concluído");
         }
         
-        return; // ✅ CORREÇÃO: Evitar que o comando seja passado ao stateManager
+        return;
     }
     // ===== COMANDO DESABILITADO - SLAVES NÃO PRECISAM WiFi =====
     /*
@@ -2586,23 +2638,37 @@ void setup() {
     }
     Serial.println();
     
-    // ⭐ POTENCIA MÁXIMA: Sincronizar trustedSlaves com knownSlaves após configurar callbacks
-    // Isso garante que slaves já descobertos sejam adicionados a knownSlaves
+    // Sincronizar trustedSlaves com knownSlaves (collect → addSlaveToList fora do visitor)
     if (masterManager) {
         Serial.println("\n🔄 Sincronizando trustedSlaves com knownSlaves...");
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
+        struct SyncSnap {
+            uint8_t mac[6];
+            String name;
+            String type;
+            uint8_t numRelays;
+        };
+        SyncSnap snaps[8];
+        int snapCount = 0;
+        masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (snapCount >= 8) return;
+            memcpy(snaps[snapCount].mac, slave.macAddress, 6);
+            snaps[snapCount].name = slave.deviceName;
+            snaps[snapCount].type = slave.deviceType;
+            snaps[snapCount].numRelays = slave.numRelays;
+            snapCount++;
+        });
         int synced = 0;
-        for (const auto& slave : trustedSlaves) {
+        for (int i = 0; i < snapCount; i++) {
             bool exists = false;
             for (const auto& known : knownSlaves) {
-                if (memcmp(known.macAddress, slave.macAddress, 6) == 0) {
+                if (memcmp(known.macAddress, snaps[i].mac, 6) == 0) {
                     exists = true;
                     break;
                 }
             }
             if (!exists) {
-                Serial.println("📋 Sincronizando: " + slave.deviceName);
-                addSlaveToList(slave.macAddress, slave.deviceName, slave.deviceType, slave.numRelays);
+                Serial.println("📋 Sincronizando: " + snaps[i].name);
+                addSlaveToList(snaps[i].mac, snaps[i].name, snaps[i].type, snaps[i].numRelays);
                 synced++;
             }
         }
@@ -2612,7 +2678,7 @@ void setup() {
             Serial.println("✅ knownSlaves já está sincronizado com trustedSlaves");
         }
         Serial.println("📊 Total knownSlaves: " + String(knownSlaves.size()));
-        Serial.println("📊 Total trustedSlaves: " + String(trustedSlaves.size()));
+        Serial.println("📊 Total trustedSlaves: " + String(snapCount));
     }
     
     Serial.println();

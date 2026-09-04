@@ -31,6 +31,8 @@ Arquitetura **híbrida MQTT + Supabase**: integridade e sync primeiro; WebSocket
 | [HANDOFF_ACL_FLEET_VALIDATION.md](./HANDOFF_ACL_FLEET_VALIDATION.md) | Validar ACL flota `mqtt_esp` + `%c` (não em produção) |
 | [ACL_MAPA_FUNCIONALIDADES_27AGO2026.md](./ACL_MAPA_FUNCIONALIDADES_27AGO2026.md) | ACL vivo vs objetivo; mapa relés + Auto EC/pH config |
 | [HANDOFF_UPLOAD_LIGHTSAIL.md](./HANDOFF_UPLOAD_LIGHTSAIL.md) | Copiar/pegar: PEM → SCP ACL + index.js → Mosquitto/bridge |
+| [../handoffs/HANDOFF_RULE_EXECUTED_MIRROR.md](../handoffs/HANDOFF_RULE_EXECUTED_MIRROR.md) | Espejo DE local → `rule_executed` → INSERT `relay_commands` |
+| [../handoffs/HANDOFF_HMI_UART_VS_SERIAL_SPAM.md](../handoffs/HANDOFF_HMI_UART_VS_SERIAL_SPAM.md) | HMI UART1 vs spam USB Serial / `mutex_timeout` |
 | [../handoffs/HANDOFF_GERAL_SESSAO_22AGO2026.md](../handoffs/HANDOFF_GERAL_SESSAO_22AGO2026.md) | Sessão ago 2026: ESP-NOW, Atlas UI, MQTT, ACL |
 
 ## Templates infra

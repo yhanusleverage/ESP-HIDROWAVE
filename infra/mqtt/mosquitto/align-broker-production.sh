@@ -63,6 +63,8 @@ user hidrowave
 topic write hidrowave/+/command
 topic write hidrowave/+/ec/config
 topic write hidrowave/+/ph/config
+topic write hidrowave/+/circ/config
+topic write hidrowave/+/rules/#
 topic read hidrowave/+/#
 
 EOF
@@ -79,6 +81,8 @@ user ${MQTT_USER}
 topic read hidrowave/${DEVICE_ID}/command
 topic read hidrowave/${DEVICE_ID}/ec/config
 topic read hidrowave/${DEVICE_ID}/ph/config
+topic read hidrowave/${DEVICE_ID}/circ/config
+topic read hidrowave/${DEVICE_ID}/rules/#
 topic write hidrowave/${DEVICE_ID}/#
 EOF
 

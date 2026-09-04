@@ -3,7 +3,6 @@
 #include "MasterSlaveManager.h"
 #include "RelayCoordinator.h"
 #include "ScriptRunner.h"
-#include <LittleFS.h>
 
 namespace {
 
@@ -74,7 +73,9 @@ DecisionEngine::DecisionEngine() :
     total_actions_executed(0),
     total_safety_blocks(0),
     masterManager(nullptr),
-    relayCoordinator(nullptr) {
+    relayCoordinator(nullptr),
+    rule_executed_mirror_callback(nullptr),
+    rule_executed_mirror_user_data(nullptr) {
 }
 
 DecisionEngine::~DecisionEngine() {
@@ -85,9 +86,10 @@ DecisionEngine::~DecisionEngine() {
 bool DecisionEngine::begin() {
     Serial.println("🧠 Inicializando Decision Engine...");
     
-    // Inicializar LittleFS se não estiver inicializado
-    if (!LittleFS.begin()) {
-        Serial.println("❌ Erro ao inicializar LittleFS");
+    // Misma partición que el resto del firmware (platformio: board_build.filesystem = spiffs).
+    // LittleFS.begin() sobre imagen SPIFFS → "Corrupted dir pair" y DE no arranca.
+    if (!SPIFFS.begin(true)) {
+        Serial.println("❌ Erro ao montar SPIFFS (reglas /rules.json)");
         return false;
     }
     
@@ -124,18 +126,22 @@ void DecisionEngine::loop() {
     }
 
     ScriptRunnerManager::instance().tickAll(current_state,
-        [this](int relay, bool on, const String& targetDeviceId, unsigned long durationMs) {
+        [this](int relay, bool on, const String& targetDeviceId, unsigned long durationMs,
+               int priority) {
             if (dry_run_mode) {
-                Serial.printf("🧪 [SCRIPT DRY-RUN] relay=%d %s device=%s %lu ms\n",
-                    relay, on ? "ON" : "OFF", targetDeviceId.c_str(), durationMs);
+                Serial.printf("🧪 [SCRIPT DRY-RUN] relay=%d %s device=%s %lu ms pri=%d\n",
+                    relay, on ? "ON" : "OFF", targetDeviceId.c_str(), durationMs, priority);
                 return;
             }
             RuleAction action;
             action.type = on ? RELAY_ON : RELAY_OFF;
             action.target_relay = relay;
-            action.target_device_id = targetDeviceId;
+            action.target_device_id = sanitizeDeviceIdOrMac(targetDeviceId);
             action.duration_ms = durationMs;
-            executeRelayAction(action, "script");
+            const RelayOwner owner = (priority >= TANK_SCRIPT_PRIORITY_THRESHOLD)
+                ? RelayOwner::TankScriptP1
+                : RelayOwner::DecisionRule;
+            executeRelayAction(action, "script", owner);
         });
 }
 
@@ -146,12 +152,12 @@ void DecisionEngine::end() {
 
 // ===== GERENCIAMENTO DE REGRAS =====
 bool DecisionEngine::loadRulesFromFile(const String& filename) {
-    if (!LittleFS.exists(filename)) {
+    if (!SPIFFS.exists(filename)) {
         Serial.println("⚠️ Arquivo de regras não encontrado: " + filename);
         return false;
     }
     
-    File file = LittleFS.open(filename, "r");
+    File file = SPIFFS.open(filename, "r");
     if (!file) {
         Serial.println("❌ Erro ao abrir arquivo de regras");
         return false;
@@ -170,24 +176,40 @@ bool DecisionEngine::loadRulesFromFile(const String& filename) {
     
     rules.clear();
     ScriptRunnerManager::instance().clear();
-    
+
+    int skipped = 0;
     JsonArray rules_array = doc["rules"].as<JsonArray>();
     for (JsonObject rule_json : rules_array) {
         DecisionRule rule;
+        const char* peekId = rule_json["rule_id"] | rule_json["id"] | "?";
         if (parseRuleFromJSON(rule_json, rule)) {
             String validation_error;
             if (validateRule(rule, validation_error)) {
                 rules.push_back(rule);
                 Serial.println("✅ Regra carregada: " + rule.name);
             } else {
-                Serial.println("❌ Regra inválida (" + rule.id + "): " + validation_error);
+                skipped++;
+                Serial.printf("⚠️ Regra SPIFFS ignorada (%s): %s\n",
+                              rule.id.c_str(), validation_error.c_str());
             }
         } else {
-            Serial.println("❌ Erro ao parsear regra");
+            skipped++;
+            Serial.printf("⚠️ Regra SPIFFS corrompida/ignorada id=%s\n", peekId);
         }
     }
-    
-    Serial.printf("📋 %d regras carregadas do arquivo\n", rules.size());
+
+    Serial.printf("📋 %d regras carregadas do arquivo", rules.size());
+    if (skipped > 0) {
+        Serial.printf(" (%d ignoradas)", skipped);
+    }
+    Serial.println();
+
+    // Purga entradas mortas (ex.: RULE_* sem actions) para o próximo boot ficar limpo
+    if (skipped > 0) {
+        if (saveRulesToFile(filename)) {
+            Serial.println("🧹 SPIFFS /rules.json reescrito sem regras inválidas");
+        }
+    }
     return true;
 }
 
@@ -200,7 +222,7 @@ bool DecisionEngine::saveRulesToFile(const String& filename) {
         ruleToJSON(rule, rule_json, doc);
     }
     
-    File file = LittleFS.open(filename, "w");
+    File file = SPIFFS.open(filename, "w");
     if (!file) {
         Serial.println("❌ Erro ao criar arquivo de regras");
         return false;
@@ -242,12 +264,65 @@ bool DecisionEngine::removeRule(const String& rule_id) {
     for (auto it = rules.begin(); it != rules.end(); ++it) {
         if (it->id == rule_id) {
             Serial.println("🗑️ Removendo regra: " + it->name);
+            ScriptRunnerManager::instance().removeByRuleId(rule_id);
             rules.erase(it);
             return true;
         }
     }
     Serial.println("❌ Regra não encontrada: " + rule_id);
     return false;
+}
+
+bool DecisionEngine::upsertRuleFromJson(const JsonObject& json_rule, bool persist) {
+    String peekId;
+    if (json_rule.containsKey("rule_id")) {
+        peekId = json_rule["rule_id"].as<String>();
+    } else if (json_rule.containsKey("id")) {
+        peekId = json_rule["id"].as<String>();
+    }
+    if (peekId.length() > 0) {
+        ScriptRunnerManager::instance().removeByRuleId(peekId);
+    }
+
+    DecisionRule rule;
+    if (!parseRuleFromJSON(json_rule, rule)) {
+        Serial.println("❌ [DE] upsertRuleFromJson: parse falhou");
+        return false;
+    }
+    String validation_error;
+    if (!validateRule(rule, validation_error)) {
+        Serial.println("❌ [DE] upsertRuleFromJson inválida: " + validation_error);
+        return false;
+    }
+
+    bool replaced = false;
+    for (auto& existing : rules) {
+        if (existing.id == rule.id) {
+            existing = rule;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        if (rules.size() >= MAX_RULES) {
+            Serial.println("❌ [DE] upsert: limite de regras");
+            return false;
+        }
+        rules.push_back(rule);
+    }
+
+    Serial.printf("✅ [DE] Regra %s %s: %s\n",
+                  replaced ? "atualizada" : "adicionada",
+                  rule.id.c_str(), rule.name.c_str());
+
+    if (!rule.enabled) {
+        ScriptRunnerManager::instance().removeByRuleId(rule.id);
+    }
+
+    if (persist) {
+        saveRulesToFile();
+    }
+    return true;
 }
 
 bool DecisionEngine::updateRule(const String& rule_id, const DecisionRule& new_rule) {
@@ -325,14 +400,13 @@ void DecisionEngine::evaluateAllRules() {
                              action.type, action.target_relay, action.duration_ms);
             }
         } else {
-            executeActions(rule.actions, rule.id);
+            const bool ok = executeActions(rule.actions, rule.id);
             updateExecutionCounts(rule);
             total_actions_executed++;
             // Scripts secuenciales: gate lo maneja ScriptRunner (inicio→fin).
             // Reglas one-shot high-pri: no usar timer; dilución ya tiene su propio gate.
+            logRuleExecution(rule.id, ok ? "EXECUTED" : "EXECUTED_FAIL", ok);
         }
-        
-        logRuleExecution(rule.id, "EXECUTED", true);
         
         // Se trigger é on_change, marcar como executado
         if (rule.trigger_type == "on_change") {
@@ -430,14 +504,17 @@ bool DecisionEngine::checkSafetyConstraints(const DecisionRule& rule, const Syst
     return true;
 }
 
-void DecisionEngine::executeActions(const std::vector<RuleAction>& actions, const String& rule_id) {
+bool DecisionEngine::executeActions(const std::vector<RuleAction>& actions, const String& rule_id) {
+    bool allOk = true;
     for (const auto& action : actions) {
         switch (action.type) {
             case RELAY_ON:
             case RELAY_OFF:
             case RELAY_PULSE:
             case RELAY_PWM:
-                executeRelayAction(action, rule_id);
+                if (!executeRelayAction(action, rule_id)) {
+                    allOk = false;
+                }
                 break;
                 
             case SYSTEM_ALERT:
@@ -456,6 +533,7 @@ void DecisionEngine::executeActions(const std::vector<RuleAction>& actions, cons
                 break;
         }
     }
+    return allOk;
 }
 
 // ===== MÉTODOS AUXILIARES =====
@@ -485,75 +563,150 @@ bool DecisionEngine::compareValues(float sensor_value, CompareOperator op, float
     }
 }
 
-void DecisionEngine::executeRelayAction(const RuleAction& action, const String& rule_id) {
+void DecisionEngine::notifyRuleExecutedMirror(const RuleAction& action, const String& rule_id,
+                                              bool success, const String& slave_mac) {
+    if (!rule_executed_mirror_callback) {
+        return;
+    }
+
+    RuleExecutedMirrorEvent event;
+    event.rule_id = rule_id;
+    event.relay_index = action.target_relay;
+    event.success = success;
+    event.duration_sec = static_cast<uint32_t>(action.duration_ms / 1000UL);
+    event.slave_mac = slave_mac;
+
+    const bool state = (action.type == RELAY_ON || action.type == RELAY_PULSE);
+    event.current_state = state;
+    if (action.type == RELAY_PULSE) {
+        event.action = "toggle";
+    } else {
+        event.action = state ? "on" : "off";
+    }
+
+    rule_executed_mirror_callback(event, rule_executed_mirror_user_data);
+}
+
+String DecisionEngine::sanitizeDeviceIdOrMac(const String& raw) {
+    String s = raw;
+    s.trim();
+    if (s.isEmpty() || s.equalsIgnoreCase("local") || s.equalsIgnoreCase("MASTER")) {
+        return s;
+    }
+    s.toUpperCase();
+    s.replace("-", ":");
+    // Colapsa "::" / ":::" residual (tipagem/JSON corrompido)
+    while (s.indexOf("::") >= 0) {
+        s.replace("::", ":");
+    }
+    return s;
+}
+
+bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& rule_id,
+                                        RelayOwner owner) {
     bool state = (action.type == RELAY_ON || action.type == RELAY_PULSE);
     String actionStr = state ? "on" : "off";
     if (action.type == RELAY_PULSE) {
         actionStr = "toggle";
     }
     const uint32_t durationSec = action.duration_ms / 1000;
+    const String targetId = sanitizeDeviceIdOrMac(action.target_device_id);
 
-    if (action.target_device_id.isEmpty() || action.target_device_id == "local" || action.target_device_id == "MASTER") {
+    if (targetId.isEmpty() || targetId.equalsIgnoreCase("local") || targetId.equalsIgnoreCase("MASTER")) {
         if (relayCoordinator) {
-            relayCoordinator->actuateLocal(
-                RelayOwner::DecisionRule,
+            const bool ok = relayCoordinator->actuateLocal(
+                owner,
                 action.target_relay,
                 actionStr,
                 (int)durationSec);
-            Serial.printf("⚡ [LOCAL/COORD] Relé %d: %s por %lu ms (regra: %s)\n",
-                action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str());
+            Serial.printf("⚡ [LOCAL/COORD] Relé %d: %s por %lu ms (regra: %s) owner=%s ok=%d\n",
+                action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str(),
+                relayOwnerName(owner), ok ? 1 : 0);
+            notifyRuleExecutedMirror(action, rule_id, ok, "");
+            return ok;
         } else if (relay_control_callback) {
             relay_control_callback(action.target_relay, state, action.duration_ms);
             Serial.printf("⚡ [LOCAL] Relé %d: %s por %lu ms (regra: %s)\n",
                 action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str());
+            notifyRuleExecutedMirror(action, rule_id, true, "");
+            return true;
+        } else {
+            notifyRuleExecutedMirror(action, rule_id, false, "");
+            return false;
         }
-        return;
     }
 
-    if (!masterManager && !relayCoordinator) {
-        Serial.printf("⚠️ [REMOTO] ESP-NOW não disponível - device_id=%s relay=%d (regra: %s)\n",
-            action.target_device_id.c_str(), action.target_relay, rule_id.c_str());
-        return;
+    if (!relayCoordinator) {
+        Serial.printf("⚠️ [REMOTO] RelayCoordinator ausente — no bypass ESP-NOW (regra: %s device=%s)\n",
+            rule_id.c_str(), targetId.c_str());
+        notifyRuleExecutedMirror(action, rule_id, false, "");
+        return false;
     }
 
-    const uint8_t* targetMac = nullptr;
-    if (masterManager) {
-        auto trustedSlaves = masterManager->getAllTrustedSlaves();
-        for (const auto& slave : trustedSlaves) {
-            if (slave.deviceName == action.target_device_id || slave.deviceName.equalsIgnoreCase(action.target_device_id)) {
-                targetMac = slave.macAddress;
-                break;
+    if (!masterManager) {
+        Serial.printf("⚠️ [REMOTO] MasterSlaveManager não disponível - device_id=%s relay=%d (regra: %s)\n",
+            targetId.c_str(), action.target_relay, rule_id.c_str());
+        notifyRuleExecutedMirror(action, rule_id, false, "");
+        return false;
+    }
+
+    uint8_t resolvedMac[6] = {0};
+    bool macFound = false;
+    masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+        if (macFound) {
+            return;
+        }
+        if (slave.deviceName == targetId ||
+            slave.deviceName.equalsIgnoreCase(targetId)) {
+            memcpy(resolvedMac, slave.macAddress, 6);
+            macFound = true;
+        }
+    });
+
+    if (!macFound) {
+        // También aceptar MAC literal en target_device_id
+        int values[6];
+        if (sscanf(targetId.c_str(), "%x:%x:%x:%x:%x:%x",
+                   &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) {
+            for (int i = 0; i < 6; i++) {
+                resolvedMac[i] = (uint8_t)values[i];
             }
+            macFound = true;
         }
     }
 
-    if (!targetMac) {
+    if (!macFound) {
         Serial.printf("⚠️ [REMOTO] Slave '%s' não encontrado (regra: %s)\n",
-            action.target_device_id.c_str(), rule_id.c_str());
-        return;
+            targetId.c_str(), rule_id.c_str());
+        notifyRuleExecutedMirror(action, rule_id, false, "");
+        return false;
     }
 
-    bool success = false;
-    if (relayCoordinator) {
-        success = relayCoordinator->actuateSlave(
-            RelayOwner::DecisionRule,
-            targetMac,
-            action.target_relay,
-            actionStr,
-            (int)durationSec) > 0;
-    } else if (masterManager) {
-        success = masterManager->sendRelayCommandToSlave(
-            targetMac, action.target_relay, actionStr, (int)durationSec) > 0;
-    }
+    const uint8_t* targetMac = resolvedMac;
+
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             targetMac[0], targetMac[1], targetMac[2], targetMac[3], targetMac[4], targetMac[5]);
+
+    const bool success = relayCoordinator->actuateSlave(
+        owner,
+        targetMac,
+        action.target_relay,
+        actionStr,
+        (int)durationSec) > 0;
 
     if (success) {
-        Serial.printf("✅ [REMOTO] device_id=%s relay=%d: %s por %lu ms (regra: %s)\n",
-            action.target_device_id.c_str(), action.target_relay,
-            actionStr.c_str(), action.duration_ms, rule_id.c_str());
+        Serial.printf("✅ [REMOTO] device_id=%s relay=%d: %s por %lu ms (regra: %s) owner=%s\n",
+            targetId.c_str(), action.target_relay,
+            actionStr.c_str(), action.duration_ms, rule_id.c_str(), relayOwnerName(owner));
     } else {
-        Serial.printf("❌ [REMOTO] Falha ao enviar comando - device_id=%s relay=%d (regra: %s)\n",
-            action.target_device_id.c_str(), action.target_relay, rule_id.c_str());
+        Serial.printf("❌ [REMOTO] Falha/deny - device_id=%s relay=%d (regra: %s) owner=%s reason=%s\n",
+            targetId.c_str(), action.target_relay, rule_id.c_str(),
+            relayOwnerName(owner),
+            relayDenyReasonName(relayCoordinator->lastDenyReason()));
     }
+    notifyRuleExecutedMirror(action, rule_id, success, String(macStr));
+    return success;
 }
 
 void DecisionEngine::executeSystemAlert(const RuleAction& action, const String& rule_id) {
@@ -572,6 +725,8 @@ void DecisionEngine::executeLogEvent(const RuleAction& action, const String& rul
 
 bool DecisionEngine::isInCooldown(const DecisionRule& rule) {
     if (rule.cooldown_ms == 0) return false;
+    // last_execution==0 → nunca executou; não bloquear os primeiros cooldown_ms após boot
+    if (rule.last_execution == 0) return false;
     return (millis() - rule.last_execution) < rule.cooldown_ms;
 }
 
@@ -821,7 +976,7 @@ bool DecisionEngine::parseActionFromJSON(const JsonObject& json_action, RuleActi
         }
     }
     if (json_action.containsKey("target_device_id")) {
-        action.target_device_id = json_action["target_device_id"].as<String>();
+        action.target_device_id = sanitizeDeviceIdOrMac(json_action["target_device_id"].as<String>());
     }
     if (json_action.containsKey("duration_ms")) {
         action.duration_ms = json_action["duration_ms"];
@@ -898,22 +1053,58 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
     rule.actions.clear();
     rule.safety_checks.clear();
 
+    // rule_json pode ser objeto, string JSON, ou ausente.
+    // NUNCA substituir rule_body por null se rule_json existir mas for inválido.
+    DynamicJsonDocument nestedRuleJson(4096);
     JsonObject rule_body = json_rule;
     if (json_rule.containsKey("rule_json")) {
-        rule_body = json_rule["rule_json"].as<JsonObject>();
+        JsonVariant rj = json_rule["rule_json"];
+        if (rj.is<JsonObject>()) {
+            JsonObject obj = rj.as<JsonObject>();
+            if (!obj.isNull()) {
+                rule_body = obj;
+            } else {
+                Serial.println("❌ [DE] parseRule: rule_json objeto nulo (heap/JSON?)");
+            }
+        } else if (rj.is<const char*>() || rj.is<String>()) {
+            const char* raw = rj.as<const char*>();
+            if (raw && raw[0]) {
+                DeserializationError nestErr = deserializeJson(nestedRuleJson, raw);
+                if (nestErr) {
+                    Serial.printf("❌ [DE] parseRule: rule_json string parse: %s\n", nestErr.c_str());
+                } else {
+                    rule_body = nestedRuleJson.as<JsonObject>();
+                }
+            }
+        }
     }
 
+    if (rule_body.isNull()) {
+        Serial.println("❌ [DE] parseRule: rule_body null");
+        return false;
+    }
+
+    bool gotCondition = false;
+
     if (rule_body.containsKey("condition")) {
-        if (!parseConditionFromJSON(rule_body["condition"].as<JsonObject>(), rule.condition)) {
-            return false;
+        JsonObject condObj = rule_body["condition"].as<JsonObject>();
+        if (!condObj.isNull() && parseConditionFromJSON(condObj, rule.condition)) {
+            gotCondition = true;
         }
-    } else if (rule_body.containsKey("conditions")) {
+    }
+
+    if (!gotCondition && rule_body.containsKey("conditions")) {
         JsonVariant conditions = rule_body["conditions"];
         if (conditions.is<JsonArray>()) {
             JsonArray cond_array = conditions.as<JsonArray>();
-            if (cond_array.size() == 0) return false;
-            if (cond_array.size() == 1) {
-                if (!parseConditionFromJSON(cond_array[0].as<JsonObject>(), rule.condition)) {
+            if (cond_array.size() == 0) {
+                // conditions:[] legado / UI — ignorar e cair nos fallbacks (condition top / script / actions)
+                Serial.println("ℹ️ [DE] parseRule: conditions[] vazio — fallback");
+            } else if (cond_array.size() == 1) {
+                if (parseConditionFromJSON(cond_array[0].as<JsonObject>(), rule.condition)) {
+                    gotCondition = true;
+                } else {
+                    Serial.println("❌ [DE] parseRule: conditions[0] inválida");
                     return false;
                 }
             } else {
@@ -925,24 +1116,51 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
                         rule.condition.sub_conditions.push_back(sub);
                     }
                 }
+                gotCondition = true;
             }
         } else if (conditions.is<JsonObject>()) {
-            if (!parseConditionFromJSON(conditions.as<JsonObject>(), rule.condition)) {
+            if (parseConditionFromJSON(conditions.as<JsonObject>(), rule.condition)) {
+                gotCondition = true;
+            } else {
+                Serial.println("❌ [DE] parseRule: conditions objeto inválido");
                 return false;
             }
         }
-    } else if (json_rule.containsKey("condition")) {
-        if (!parseConditionFromJSON(json_rule["condition"].as<JsonObject>(), rule.condition)) {
-            return false;
+    }
+
+    if (!gotCondition && json_rule.containsKey("condition")) {
+        JsonObject topCond = json_rule["condition"].as<JsonObject>();
+        if (!topCond.isNull() && parseConditionFromJSON(topCond, rule.condition)) {
+            gotCondition = true;
         }
-    } else if (rule_body.containsKey("script")) {
+    }
+
+    if (!gotCondition && rule_body.containsKey("script")) {
         JsonObject scriptCheck = rule_body["script"].as<JsonObject>();
-        if (scriptCheck.isNull() || !scriptCheck.containsKey("instructions")) {
-            return false;
+        if (!scriptCheck.isNull() && scriptCheck.containsKey("instructions")) {
+            rule.condition.type = TIME_WINDOW;
+            rule.condition.sensor_name = "time_window";
+            gotCondition = true;
         }
-        rule.condition.type = TIME_WINDOW;
-        rule.condition.sensor_name = "time_window";
-    } else {
+    }
+
+    // fn_recirculacao: às vezes só actions + conditions:[] — TIME_WINDOW implícito
+    if (!gotCondition) {
+        const bool hasActions =
+            (rule_body.containsKey("actions") && rule_body["actions"].is<JsonArray>() &&
+             rule_body["actions"].as<JsonArray>().size() > 0) ||
+            (json_rule.containsKey("actions") && json_rule["actions"].is<JsonArray>() &&
+             json_rule["actions"].as<JsonArray>().size() > 0);
+        if (hasActions) {
+            rule.condition.type = TIME_WINDOW;
+            rule.condition.sensor_name = "time_window";
+            gotCondition = true;
+            Serial.println("ℹ️ [DE] parseRule: TIME_WINDOW implícito (só actions)");
+        }
+    }
+
+    if (!gotCondition) {
+        Serial.println("❌ [DE] parseRule: sem condition/conditions/script/actions");
         return false;
     }
 
@@ -1013,7 +1231,15 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
         }
     }
 
-    return !rule.id.isEmpty() && (!rule.actions.empty() || rule.has_script);
+    if (rule.id.isEmpty()) {
+        Serial.println("❌ [DE] parseRule: id vazio");
+        return false;
+    }
+    if (rule.actions.empty() && !rule.has_script) {
+        Serial.printf("❌ [DE] parseRule: sem actions/script id=%s\n", rule.id.c_str());
+        return false;
+    }
+    return true;
 }
 
 void DecisionEngine::ruleToJSON(const DecisionRule& rule, JsonObject& out, JsonDocument& doc) {
@@ -1075,71 +1301,9 @@ void DecisionEngine::printRuleStatus() {
     Serial.println("==============================\n");
 }
 
-// ===== REGRAS PADRÃO (DEMONSTRAÇÃO) =====
+// ===== REGRAS PADRÃO =====
+// Não inventar recirculação R6 / pH demo. Tipagem hidráulica + decision_rules
+// (fn_circulation ao salvar bomba Atlas) são a fonte de verdade.
 void DecisionEngine::createDefaultRules() {
-    // Regra 1: Controle de pH baixo
-    DecisionRule ph_low_rule;
-    ph_low_rule.id = "ph_low_control";
-    ph_low_rule.name = "Correção pH Baixo";
-    ph_low_rule.description = "Ativa bomba de pH+ quando pH < 5.8";
-    ph_low_rule.enabled = true;
-    ph_low_rule.priority = 80;
-    ph_low_rule.trigger_type = "periodic";
-    ph_low_rule.trigger_interval_ms = 30000;
-    ph_low_rule.cooldown_ms = 300000; // 5 minutos
-    ph_low_rule.max_executions_per_hour = 6;
-    
-    // Condição: pH < 5.8
-    ph_low_rule.condition.type = SENSOR_COMPARE;
-    ph_low_rule.condition.sensor_name = "ph";
-    ph_low_rule.condition.op = OP_LESS_THAN;
-    ph_low_rule.condition.value_min = 5.8;
-    
-    // Ação: Ligar bomba pH por 5 segundos
-    RuleAction ph_action;
-    ph_action.type = RELAY_PULSE;
-    ph_action.target_relay = 2; // Bomba pH
-    ph_action.duration_ms = 5000;
-    ph_action.message = "Corrigindo pH baixo";
-    ph_low_rule.actions.push_back(ph_action);
-    
-    // Safety: Não executar se nível de água baixo
-    SafetyCheck water_level_check;
-    water_level_check.name = "Verificação nível água";
-    water_level_check.condition.type = SYSTEM_STATUS;
-    water_level_check.condition.sensor_name = "water_level_ok";
-    water_level_check.condition.value_min = 1;
-    water_level_check.error_message = "Nível de água baixo";
-    water_level_check.is_critical = false;
-    ph_low_rule.safety_checks.push_back(water_level_check);
-    
-    rules.push_back(ph_low_rule);
-    
-    // Regra 2: Recirculação periódica
-    DecisionRule circulation_rule;
-    circulation_rule.id = "circulation_control";
-    circulation_rule.name = "Recirculação Periódica";
-    circulation_rule.description = "Liga bomba de circulação a cada 30 minutos por 10 minutos";
-    circulation_rule.enabled = true;
-    circulation_rule.priority = 60;
-    circulation_rule.trigger_type = "periodic";
-    circulation_rule.trigger_interval_ms = 1800000; // 30 minutos
-    circulation_rule.cooldown_ms = 0;
-    
-    // Condição: Sempre verdadeira (sistema funcionando)
-    circulation_rule.condition.type = SYSTEM_STATUS;
-    circulation_rule.condition.sensor_name = "water_level_ok";
-    circulation_rule.condition.value_min = 1;
-    
-    // Ação: Ligar bomba de circulação por 10 minutos
-    RuleAction circ_action;
-    circ_action.type = RELAY_PULSE;
-    circ_action.target_relay = 6; // Bomba Circulação
-    circ_action.duration_ms = 600000; // 10 minutos
-    circ_action.message = "Recirculação periódica";
-    circulation_rule.actions.push_back(circ_action);
-    
-    rules.push_back(circulation_rule);
-    
-    Serial.println("✅ Regras padrão criadas");
+    Serial.println("📋 Sem regras default embutidas — use tipagem hidráulica / decision_rules");
 }

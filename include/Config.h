@@ -63,6 +63,17 @@
 #ifndef MQTT_COMMAND_BRIDGE_ONLY
 #define MQTT_COMMAND_BRIDGE_ONLY 1
 #endif
+// 1 = espejo async DE local → MQTT rule_executed → bridge INSERT relay_commands
+#ifndef RULE_EXECUTED_MIRROR_ENABLED
+#define RULE_EXECUTED_MIRROR_ENABLED 1
+#endif
+// Mínimo entre publishes globales (~30/min max). Plan: RULE_EXECUTED_MAX_PER_MIN=30
+#ifndef RULE_EXECUTED_MIRROR_RATE_LIMIT_MS
+#define RULE_EXECUTED_MIRROR_RATE_LIMIT_MS 2000UL
+#endif
+#ifndef RULE_EXECUTED_MAX_PER_MIN
+#define RULE_EXECUTED_MAX_PER_MIN 30
+#endif
 // 1 = entrega de comandos só MQTT (sem poll HTTPS get_and_lock / relay_commands)
 #ifndef COMMAND_POLL_HTTPS_DISABLED
 #define COMMAND_POLL_HTTPS_DISABLED 1
@@ -78,13 +89,25 @@
 #define RELAY_HTTPS_SYNC_DISABLED_IF_MQTT_OK 1
 #endif
 #ifndef MQTT_COMMAND_PATH_STABLE_MS
-#define MQTT_COMMAND_PATH_STABLE_MS 60000UL
+// 10s: evita RPC HTTPS (mbedTLS ~40KB) nos primeiros ACKs após MQTT conectar
+#define MQTT_COMMAND_PATH_STABLE_MS 10000UL
 #endif
 #ifndef MQTT_RELAY_STATE_DEBOUNCE_MS
 #define MQTT_RELAY_STATE_DEBOUNCE_MS 300UL
 #endif
 #ifndef MQTT_RELAY_STATE_URGENT_MS
 #define MQTT_RELAY_STATE_URGENT_MS 0UL
+#endif
+// ESP-NOW batch (SET_RELAY_MASK): agrupa clics instant slave mesma MAC (~300 ms).
+// Baseline pre-batch validado: docs/handoffs/espnow/HANDOFF_ESPNOW_RELAY_BATCH.md
+#ifndef ESPNOW_RELAY_BATCH_ENABLED
+#define ESPNOW_RELAY_BATCH_ENABLED 1
+#endif
+#ifndef ESPNOW_RELAY_BATCH_MS
+#define ESPNOW_RELAY_BATCH_MS 300UL
+#endif
+#ifndef ESPNOW_RELAY_BATCH_COMPACT_LOG
+#define ESPNOW_RELAY_BATCH_COMPACT_LOG 1
 #endif
 // 1 = cloud runtime só MQTT (telemetria + heartbeat). Sem HTTPS procedural se broker cair.
 // Boot: autoRegisterDevice e patchBootInterrupted mantidos.
@@ -199,6 +222,16 @@
 #endif
 #ifndef ESPNOW_PROVISIONING_BURST_MS
 #define ESPNOW_PROVISIONING_BURST_MS 30000UL
+#endif
+/** 1 = ciclo supremo: suspend STA breve, burst en ch11, reconnect op */
+#ifndef ESPNOW_PROVISIONING_STA_SUSPEND
+#define ESPNOW_PROVISIONING_STA_SUSPEND 1
+#endif
+#ifndef ESPNOW_PROVISIONING_STA_SUSPEND_MS
+#define ESPNOW_PROVISIONING_STA_SUSPEND_MS 4000UL
+#endif
+#ifndef ESPNOW_PROVISIONING_WIFI_RECONNECT_MS
+#define ESPNOW_PROVISIONING_WIFI_RECONNECT_MS 8000UL
 #endif
 /** 1 = log PING/PONG e peer repetido; 0 = só eventos novos/erros */
 #ifndef ESPNOW_LINK_VERBOSE

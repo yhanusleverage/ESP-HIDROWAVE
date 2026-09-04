@@ -119,12 +119,15 @@ void DecisionEngineIntegration::loop() {
     // Verificar interlocks de segurança
     performSafetyChecks();
     
-    // Enviar telemetria para Supabase (a cada 60 segundos)
+    // Enviar telemetria HTTPS só se fallback cloud HTTPS estiver ativo.
+    // Com MQTT_HYDRO_ONLY / HTTPS_RUNTIME_FALLBACK_DISABLED a tabela "telemetry" não existe → 404.
+#if !(ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED)
     static unsigned long last_telemetry = 0;
     if (millis() - last_telemetry >= 60000) {
         sendTelemetryToSupabase();
         last_telemetry = millis();
     }
+#endif
 }
 
 void DecisionEngineIntegration::end() {
@@ -474,6 +477,9 @@ bool DecisionEngineIntegration::checkMemoryInterlock() {
 
 // ===== TELEMETRIA =====
 void DecisionEngineIntegration::sendTelemetryToSupabase() {
+#if ENABLE_MQTT && HTTPS_RUNTIME_FALLBACK_DISABLED
+    return;  // hydro via MQTT + bridge; não POST /telemetry (404)
+#endif
     if (!supabase || !supabase->isReady()) return;
     
     DynamicJsonDocument doc(1024);

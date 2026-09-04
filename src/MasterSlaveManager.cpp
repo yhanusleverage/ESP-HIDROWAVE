@@ -438,7 +438,7 @@ void MasterSlaveManager::runProvisioningIfNeeded() {
     String ssid;
     String password;
     uint8_t storedChannel = 0;
-    if (!EspNowChannelPolicy::loadWifiCredentials(ssid, password, storedChannel)) {
+    if (!EspNowChannelPolicy::loadWifiCredentialsForProvisioning(ssid, password, storedChannel)) {
         return;
     }
 
@@ -687,37 +687,48 @@ uint32_t MasterSlaveManager::sendRelayMaskToSlave(const uint8_t* macAddress, uin
     if (!initialized || !espNowController || !macAddress) {
         return 0;
     }
-    const String action = (mask == 0) ? "off_all" : "on_all";
+    // Guardar máscara real: "on_all" só se mask==0xFF (retry NÃO deve inventar 0xFF)
+    const String action = (mask == 0) ? "off_all" : ((mask == 0xFF) ? "on_all" : "mask");
     TrustedSlave* slave = getTrustedSlave(macAddress);
     if (!slave) {
         return 0;
     }
     uint32_t commandId = generateCommandId();
     if (!isSlaveReachable(*slave) || hasInFlightForMac(macAddress) || !canEspNowSendToMac(macAddress)) {
-        addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, false);
+        addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, false,
+                        0, "", mask);
         return commandId;
     }
     Serial.printf("[PROC] SET_RELAY_MASK id=%u mask=0x%02X\n", (unsigned)commandId, mask);
     bool success = espNowController->sendSetRelayMask(macAddress, mask, (uint16_t)durationSec, commandId);
     if (success) {
         markEspNowSendToMac(macAddress);
-        addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, true);
+        addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, true,
+                        0, "", mask);
         return commandId;
     }
-    addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, false);
+    addToRetryQueue(macAddress, 255, action, durationSec, commandId, supabaseCommandId, false,
+                    0, "", mask);
     return commandId;
 }
 
 int MasterSlaveManager::applyRelayMaskToAllOnlineSlaves(uint8_t mask) {
-    int sent = 0;
-    auto slaves = getAllTrustedSlaves();
-    for (const auto& slave : slaves) {
-        if (!slave.isOnline()) {
-            continue;
+    uint8_t macList[8][6];
+    int macCount = 0;
+    forEachTrustedSlave([&](const TrustedSlave& slave) {
+        if (macCount >= 8 || !slave.isOnline()) {
+            return;
         }
-        if (sendRelayMaskToSlave(slave.macAddress, mask) > 0) {
+        memcpy(macList[macCount], slave.macAddress, 6);
+        macCount++;
+    });
+
+    int sent = 0;
+    for (int i = 0; i < macCount; i++) {
+        if (sendRelayMaskToSlave(macList[i], mask) > 0) {
             sent++;
-            Serial.printf("[PROC] mask=0x%02X -> %s\n", mask, slave.deviceName.c_str());
+            Serial.printf("[PROC] mask=0x%02X -> %s\n", mask,
+                          ESPNowController::macToString(macList[i]).c_str());
         }
     }
     return sent;
@@ -852,6 +863,10 @@ void MasterSlaveManager::notifyAllRelaysStatusReceived(const uint8_t* senderMac,
     }
     if (senderMac) {
         touchSlaveLink(senderMac, "all_relays_rx");
+        TrustedSlave* slave = getTrustedSlave(senderMac);
+        if (slave) {
+            slave->lastAllRelaysReceivedMs = millis();
+        }
     }
     if (allRelaysSnapshotCallback && senderMac && relayStates && numRelays > 0) {
         allRelaysSnapshotCallback(senderMac, relayStates, numRelays);
@@ -964,6 +979,24 @@ void MasterSlaveManager::setSupabaseRelayStateCallback(std::function<void(const 
 
 void MasterSlaveManager::logSlaveLink(const char* event, const uint8_t* mac, long lastSeenDeltaMs) {
     if (!event) return;
+
+    // mutex_timeout é frequente sob carga (getAllTrustedSlaves copia) — não spammar serial
+    if (strcmp(event, "mutex_timeout") == 0) {
+        static unsigned long lastMutexTimeoutLogMs = 0;
+        static uint32_t suppressedMutexTimeouts = 0;
+        const unsigned long now = millis();
+        if (now - lastMutexTimeoutLogMs < 5000UL) {
+            suppressedMutexTimeouts++;
+            return;
+        }
+        lastMutexTimeoutLogMs = now;
+        if (suppressedMutexTimeouts > 0) {
+            Serial.printf("[SLAVE-LINK] event=mutex_timeout (suppressed=%u no último intervalo)\n",
+                          (unsigned)suppressedMutexTimeouts);
+            suppressedMutexTimeouts = 0;
+        }
+    }
+
     String macBuf = mac ? ESPNowController::macToString(mac) : String("unknown");
     Serial.printf("[SLAVE-LINK] event=%s mac=%s queue=%u heap=%u",
                   event,
@@ -1141,21 +1174,25 @@ void MasterSlaveManager::processPingReceived(const uint8_t* senderMac, uint32_t 
             slave = findTrustedSlaveUnsafe(senderMac);
         }
     } else if (slave->deviceName.startsWith("Slave-") || slave->deviceName == "Unknown") {
-        xSemaphoreGive(trustedSlavesMutex);
-        
-        Serial.println("\n📋 === SLAVE CON INFORMACIÓN INCOMPLETA ===");
-        Serial.println("🔄 Solicitando DEVICE_INFO para actualizar información...");
-        if (espNowController) {
-            espNowController->initiateHandshake(senderMac);
-            Serial.println("✅ Handshake iniciado para obtener información completa");
+        const unsigned long nowHs = millis();
+        const bool handshakeDue = (slave->lastDeviceInfoRequestMs == 0) ||
+                                    (nowHs - slave->lastDeviceInfoRequestMs >= 30000UL);
+        if (handshakeDue) {
+            slave->lastDeviceInfoRequestMs = nowHs;
+            xSemaphoreGive(trustedSlavesMutex);
+
+            if (espNowController) {
+                Serial.printf("[DEVICE-INFO] handshake mac=%s (cooldown 30s)\n",
+                              ESPNowController::macToString(senderMac).c_str());
+                espNowController->initiateHandshake(senderMac);
+            }
+
+            if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                Serial.println("⚠️ Timeout ao obter mutex após handshake em processPingReceived()");
+                return;
+            }
+            slave = findTrustedSlaveUnsafe(senderMac);
         }
-        Serial.println("============================================\n");
-        
-        if (xSemaphoreTake(trustedSlavesMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-            Serial.println("⚠️ Timeout ao obter mutex após handshake em processPingReceived()");
-            return;
-        }
-        slave = findTrustedSlaveUnsafe(senderMac);
     }
     
     String deviceNameForCallback;
@@ -1771,33 +1808,31 @@ void MasterSlaveManager::printStatus() {
 
 void MasterSlaveManager::printTrustedSlaves() {
     Serial.println("\n👥 === LISTA DE SLAVES CONFIÁVEIS ===");
-    
-    // ✅ PROTEÇÃO MULTI-CORE: Usar getAllTrustedSlaves() que já protege com mutex
-    std::vector<TrustedSlave> slaves = getAllTrustedSlaves();
-    
-    if (slaves.empty()) {
+
+    int index = 0;
+    const bool ok = forEachTrustedSlave([&](const TrustedSlave& slave) {
+        index++;
+        Serial.println("\n📋 Slave #" + String(index) + ":");
+        Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
+        Serial.println("   Nome: " + slave.deviceName);
+        Serial.println("   Tipo: " + slave.deviceType);
+        Serial.println("   Status: " + String((int)slave.status));
+        Serial.println("   Online: " + String(slave.isOnline() ? "Sim" : "Não"));
+        Serial.println("   Relés: " + String(slave.numRelays));
+        Serial.println("   Operacional: " + String(slave.operational ? "Sim" : "Não"));
+        Serial.println("   Último contato: " + String(slave.getTimeSinceLastSeen() / 1000) + "s atrás");
+        Serial.println("   PINGs recebidos: " + String(slave.pingsReceived));
+        Serial.println("   PINGs enviados: " + String(slave.pingsSent));
+        Serial.println("   PONGs recebidos: " + String(slave.pongsReceived));
+        Serial.println("   PONGs enviados: " + String(slave.pongsSent));
+        Serial.println("   Mensagens recebidas: " + String(slave.messagesReceived));
+        Serial.println("   Mensagens perdidas: " + String(slave.messagesLost));
+    });
+
+    if (!ok || index == 0) {
         Serial.println("📭 Nenhum Slave confiável encontrado");
-    } else {
-        for (size_t i = 0; i < slaves.size(); i++) {
-            const auto& slave = slaves[i];
-            Serial.println("\n📋 Slave #" + String(i + 1) + ":");
-            Serial.println("   MAC: " + ESPNowController::macToString(slave.macAddress));
-            Serial.println("   Nome: " + slave.deviceName);
-            Serial.println("   Tipo: " + slave.deviceType);
-            Serial.println("   Status: " + String((int)slave.status));
-            Serial.println("   Online: " + String(slave.isOnline() ? "Sim" : "Não"));
-            Serial.println("   Relés: " + String(slave.numRelays));
-            Serial.println("   Operacional: " + String(slave.operational ? "Sim" : "Não"));
-            Serial.println("   Último contato: " + String(slave.getTimeSinceLastSeen() / 1000) + "s atrás");
-            Serial.println("   PINGs recebidos: " + String(slave.pingsReceived));
-            Serial.println("   PINGs enviados: " + String(slave.pingsSent));
-            Serial.println("   PONGs recebidos: " + String(slave.pongsReceived));
-            Serial.println("   PONGs enviados: " + String(slave.pongsSent));
-            Serial.println("   Mensagens recebidas: " + String(slave.messagesReceived));
-            Serial.println("   Mensagens perdidas: " + String(slave.messagesLost));
-        }
     }
-    
+
     Serial.println("=====================================\n");
 }
 
@@ -1946,7 +1981,7 @@ uint32_t MasterSlaveManager::generateCommandId() {
 void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumber, const String& action,
                                          int duration, uint32_t commandId, int supabaseCommandId,
                                          bool waitingForAck, int cycleOffDuration,
-                                         const String& commandMode) {
+                                         const String& commandMode, uint8_t relayMask) {
     PendingRelayCommand cmd;
     memcpy(cmd.targetMac, targetMac, 6);
     cmd.relayNumber = relayNumber;
@@ -1954,6 +1989,7 @@ void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumb
     cmd.duration = duration;
     cmd.cycleOffDuration = cycleOffDuration;
     cmd.commandMode = commandMode;
+    cmd.relayMask = relayMask;
     cmd.enqueuedAt = millis();
     cmd.ackWaitStartedAt = waitingForAck ? millis() : 0;
     cmd.nextRetry = waitingForAck ? (millis() + 60000UL) : (millis() + RETRY_INTERVAL);
@@ -1975,6 +2011,7 @@ void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumb
         existing.duration = duration;
         existing.cycleOffDuration = cycleOffDuration;
         existing.commandMode = commandMode;
+        existing.relayMask = relayMask;
         existing.commandId = commandId;
         existing.supabaseCommandId = supabaseCommandId;
         existing.enqueuedAt = millis();
@@ -1987,8 +2024,13 @@ void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumb
             existing.retryCount = 0;
         }
         unlockPendingQueue();
-        Serial.printf("📋 [QUEUE] coalesce relay=%d esp=%u supabase=%d\n",
-                      relayNumber, commandId, supabaseCommandId);
+        if (relayNumber == 255) {
+            Serial.printf("📋 [QUEUE] coalesce MASK esp=%u mask=0x%02X supabase=%d\n",
+                          commandId, relayMask, supabaseCommandId);
+        } else {
+            Serial.printf("📋 [QUEUE] coalesce relay=%d esp=%u supabase=%d\n",
+                          relayNumber, commandId, supabaseCommandId);
+        }
         return;
     }
 
@@ -2027,20 +2069,22 @@ void MasterSlaveManager::addToRetryQueue(const uint8_t* targetMac, int relayNumb
     unlockPendingQueue();
     
     if (waitingForAck) {
-        Serial.printf("📋 [ACK-WAIT] ESP-NOW id=%u supabase=%d relay=%d %s\n",
-                      commandId, supabaseCommandId, relayNumber, action.c_str());
+        if (relayNumber == 255) {
+            Serial.printf("📋 [ACK-WAIT] ESP-NOW id=%u MASK=0x%02X supabase=%d\n",
+                          commandId, relayMask, supabaseCommandId);
+        } else {
+            Serial.printf("📋 [ACK-WAIT] ESP-NOW id=%u supabase=%d relay=%d %s\n",
+                          commandId, supabaseCommandId, relayNumber, action.c_str());
+        }
         return;
     }
 
-    Serial.println("\n📋 ========================================");
-    Serial.println("📋 COMANDO ADICIONADO À FILA DE RETRY");
-    Serial.println("📋 ========================================");
-    Serial.println("🆔 Command ID: " + String(commandId));
-    Serial.println("📡 Destino: " + ESPNowController::macToString(targetMac));
-    Serial.println("🔌 Relé: " + String(relayNumber));
-    Serial.println("⚡ Ação: " + action);
-    Serial.println("⏱️ Próximo retry em: 2s");
-    Serial.println("========================================\n");
+    if (relayNumber == 255) {
+        Serial.printf("📋 [RETRY-QUEUE] MASK esp=%u mask=0x%02X next=2s\n", commandId, relayMask);
+    } else {
+        Serial.printf("📋 [RETRY-QUEUE] R%d %s esp=%u next=2s\n",
+                      relayNumber, action.c_str(), commandId);
+    }
 }
 
 void MasterSlaveManager::processRetryQueue() {
@@ -2066,19 +2110,19 @@ void MasterSlaveManager::processRetryQueue() {
                 continue;
             }
 
-            Serial.println("\n🔄 ========================================");
-            Serial.println("🔄 REINTENTANDO COMANDO");
-            Serial.println("🔄 ========================================");
-            Serial.println("🆔 Command ID: " + String(it->commandId));
-            Serial.println("📡 Destino: " + ESPNowController::macToString(it->targetMac));
-            Serial.println("🔌 Relé: " + String(it->relayNumber));
-            Serial.println("⚡ Ação: " + it->action);
-            Serial.println("🔢 Tentativa: " + String(it->retryCount + 1) + "/" + String(MAX_RELAY_RETRIES));
+            char what[32];
+            if (it->relayNumber == 255) {
+                snprintf(what, sizeof(what), "MASK=0x%02X", it->relayMask);
+            } else {
+                snprintf(what, sizeof(what), "R%d %s", it->relayNumber, it->action.c_str());
+            }
+            Serial.printf("🔄 [RETRY] esp=%u %s try=%u/%u\n",
+                          it->commandId, what, it->retryCount + 1, MAX_RELAY_RETRIES);
             
             bool success = false;
-            if (it->relayNumber == 255 || it->action == "on_all" || it->action == "off_all") {
-                const uint8_t mask = (it->action == "off_all") ? 0x00 : 0xFF;
-                success = espNowController->sendSetRelayMask(it->targetMac, mask,
+            if (it->relayNumber == 255) {
+                // Usar máscara guardada — NUNCA reinventar 0xFF a partir de action
+                success = espNowController->sendSetRelayMask(it->targetMac, it->relayMask,
                                                               (uint16_t)it->duration, it->commandId);
             } else {
                 String espAction = resolveSlaveEspAction(it->action, it->commandMode);
@@ -2089,9 +2133,7 @@ void MasterSlaveManager::processRetryQueue() {
             
             if (success) {
                 markEspNowSendToMac(it->targetMac);
-                Serial.println("✅ Reintento exitoso!");
-                Serial.println("⏳ Aguardando confirmação do Slave...");
-                Serial.println("========================================\n");
+                Serial.printf("✅ [RETRY] esp=%u sent — aguardando ACK\n", it->commandId);
                 
                 it->waitingForAck = true;
                 it->ackWaitStartedAt = now;
@@ -2099,12 +2141,12 @@ void MasterSlaveManager::processRetryQueue() {
                 it->nextRetry = now + (RETRY_INTERVAL * it->retryCount);
                 ++it;
             } else {
-                Serial.println("❌ Reintento falhou!");
+                Serial.printf("❌ [RETRY] esp=%u send falhou\n", it->commandId);
                 it->retryCount++;
                 
                 if (it->retryCount >= MAX_RELAY_RETRIES) {
-                    Serial.println("💔 COMANDO DESCARTADO APÓS " + String(MAX_RELAY_RETRIES) + " TENTATIVAS");
-                    Serial.println("========================================\n");
+                    Serial.printf("💔 [RETRY] esp=%u descartado após %u tentativas\n",
+                                  it->commandId, MAX_RELAY_RETRIES);
                     
                     // ✅ Marcar como failed en Supabase si viene de Supabase
                     if (it->supabaseCommandId > 0 && supabaseCommandCallback) {
@@ -2124,8 +2166,8 @@ void MasterSlaveManager::processRetryQueue() {
                 } else {
                     // Calcular próximo retry com backoff exponencial
                     it->nextRetry = now + (RETRY_INTERVAL * it->retryCount);
-                    Serial.println("⏱️ Próximo retry em: " + String((RETRY_INTERVAL * it->retryCount) / 1000) + "s");
-                    Serial.println("========================================\n");
+                    Serial.printf("⏱️ [RETRY] esp=%u próximo em %lus\n",
+                                  it->commandId, (RETRY_INTERVAL * it->retryCount) / 1000UL);
                     ++it;
                 }
             }
@@ -2214,23 +2256,12 @@ void MasterSlaveManager::removeFromRetryQueue(uint32_t commandId, bool currentSt
     }
     for (auto it = pendingRelayCommands.begin(); it != pendingRelayCommands.end(); ++it) {
         if (it->commandId == commandId) {
-            Serial.println("\n✅ ========================================");
-            Serial.println("✅ COMANDO CONFIRMADO");
-            Serial.println("✅ ========================================");
-            Serial.println("🆔 Command ID: " + String(commandId));
-            Serial.println("📡 Destino: " + ESPNowController::macToString(it->targetMac));
-            Serial.println("🔌 Relé: " + String(it->relayNumber));
-            Serial.println("⚡ Ação: " + it->action);
-            Serial.println("💡 Estado final: " + String(currentState ? "ON" : "OFF"));
-            Serial.println("🎯 Removido da fila de retry");
-            
             if (it->supabaseCommandId > 0 && supabaseCommandCallback && notifySupabase) {
                 String stateStr = currentState ? "true" : "false";
                 supabaseCommandCallback(it->supabaseCommandId, true, stateStr);
-                Serial.println("📤 Comando marcado como COMPLETED en Supabase (ID: " + String(it->supabaseCommandId) + ", state: " + stateStr + ")");
+                Serial.printf("📤 [CLOUD] completed id=%d state=%s\n",
+                              it->supabaseCommandId, stateStr.c_str());
             }
-            
-            Serial.println("========================================\n");
             
             pendingRelayCommands.erase(it);
             break;
@@ -2269,10 +2300,16 @@ void MasterSlaveManager::sendPendingCommandsToSlave(const uint8_t* macAddress) {
 // ===== 🔄 FASE 2: PROCESSAMENTO DE ACKs DE RELAY =====
 
 void MasterSlaveManager::processRelayCommandAck(const RelayCommandAck& ack, const uint8_t* senderMac) {
-    Serial.printf("[RELAY-ACK] id=%u relay=%u ok=%u state=%s mac=%s\n",
-                  (unsigned)ack.commandId, (unsigned)ack.relayNumber,
-                  (unsigned)ack.success, ack.currentState ? "ON" : "OFF",
-                  ESPNowController::macToString(senderMac).c_str());
+    if (ack.relayNumber == 255) {
+        Serial.printf("[RELAY-ACK] MASK esp=%u ok=%u mac=%s\n",
+                      (unsigned)ack.commandId, (unsigned)ack.success,
+                      ESPNowController::macToString(senderMac).c_str());
+    } else {
+        Serial.printf("[RELAY-ACK] R%u esp=%u ok=%u state=%s mac=%s\n",
+                      (unsigned)ack.relayNumber, (unsigned)ack.commandId,
+                      (unsigned)ack.success, ack.currentState ? "ON" : "OFF",
+                      ESPNowController::macToString(senderMac).c_str());
+    }
 
     touchSlaveLink(senderMac, "relay_ack_rx");
 
@@ -2287,7 +2324,6 @@ void MasterSlaveManager::processRelayCommandAck(const RelayCommandAck& ack, cons
         relayAckCallback(senderMac, ack.commandId, ack.success, ack.relayNumber, ack.currentState);
     }
     
-    // Atualizar estatísticas do Slave (sem SSL aquí)
     TrustedSlave* slave = getTrustedSlave(senderMac);
     if (slave) {
         slave->updateLastSeen();
@@ -2296,20 +2332,14 @@ void MasterSlaveManager::processRelayCommandAck(const RelayCommandAck& ack, cons
         if (ack.success && ack.relayNumber < 8) {
             slave->relayStates[ack.relayNumber].state = currentState;
             slave->relayStates[ack.relayNumber].lastUpdate = millis();
-            Serial.println("✅ Estado do relé " + String(ack.relayNumber) + " atualizado desde ACK: " + (currentState ? "ON" : "OFF"));
         }
         
-        if (ack.success) {
-            Serial.println("📊 Slave executou comando com sucesso!");
-        } else {
-            Serial.println("⚠️ Slave reportou falha na execução");
+        if (!ack.success) {
             slave->errors++;
+            Serial.printf("⚠️ [RELAY-ACK] falha no slave esp=%u\n", (unsigned)ack.commandId);
         }
-    } else if (ack.success) {
-        Serial.println("📊 Slave executou comando com sucesso!");
-    } else {
-        Serial.println("\n⚠️ Comando falhou no Slave");
-        Serial.println("🔄 Sistema de retry continuará tentando...");
+    } else if (!ack.success) {
+        Serial.printf("⚠️ [RELAY-ACK] falha esp=%u (slave desconhecido)\n", (unsigned)ack.commandId);
     }
 }
 
@@ -2618,28 +2648,31 @@ void MasterSlaveManager::processSlaveRelayCommands() {
             Serial.println("   ⏱️ Duração: " + String(durationSeconds) + "s");
         }
         
-        // ✅ Buscar slave por nombre (target_device_id = slave_name)
-        // Buscar en la lista de slaves confiables
-        const uint8_t* targetMac = nullptr;
-        auto trustedSlaves = getAllTrustedSlaves();
-        
-        for (const auto& slave : trustedSlaves) {
-            if (slave.deviceName == targetDeviceId || 
-                slave.deviceName.equalsIgnoreCase(targetDeviceId)) {
-                targetMac = slave.macAddress;
-                Serial.println("   ✅ Slave encontrado: " + slave.deviceName);
-                Serial.println("   💡 MAC: " + ESPNowController::macToString(targetMac));
-                break;
+        // Buscar slave por nombre (target_device_id = slave_name) sin copiar el vector
+        uint8_t resolvedMac[6] = {0};
+        bool macFound = false;
+        forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (macFound) {
+                return;
             }
-        }
-        
-        if (!targetMac) {
+            if (slave.deviceName == targetDeviceId ||
+                slave.deviceName.equalsIgnoreCase(targetDeviceId)) {
+                memcpy(resolvedMac, slave.macAddress, 6);
+                macFound = true;
+                Serial.println("   ✅ Slave encontrado: " + slave.deviceName);
+                Serial.println("   💡 MAC: " + ESPNowController::macToString(resolvedMac));
+            }
+        });
+
+        if (!macFound) {
             Serial.println("   ❌ Slave não encontrado na lista confiável: " + targetDeviceId);
             Serial.println("   💡 Use 'list' para ver slaves disponíveis");
             failCount++;
             continue;
         }
-        
+
+        const uint8_t* targetMac = resolvedMac;
+
         // Verificar si slave está online
         TrustedSlave* slave = getTrustedSlave(targetMac);
         if (!slave || !slave->isOnline()) {

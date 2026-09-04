@@ -25,6 +25,10 @@ user hidrowave
 topic write hidrowave/+/command
 topic write hidrowave/+/ec/config
 topic write hidrowave/+/ph/config
+topic write hidrowave/+/circ/config
+topic write hidrowave/+/rules/#
 topic read hidrowave/+/#
 
 # --- Master ESP (bloco injetado por align-broker-production.sh) ---
+# Cada master precisa read explícito: command, ec/config, ph/config, circ/config, rules/#
+# (write hidrowave/{id}/# NÃO autoriza subscribe)

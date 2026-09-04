@@ -33,8 +33,14 @@ public:
     /** Uma linha/s durante janela de provisioning (serial legível) */
     static void tickProvisioningCountdown();
 
+    /** true durante WiFi.disconnect → ch11 → burst → reconnect */
+    static bool isProvisioningStaSuspendActive();
+
     /** SSID/senha: hydro_system → PreferencesManager → WiFi STA */
     static bool loadWifiCredentials(String& ssid, String& password, uint8_t& channel);
+
+    /** Provisioning burst: exige SSID+password em NVS (sem fallback STA sem senha) */
+    static bool loadWifiCredentialsForProvisioning(String& ssid, String& password, uint8_t& channel);
 };
 
 #endif  // ESPNOW_CHANNEL_POLICY_H

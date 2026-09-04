@@ -2,6 +2,7 @@
 #define RELAY_COORDINATOR_H
 
 #include <Arduino.h>
+#include <functional>
 
 class HydroControl;
 class MasterSlaveManager;
@@ -21,6 +22,25 @@ enum class RelayActuationAction : uint8_t {
     Off = 0,
     On,
     Toggle
+};
+
+/** Gate de mezcla Auto EC/pH (bomba de circulação tipada). */
+enum class CirculationMixGate : uint8_t {
+    Ok = 0,
+    NotTyped = 1,
+    Inactive = 2
+};
+
+/** Política pura — sin I/O. Ver docs/handoffs/HANDOFF_RELAY_ROUTER.md */
+enum class RelayDenyReason : uint8_t {
+    Ok = 0,
+    BlockedBit,
+    DilutionHold,
+    CirculationConflict,
+    SlaveOffline,
+    WaterInterlock,
+    OwnerDenied,
+    InvalidTarget
 };
 
 struct RelayTarget {
@@ -44,11 +64,31 @@ struct ObservedRelayState {
 
 class RelayCoordinator {
 public:
+    using SlaveReachableFn = std::function<bool(const uint8_t mac[6])>;
+    using WaterLevelOkFn = std::function<bool()>;
+
     RelayCoordinator();
 
     void begin(HydroControl* hydro, MasterSlaveManager* masterManager);
     void loadConfigFromNVS();
     void setCirculationTarget(const uint8_t mac[6], int relayNumber);
+    void clearCirculationTarget();
+    /**
+     * Interlock de mezcla Auto EC/pH:
+     * - sin tipagem → NotTyped (bloquea)
+     * - tipada + OFF/inválido → Inactive (bloquea)
+     * - tipada + ON → Ok
+     */
+    CirculationMixGate getCirculationMixGate() const;
+    bool isCirculationMixActiveForDosing() const;
+
+    void setSlaveReachableCallback(SlaveReachableFn cb) { slaveReachableCb_ = cb; }
+    /** Water interlock: callback + flag (default off — no romper bancada). */
+    void setWaterLevelOkCallback(WaterLevelOkFn cb, bool enabled = false) {
+        waterLevelOkCb_ = cb;
+        waterInterlockEnabled_ = enabled;
+    }
+    void setWaterInterlockEnabled(bool enabled) { waterInterlockEnabled_ = enabled; }
 
     bool isCirculationConfigured() const { return circulationConfigured; }
     RelayTarget getCirculationTarget() const;
@@ -56,6 +96,14 @@ public:
     ObservedRelayState getObservedState(const RelayTarget& target) const;
     RelayOwner getOwner(const RelayTarget& target) const;
     bool isCirculationTarget(const RelayTarget& target) const;
+
+    /** Solo política. Actualiza lastDenyReason_. */
+    RelayDenyReason mayExecute(
+        RelayOwner owner,
+        const RelayTarget& target,
+        RelayActuationAction action) const;
+
+    RelayDenyReason lastDenyReason() const { return lastDenyReason_; }
 
     uint32_t requestActuation(
         RelayOwner owner,
@@ -109,6 +157,12 @@ private:
     RelayOwner circulationOwner;
     uint8_t circulationRefCount;
 
+    mutable RelayDenyReason lastDenyReason_;
+    SlaveReachableFn slaveReachableCb_;
+    WaterLevelOkFn waterLevelOkCb_;
+    bool waterInterlockEnabled_;
+
+    static bool isAutomationOwner(RelayOwner owner);
     bool claimCirculationOwner(RelayOwner owner);
     bool releaseCirculationOwner(RelayOwner owner, bool tryOff);
     bool executeLocalRelay(int relay, const String& action, int durationSec);
@@ -126,5 +180,6 @@ private:
 };
 
 const char* relayOwnerName(RelayOwner owner);
+const char* relayDenyReasonName(RelayDenyReason reason);
 
 #endif

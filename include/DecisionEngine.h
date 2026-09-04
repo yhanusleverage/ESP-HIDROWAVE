@@ -3,14 +3,14 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <LittleFS.h>
+#include <SPIFFS.h>
 #include <vector>
 #include "DataTypes.h"
 #include "Config.h"
+#include "RelayCoordinator.h"
 
 // Forward declaration - ✅ Normalizado: usar MasterSlaveManager en lugar de ESPNowTask
 class MasterSlaveManager;
-class RelayCoordinator;
 
 // ===== ESTRUTURAS DO MOTOR DE DECISÕES =====
 
@@ -182,6 +182,19 @@ struct SystemState {
 };
 
 /**
+ * @brief Evento para espejo MQTT de ejecución DE local (post-actuate, fire-and-forget).
+ */
+struct RuleExecutedMirrorEvent {
+    String rule_id;
+    int relay_index;
+    String action;          // "on" | "off" | "toggle"
+    bool current_state;
+    bool success;
+    uint32_t duration_sec;
+    String slave_mac;       // vacío = relé local master
+};
+
+/**
  * @brief Motor de Decisões Principal
  */
 class DecisionEngine {
@@ -219,6 +232,8 @@ public:
     bool addRule(const DecisionRule& rule);
     bool removeRule(const String& rule_id);
     bool updateRule(const String& rule_id, const DecisionRule& new_rule);
+    /** Upsert por id (rule_id/id) desde JSON cloud/MQTT; opcional persistir SPIFFS. */
+    bool upsertRuleFromJson(const JsonObject& json_rule, bool persist = true);
     DecisionRule* getRule(const String& rule_id);
     std::vector<DecisionRule>& getAllRules() { return rules; }
     
@@ -227,7 +242,8 @@ public:
     void evaluateAllRules();
     bool evaluateCondition(const RuleCondition& condition, const SystemState& state);
     bool checkSafetyConstraints(const DecisionRule& rule, const SystemState& state);
-    void executeActions(const std::vector<RuleAction>& actions, const String& rule_id);
+    /** @return false se alguma ação de relé falhou (MSM ausente, deny, etc.). */
+    bool executeActions(const std::vector<RuleAction>& actions, const String& rule_id);
     
     // ===== CONTROLE DE MODO =====
     void setDryRunMode(bool enabled) { dry_run_mode = enabled; }
@@ -262,6 +278,13 @@ public:
     void setMasterManager(MasterSlaveManager* mgr) { masterManager = mgr; }
     void setRelayCoordinator(RelayCoordinator* coordinator) { relayCoordinator = coordinator; }
 
+    /** Espejo async relay_commands vía MQTT (HydroSystemCore registra callback). */
+    typedef void (*RuleExecutedMirrorCallback)(const RuleExecutedMirrorEvent& event, void* user_data);
+    void setRuleExecutedMirrorCallback(RuleExecutedMirrorCallback callback, void* user_data) {
+        rule_executed_mirror_callback = callback;
+        rule_executed_mirror_user_data = user_data;
+    }
+
 private:
     // ===== CALLBACKS INTERNOS =====
     RelayControlCallback relay_control_callback;
@@ -272,6 +295,9 @@ private:
     // ✅ INTEGRAÇÃO ESP-NOW - Normalizado: usar MasterSlaveManager
     MasterSlaveManager* masterManager;
     RelayCoordinator* relayCoordinator;
+
+    RuleExecutedMirrorCallback rule_executed_mirror_callback;
+    void* rule_executed_mirror_user_data;
     
     // ===== MÉTODOS INTERNOS =====
     bool parseRuleFromJSON(const JsonObject& json_rule, DecisionRule& rule);
@@ -289,7 +315,13 @@ private:
     bool isInCooldown(const DecisionRule& rule);
     bool hasExceededHourlyLimit(const DecisionRule& rule);
     
-    void executeRelayAction(const RuleAction& action, const String& rule_id);
+    /** Normaliza MAC (colapsa "::", upper, '-'→':'). */
+    static String sanitizeDeviceIdOrMac(const String& raw);
+    /** @return false se a atuação remota/local falhou. */
+    bool executeRelayAction(const RuleAction& action, const String& rule_id,
+                            RelayOwner owner = RelayOwner::DecisionRule);
+    void notifyRuleExecutedMirror(const RuleAction& action, const String& rule_id, bool success,
+                                  const String& slave_mac);
     void executeSystemAlert(const RuleAction& action, const String& rule_id);
     void executeLogEvent(const RuleAction& action, const String& rule_id);
     

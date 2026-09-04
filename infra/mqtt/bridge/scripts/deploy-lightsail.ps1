@@ -31,6 +31,10 @@ if (-not (Test-Path $IndexJs)) {
 
 Write-Host ">> SCP bridge files -> ${SshHost}:/tmp/"
 scp -i $PemPath -o StrictHostKeyChecking=accept-new $IndexJs "${SshHost}:/tmp/hidrowave-index.js"
+$ScheduleEval = Join-Path $BridgeDir "schedule-evaluator.js"
+if (Test-Path $ScheduleEval) {
+  scp -i $PemPath -o StrictHostKeyChecking=accept-new $ScheduleEval "${SshHost}:/tmp/schedule-evaluator.js"
+}
 scp -i $PemPath -o StrictHostKeyChecking=accept-new $PhTestJs "${SshHost}:/tmp/test-publish-ph-dose.js"
 scp -i $PemPath -o StrictHostKeyChecking=accept-new $EcTestJs "${SshHost}:/tmp/test-publish-ec-dose.js"
 scp -i $PemPath -o StrictHostKeyChecking=accept-new $EcMetricJs "${SshHost}:/tmp/test-publish-ec-metric.js"
@@ -58,6 +62,7 @@ scp -i $PemPath -o StrictHostKeyChecking=accept-new $PackageJson "${SshHost}:/tm
 Write-Host ">> Instalar y reiniciar hidrowave-bridge"
 $remoteCmd = @"
 sudo cp /tmp/hidrowave-index.js /opt/hidrowave-bridge/index.js &&
+if [ -f /tmp/schedule-evaluator.js ]; then sudo cp /tmp/schedule-evaluator.js /opt/hidrowave-bridge/schedule-evaluator.js && sudo chown hidrowave:hidrowave /opt/hidrowave-bridge/schedule-evaluator.js; fi &&
 sudo mkdir -p /opt/hidrowave-bridge/scripts &&
 sudo cp /tmp/test-publish-ph-dose.js /opt/hidrowave-bridge/scripts/test-publish-ph-dose.js &&
 sudo cp /tmp/test-publish-ec-dose.js /opt/hidrowave-bridge/scripts/test-publish-ec-dose.js &&

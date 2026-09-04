@@ -81,6 +81,22 @@ bool MqttClientWrapper::subscribeInboundTopics() {
             ok = false;
         }
     }
+    if (circConfigTopic.length() > 0) {
+        if (mqtt.subscribe(circConfigTopic.c_str(), 1)) {
+            Serial.printf("[MQTT] subscribe circ/config QoS1 %s\n", circConfigTopic.c_str());
+        } else {
+            Serial.println("[MQTT] subscribe circ/config failed");
+            ok = false;
+        }
+    }
+    if (rulesWildcardTopic.length() > 0) {
+        if (mqtt.subscribe(rulesWildcardTopic.c_str(), 1)) {
+            Serial.printf("[MQTT] subscribe rules/# QoS1 %s\n", rulesWildcardTopic.c_str());
+        } else {
+            Serial.println("[MQTT] subscribe rules/# failed");
+            ok = false;
+        }
+    }
     return ok;
 }
 
@@ -93,6 +109,9 @@ bool MqttClientWrapper::begin(const String& id) {
     commandTopic = String("hidrowave/") + deviceId + "/command";
     ecConfigTopic = String("hidrowave/") + deviceId + "/ec/config";
     phConfigTopic = String("hidrowave/") + deviceId + "/ph/config";
+    circConfigTopic = String("hidrowave/") + deviceId + "/circ/config";
+    rulesWildcardTopic = String("hidrowave/") + deviceId + "/rules/#";
+    rulesManifestTopic = String("hidrowave/") + deviceId + "/rules/manifest";
     ecOperationTopic = String("hidrowave/") + deviceId + "/ec_operation";
     doseTopic = String("hidrowave/") + deviceId + "/dose";
     phOperationTopic = String("hidrowave/") + deviceId + "/ph_operation";
@@ -103,6 +122,7 @@ bool MqttClientWrapper::begin(const String& id) {
     phGainTopic = String("hidrowave/") + deviceId + "/ph_gain";
     ecDilutionTopic = String("hidrowave/") + deviceId + "/ec_dilution";
     commandAckTopic = String("hidrowave/") + deviceId + "/command_ack";
+    ruleExecutedTopic = String("hidrowave/") + deviceId + "/rule_executed";
     relayStateTopic = String("hidrowave/") + deviceId + "/relay/state";
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     callbackInstance = this;
@@ -243,7 +263,7 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
     }
 #endif
 
-    StaticJsonDocument<448> doc;
+    StaticJsonDocument<512> doc;
     doc["v"] = 1;
     doc["device_id"] = deviceId;
 #if HIDRO_DEV_RELAX_SENSORS
@@ -293,6 +313,8 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
     if (reading.interlockMode && reading.interlockMode[0]) {
         doc["interlock_mode"] = reading.interlockMode;
     }
+    doc["circulation_typed"] = reading.circulationTyped;
+    doc["circulation_mix_ok"] = reading.circulationMixOk;
     if (isValidEnvironmentReading(reading.airTemperature, reading.humidity)) {
         doc["air_temp"] = reading.airTemperature;
         doc["humidity"] = reading.humidity;
@@ -316,7 +338,7 @@ bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
         return false;
     }
 
-    StaticJsonDocument<320> doc;
+    StaticJsonDocument<384> doc;
     doc["v"] = 1;
     doc["device_id"] = deviceId;
     doc["water_level_ok"] = reading.waterLevelOk;
@@ -331,8 +353,10 @@ bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
     if (reading.interlockMode && reading.interlockMode[0]) {
         doc["interlock_mode"] = reading.interlockMode;
     }
+    doc["circulation_typed"] = reading.circulationTyped;
+    doc["circulation_mix_ok"] = reading.circulationMixOk;
 
-    char payload[320];
+    char payload[384];
     size_t len = serializeJson(doc, payload, sizeof(payload));
     if (len == 0) {
         return false;
@@ -340,7 +364,7 @@ bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
 
     bool published = mqtt.publish(levelsTopic.c_str(), payload, false);
     if (published) {
-        Serial.printf("[MQTT] levels L1=%d L2=%d L3=%d L4=%d wl=%s ok=%d sim=%d ilock=%s\n",
+        Serial.printf("[MQTT] levels L1=%d L2=%d L3=%d L4=%d wl=%s ok=%d sim=%d ilock=%s circ=%d/%d\n",
                       reading.level1Wet ? 1 : 0,
                       reading.level2Wet ? 1 : 0,
                       reading.level3Wet ? 1 : 0,
@@ -348,7 +372,9 @@ bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
                       reading.waterLevel ? reading.waterLevel : "-",
                       reading.waterLevelOk ? 1 : 0,
                       reading.levelsSimulated ? 1 : 0,
-                      reading.interlockMode ? reading.interlockMode : "-");
+                      reading.interlockMode ? reading.interlockMode : "-",
+                      reading.circulationTyped ? 1 : 0,
+                      reading.circulationMixOk ? 1 : 0);
     } else {
         Serial.println("[MQTT] levels publish failed");
     }
@@ -748,6 +774,48 @@ bool MqttClientWrapper::publishCommandAck(const MqttCommandAckReading& reading) 
                       reading.status ? reading.status : "completed");
     } else {
         Serial.println("[MQTT] command_ack publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishRuleExecuted(const MqttRuleExecutedReading& reading) {
+    if (!mqtt.connected() || !reading.event_id || !reading.event_id[0] ||
+        !reading.rule_id || !reading.rule_id[0]) {
+        return false;
+    }
+
+    StaticJsonDocument<384> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ts"] = (uint32_t)(millis() / 1000UL);
+    doc["event_id"] = reading.event_id;
+    doc["rule_id"] = reading.rule_id;
+    doc["relay_index"] = reading.relay_index;
+    if (reading.action && reading.action[0]) {
+        doc["action"] = reading.action;
+    }
+    doc["current_state"] = reading.current_state;
+    doc["success"] = reading.success;
+    if (reading.duration_sec > 0) {
+        doc["duration_s"] = reading.duration_sec;
+    }
+    if (reading.slave_mac && reading.slave_mac[0]) {
+        doc["slave_mac_address"] = reading.slave_mac;
+    }
+
+    char payload[384];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0 || len >= sizeof(payload)) {
+        return false;
+    }
+
+    bool published = mqtt.publish(ruleExecutedTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] rule_executed event=%s rule=%s relay=%d ok=%d\n",
+                      reading.event_id, reading.rule_id, reading.relay_index,
+                      reading.success ? 1 : 0);
+    } else {
+        Serial.println("[MQTT] rule_executed publish failed");
     }
     return published;
 }

@@ -62,7 +62,8 @@ struct ActiveScript {
 
 class ScriptRunnerManager {
 public:
-    using RelayFn = std::function<void(int relay, bool on, const String& targetDeviceId, unsigned long durationMs)>;
+    using RelayFn = std::function<void(int relay, bool on, const String& targetDeviceId,
+                                       unsigned long durationMs, int priority)>;
     /** true = procedimento tanque activo; false = terminó. */
     using TankGateFn = std::function<void(bool active)>;
     using FlowResetFn = std::function<void()>;
@@ -74,6 +75,7 @@ public:
     static ScriptRunnerManager& instance();
 
     void clear();
+    bool removeByRuleId(const String& ruleId);
     bool loadFromRuleJson(const String& ruleId, int priority,
                           const JsonObject& ruleJson,
                           const JsonVariant& triggers = JsonVariant());

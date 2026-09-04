@@ -1899,12 +1899,6 @@ void ESPNowController::onDataReceived(const uint8_t* mac, const uint8_t* incomin
         
         // Verificar se é um ACK de relay
         if (taskMsg.type == TASK_MSG_RELAY_ACK) {
-            Serial.println("\n🎊 === TaskESPNowMessage ACK DETECTADO ===");
-            Serial.println("📥 De: " + macToString(mac));
-            Serial.println("📦 Tamanho: " + String(len) + " bytes");
-            Serial.println("🆔 Tipo: TASK_MSG_RELAY_ACK");
-            
-            // Extrair dados do ACK
             if (taskMsg.dataSize >= sizeof(RelayCommandAck)) {
                 RelayCommandAck ack;
                 memcpy(&ack, taskMsg.data, sizeof(RelayCommandAck));
@@ -1918,20 +1912,11 @@ void ESPNowController::onDataReceived(const uint8_t* mac, const uint8_t* incomin
                 }
                 
                 if (receivedChecksum == expectedChecksum) {
-                    Serial.println("✅ Checksum válido");
-                    Serial.println("🆔 Command ID: " + String(ack.commandId));
-                    Serial.println("🔌 Relé: " + String(ack.relayNumber));
-                    Serial.println("✅ Success: " + String(ack.success ? "Sim" : "Não"));
-                    Serial.println("💡 Estado: " + String(ack.currentState ? "ON" : "OFF"));
-                    Serial.println("==========================================\n");
-                    
-                    // Notificar MasterSlaveManager se houver instância
                     if (MasterSlaveManager::getInstance()) {
                         MasterSlaveManager::getInstance()->processRelayCommandAck(ack, mac);
                     }
                 } else {
-                    Serial.println("❌ Checksum inválido!");
-                    Serial.println("==========================================\n");
+                    Serial.println("❌ [ESPNOW-ACK] checksum inválido");
                 }
             }
             return; // Já processado, não tentar como ESPNowMessage
@@ -2085,10 +2070,10 @@ bool ESPNowController::initiateHandshake(const uint8_t* targetMac) {
     memcpy(message.data, &handshake, sizeof(HandshakeData));
     message.checksum = calculateChecksum(message);
     
-    Serial.println("🤝 Iniciando handshake bidirecional com " + macToString(targetMac));
-    Serial.println("   Sessão: " + String(handshake.sessionId));
-    Serial.println("   Dispositivo: " + deviceName);
-    Serial.println("   WiFi: " + String(handshake.wifiConnected ? "Conectado" : "Desconectado"));
+    Serial.printf("[DEVICE-INFO] handshake → %s sess=%u wifi=%d\n",
+                  macToString(targetMac).c_str(),
+                  static_cast<unsigned>(handshake.sessionId),
+                  handshake.wifiConnected ? 1 : 0);
     
     return sendMessage(message, targetMac);
 }

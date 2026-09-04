@@ -521,8 +521,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
         
         // ✅ PASSO 2: Adicionar relés dos SLAVES (se masterManager disponível)
         if (this->masterManager) {
-            std::vector<TrustedSlave> slaves = this->masterManager->getAllTrustedSlaves();
-            for (const auto& slave : slaves) {
+            this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
                 if (slave.isOnline()) {
                     for (int i = 0; i < slave.numRelays && i < 8; i++) {
                         JsonObject relay = relays.createNestedObject();
@@ -548,7 +547,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                         relay["state_reliable"] = (slave.relayStates[i].lastUpdate != 0 && age < 10000);
                     }
                 }
-            }
+            });
         }
         
         String response;
@@ -850,15 +849,18 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
         
         // Si es remoto, buscar MAC del slave
         if (!deviceId.isEmpty() && deviceId != "local" && deviceId != "MASTER" && this->masterManager) {
-            auto trustedSlaves = this->masterManager->getAllTrustedSlaves();
-            for (const auto& slave : trustedSlaves) {
+            bool macFound = false;
+            this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                if (macFound) {
+                    return;
+                }
                 String slaveDeviceId = "ESP32_SLAVE_" + ESPNowController::macToString(slave.macAddress);
                 slaveDeviceId.replace(":", "_");
                 if (slaveDeviceId == deviceId || slaveDeviceId.equalsIgnoreCase(deviceId)) {
                     memcpy(cmd.slaveMac, slave.macAddress, 6);
-                    break;
+                    macFound = true;
                 }
-            }
+            });
         }
         
         // ✅ TÓPICO 3: ENVIAR COMANDO A QUEUE (Core 1 → Core 0)
@@ -968,23 +970,26 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                 }
                         
                 // ✅ Buscar Slave por device_id (formato: ESP32_SLAVE_XX_XX_XX_XX_XX_XX)
-                const uint8_t* targetMac = nullptr;
-                auto trustedSlaves = this->masterManager->getAllTrustedSlaves();
-                for (const auto& slave : trustedSlaves) {
+                uint8_t targetMac[6] = {0};
+                bool macFound = false;
+                this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                    if (macFound) {
+                        return;
+                    }
                     // Gerar device_id do slave (igual ao formato usado no /api/slaves)
                     String slaveDeviceId = "ESP32_SLAVE_" + ESPNowController::macToString(slave.macAddress);
                     slaveDeviceId.replace(":", "_");
                     
                     // Comparar com device_id recebido
                     if (slaveDeviceId == deviceId || slaveDeviceId.equalsIgnoreCase(deviceId)) {
-                        targetMac = slave.macAddress;
+                        memcpy(targetMac, slave.macAddress, 6);
+                        macFound = true;
                         Serial.printf("✅ [API] Slave encontrado: %s -> MAC: %s\n", 
                                     deviceId.c_str(), ESPNowController::macToString(slave.macAddress).c_str());
-                        break;
                     }
-                }
+                });
                 
-                if (!targetMac) {
+                if (!macFound) {
                     // Slave não encontrado
                     doc["status"] = "error";
                     doc["success"] = false;
@@ -1003,7 +1008,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                     return;
                 }
                 
-                // Enviar comando via ESP-NOW usando MasterSlaveManager
+                // Enviar comando via ESP-NOW usando MasterSlaveManager (fora do forEach)
                 bool success = this->masterManager->sendRelayCommandToSlave(targetMac, relay, action, duration);
                 
                 if (success) {
@@ -1368,9 +1373,11 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
         // ✅ CRÍTICO: Verificar se estados dos relés estão desatualizados
         bool statesOutdated = false;
         if (this->masterManager) {
-            std::vector<TrustedSlave> slaves = this->masterManager->getAllTrustedSlaves();
             unsigned long now = millis();
-            for (const auto& slave : slaves) {
+            this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                if (statesOutdated) {
+                    return;
+                }
                 if (slave.isOnline()) {
                     // ✅ CORRIGIDO: Verificar se algum relé tem lastUpdate muito antigo OU nunca foi atualizado
                     for (int i = 0; i < slave.numRelays && i < 8; i++) {
@@ -1387,9 +1394,8 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                             break;
                         }
                     }
-                    if (statesOutdated) break;
                 }
-            }
+            });
         }
         
         // ✅ CRÍTICO: Solicitar atualização de estados se:
@@ -1494,19 +1500,19 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
         }
         
         // ✅ CRÍTICO: Buscar slaves DEPOIS de solicitar estados (para ter dados atualizados)
-        std::vector<TrustedSlave> slaves = this->masterManager->getAllTrustedSlaves();
-        Serial.printf("   ✅ Encontrados %d slave(s) diretamente do masterManager\n", slaves.size());
+        const int slaveCount = this->masterManager->getTrustedSlaveCount();
+        Serial.printf("   ✅ Encontrados %d slave(s) diretamente do masterManager\n", slaveCount);
         
-        if (slaves.size() > 0) {
+        if (slaveCount > 0) {
             // ✅ CRIAR JSON DIRETAMENTE (fallback quando cache não está pronto)
             // ✅ OTIMIZAÇÃO: Calcular tamanho necessário dinamicamente
             // Cada slave: ~400-600 bytes (com 8 relés)
-            // Buffer: slaves.size() * 600 + 256 (overhead)
-            size_t estimatedSize = (slaves.size() * 600) + 256;
+            // Buffer: slaveCount * 600 + 256 (overhead)
+            size_t estimatedSize = (slaveCount * 600) + 256;
             if (estimatedSize > 8192) estimatedSize = 8192;  // Limitar a 8KB máximo
             if (estimatedSize < 1024) estimatedSize = 1024;  // Mínimo 1KB
             
-            Serial.printf("   📝 Criando JSON diretamente (buffer: %d bytes para %d slaves)...\n", estimatedSize, slaves.size());
+            Serial.printf("   📝 Criando JSON diretamente (buffer: %d bytes para %d slaves)...\n", estimatedSize, slaveCount);
             
             DynamicJsonDocument doc(estimatedSize);
             
@@ -1524,7 +1530,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                 return;
             }
             
-            for (const auto& slave : slaves) {
+            this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
                 JsonObject slaveObj = slavesArray.createNestedObject();
                 
                 // ✅ Gerar device_id correto (ESP32_SLAVE_XX_XX_XX_XX_XX_XX)
@@ -1572,7 +1578,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                     relayObj["state_age_ms"] = neverUpdated ? -1 : (int)stateAge;  // -1 se nunca atualizado
                     relayObj["state_reliable"] = stateIsReliable;  // ✅ NOVO: Indica se estado é confiável
                 }
-            }
+            });
             
             String response;
             if (serializeJson(doc, response) > 0) {
@@ -1666,11 +1672,11 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
         
         // ✅ Tentar obter contagem de slaves (sem try-catch, que não funciona bem em Arduino)
         if (this->masterManager) {
-            Serial.println("🔍 [DEBUG] masterManager disponível, tentando getAllTrustedSlaves()...");
-            std::vector<TrustedSlave> trustedSlaves = this->masterManager->getAllTrustedSlaves();
-            debug["total_slaves"] = (int)trustedSlaves.size();
+            Serial.println("🔍 [DEBUG] masterManager disponível, tentando getTrustedSlaveCount()...");
+            const int totalSlaves = this->masterManager->getTrustedSlaveCount();
+            debug["total_slaves"] = totalSlaves;
             debug["status"] = "ok";
-            Serial.printf("✅ [DEBUG] getAllTrustedSlaves() OK: %d slaves\n", trustedSlaves.size());
+            Serial.printf("✅ [DEBUG] getTrustedSlaveCount() OK: %d slaves\n", totalSlaves);
         } else {
             debug["error"] = "MasterSlaveManager não disponível";
             debug["total_slaves"] = 0;
@@ -1707,9 +1713,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
         DynamicJsonDocument doc(2048);
         JsonArray slavesArray = doc.createNestedArray("slaves");
         
-        std::vector<TrustedSlave> trustedSlaves = this->masterManager->getAllTrustedSlaves();
-        
-        for (const auto& slave : trustedSlaves) {
+        this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
             JsonObject slaveObj = slavesArray.createNestedObject();
             
             String deviceId = "ESP32_SLAVE_" + ESPNowController::macToString(slave.macAddress);
@@ -1736,7 +1740,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                 relayObj["has_timer"] = slave.relayStates[i].hasTimer;
                 relayObj["remaining_time"] = slave.relayStates[i].remainingTime;
             }
-        }
+        });
         
         String jsonResponse;
         serializeJsonPretty(doc, jsonResponse);  // Pretty print para Serial
@@ -1786,15 +1790,15 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
             return;
         }
         
-        std::vector<TrustedSlave> trustedSlaves = this->masterManager->getAllTrustedSlaves();
+        const int slaveCount = this->masterManager->getTrustedSlaveCount();
         
         html += "<div class='slave'>";
         html += "<h2>📊 Estatísticas</h2>";
-        html += "<p class='info'><span class='label'>Total de Slaves:</span> <strong>" + String(trustedSlaves.size()) + "</strong></p>";
+        html += "<p class='info'><span class='label'>Total de Slaves:</span> <strong>" + String(slaveCount) + "</strong></p>";
         html += "<p class='info'><span class='label'>MasterManager:</span> <span class='online'>✅ Disponível</span></p>";
         html += "</div>";
         
-        if (trustedSlaves.empty()) {
+        if (slaveCount <= 0) {
             html += "<div class='slave'>";
             html += "<h2>⚠️ Nenhum Slave Encontrado</h2>";
             html += "<p>Nenhum slave foi encontrado em <code>trustedSlaves</code>.</p>";
@@ -1806,11 +1810,12 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
             html += "</ul>";
             html += "</div>";
         } else {
-            for (size_t idx = 0; idx < trustedSlaves.size(); idx++) {
-                const auto& slave = trustedSlaves[idx];
+            int idx = 0;
+            this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+                idx++;
                 
                 html += "<div class='slave'>";
-                html += "<h2>📋 Slave #" + String(idx + 1) + ": " + slave.deviceName + "</h2>";
+                html += "<h2>📋 Slave #" + String(idx) + ": " + slave.deviceName + "</h2>";
                 
                 html += "<div class='info'><span class='label'>MAC Address:</span> " + ESPNowController::macToString(slave.macAddress) + "</div>";
                 String deviceIdForHtml = "ESP32_SLAVE_" + ESPNowController::macToString(slave.macAddress);
@@ -1848,13 +1853,13 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                 html += "<div class='info'><span class='label'>Errors:</span> " + String(slave.errors) + "</div>";
                 
                 html += "</div>";
-            }
+            });
         }
         
         // Adicionar JSON completo no final
         DynamicJsonDocument doc(4096);
         JsonArray slavesArray = doc.createNestedArray("slaves");
-        for (const auto& slave : trustedSlaves) {
+        this->masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
             JsonObject slaveObj = slavesArray.createNestedObject();
             String deviceIdJson = "ESP32_SLAVE_" + ESPNowController::macToString(slave.macAddress);
             deviceIdJson.replace(":", "_");
@@ -1879,7 +1884,7 @@ void WebServerManager::beginAdminServer(WiFiManager& wifiManager, HydroControl& 
                 relayObj["has_timer"] = slave.relayStates[i].hasTimer;
                 relayObj["remaining_time"] = slave.relayStates[i].remainingTime;
             }
-        }
+        });
         
         String jsonResponse;
         serializeJsonPretty(doc, jsonResponse);
@@ -2187,10 +2192,13 @@ bool WebServerManager::shouldRefreshSlaveStates() {
         return false;
     }
     
-    std::vector<TrustedSlave> slaves = masterManager->getAllTrustedSlaves();
     unsigned long now = millis();
+    bool needsRefresh = false;
     
-    for (const auto& slave : slaves) {
+    masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+        if (needsRefresh) {
+            return;
+        }
         if (slave.isOnline()) {
             for (int i = 0; i < slave.numRelays && i < 8; i++) {
                 bool neverUpdated = (slave.relayStates[i].lastUpdate == 0);
@@ -2199,11 +2207,12 @@ bool WebServerManager::shouldRefreshSlaveStates() {
                     : (now - slave.relayStates[i].lastUpdate);
                     
                 if (neverUpdated || age > 5000) {  // ✅ Estados desatualizados (> 5s ou nunca atualizados)
-                    return true;
+                    needsRefresh = true;
+                    break;
                 }
             }
         }
-    }
+    });
     
-    return false;
+    return needsRefresh;
 }

@@ -42,8 +42,13 @@ public:
     DecisionEngineIntegration(DecisionEngine* engine, HydroControl* hydro, SupabaseClient* supa, MasterSlaveManager* masterMgr = nullptr);
     ~DecisionEngineIntegration();
     
-    // ✅ INTEGRAÇÃO ESP-NOW: Setter para MasterSlaveManager
-    void setMasterManager(MasterSlaveManager* masterMgr) { masterManager = masterMgr; }
+    // ✅ INTEGRAÇÃO ESP-NOW: late-bind também no DecisionEngine (não só neste wrapper)
+    void setMasterManager(MasterSlaveManager* masterMgr) {
+        masterManager = masterMgr;
+        if (engine) {
+            engine->setMasterManager(masterMgr);
+        }
+    }
     void setRelayCoordinator(RelayCoordinator* coordinator) {
         relayCoordinator = coordinator;
         if (engine) {

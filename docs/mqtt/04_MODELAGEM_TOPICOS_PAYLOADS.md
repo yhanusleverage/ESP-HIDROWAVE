@@ -42,6 +42,8 @@ hidrowave/{device_id}/{recurso}
 | `.../dose` | ESP → broker | 1 | false | por nutriente | Bridge → `nutrient_dosages` |
 | `.../ph_operation` | ESP → broker | 0 | false | 12s activo / 30s idle | Bridge → `relay_master.ph_operation_*` |
 | `.../ph_dose` | ESP → broker | 1 | false | por corrección pH | Bridge → `ph_dosages` |
+| `.../command_ack` | ESP → broker | 1 | false | pós ACK | Bridge → `complete_relay_command` |
+| `.../rule_executed` | ESP → broker | 1 | false | pós DE local | Bridge → INSERT `relay_commands` completed |
 
 ### Last Will and Testament (LWT)
 
@@ -305,6 +307,39 @@ Espelhar semântica de `relay_commands`. **Fonte de verdade TypeScript:** `HIDRO
 Publicar **somente quando mudar** (após comando local, ESP-NOW ou remoto).
 
 **Cuidado:** não substituir ainda `relay_master` no Supabase sem política clara — na fase 2–3 MQTT é espelho; Supabase continua autoritativo para UI.
+
+### 3.4b Espejo DE local → `.../rule_executed`
+
+Publicar **após** actuar (nunca antes). Fire-and-forget; se MQTT offline, saltar (drop_ok v1).
+
+```json
+{
+  "v": 1,
+  "device_id": "ESP32_HIDRO_269844",
+  "ts": 1716490000,
+  "event_id": "DRENAJE_NIVEL-301000-3",
+  "rule_id": "DRENAJE_NIVEL",
+  "relay_index": 3,
+  "action": "on",
+  "current_state": true,
+  "success": true,
+  "duration_s": 0,
+  "slave_mac_address": "14:33:5C:38:BF:60"
+}
+```
+
+| Campo | Requerido | Notas |
+|-------|-----------|-------|
+| `event_id` | sí | Dedup bridge (`device_id:event_id`) |
+| `rule_id` | sí | ID regla DecisionEngine |
+| `relay_index` | sí | 0–15 |
+| `current_state` | sí | bool post-actuate |
+| `success` | no | default true |
+| `slave_mac_address` | slave | omitir si relé local |
+
+Bridge: INSERT `relay_commands` con `status=completed|failed`, `created_by=decision_engine_local#{rule_id}` (sin fila pending).
+
+Handoff: [HANDOFF_RULE_EXECUTED_MIRROR.md](../handoffs/HANDOFF_RULE_EXECUTED_MIRROR.md)
 
 ### 3.5 Estado Auto EC → `.../ec_operation`
 

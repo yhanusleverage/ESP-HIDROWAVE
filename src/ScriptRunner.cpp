@@ -15,6 +15,17 @@ void ScriptRunnerManager::clear() {
     scripts_.clear();
 }
 
+bool ScriptRunnerManager::removeByRuleId(const String& ruleId) {
+    for (auto it = scripts_.begin(); it != scripts_.end(); ++it) {
+        if (it->ruleId == ruleId) {
+            releaseProcedureGate(*it);
+            scripts_.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 void ScriptRunnerManager::engageProcedureGate(ActiveScript& script) {
     if (script.priority < TANK_SCRIPT_PRIORITY_THRESHOLD || script.procedureGateHeld) {
         return;
@@ -346,7 +357,7 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
             }
         }
         const bool on = (ins.action == "on" || ins.action == "toggle");
-        relayFn(relay, on, target, ins.durationMs);
+        relayFn(relay, on, target, ins.durationMs, script.priority);
         (*pc)++;
         return;
     }

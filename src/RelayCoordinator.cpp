@@ -22,6 +22,20 @@ const char* relayOwnerName(RelayOwner owner) {
     }
 }
 
+const char* relayDenyReasonName(RelayDenyReason reason) {
+    switch (reason) {
+        case RelayDenyReason::Ok: return "Ok";
+        case RelayDenyReason::BlockedBit: return "BlockedBit";
+        case RelayDenyReason::DilutionHold: return "DilutionHold";
+        case RelayDenyReason::CirculationConflict: return "CirculationConflict";
+        case RelayDenyReason::SlaveOffline: return "SlaveOffline";
+        case RelayDenyReason::WaterInterlock: return "WaterInterlock";
+        case RelayDenyReason::OwnerDenied: return "OwnerDenied";
+        case RelayDenyReason::InvalidTarget: return "InvalidTarget";
+        default: return "Unknown";
+    }
+}
+
 RelayTarget RelayTarget::local(int relayNumber) {
     RelayTarget target = {};
     target.isLocal = true;
@@ -53,10 +67,72 @@ RelayCoordinator::RelayCoordinator()
       circulationConfigured(false),
       circulationRelay(CIRCULATION_RELAY_DEFAULT),
       circulationOwner(RelayOwner::None),
-      circulationRefCount(0) {
+      circulationRefCount(0),
+      lastDenyReason_(RelayDenyReason::Ok),
+      waterInterlockEnabled_(false) {
     memset(circulationMac, 0, sizeof(circulationMac));
     memset(&localBank, 0, sizeof(localBank));
     memset(slaveBanks, 0, sizeof(slaveBanks));
+}
+
+bool RelayCoordinator::isAutomationOwner(RelayOwner owner) {
+    return owner == RelayOwner::DecisionRule ||
+           owner == RelayOwner::ScheduleP4 ||
+           owner == RelayOwner::TankScriptP1;
+}
+
+RelayDenyReason RelayCoordinator::mayExecute(
+    RelayOwner owner,
+    const RelayTarget& target,
+    RelayActuationAction action) const {
+    const bool turningOn = (action == RelayActuationAction::On || action == RelayActuationAction::Toggle);
+    const bool turningOff = (action == RelayActuationAction::Off);
+
+    if (target.relay < 0 || target.relay > 15) {
+        lastDenyReason_ = RelayDenyReason::InvalidTarget;
+        return lastDenyReason_;
+    }
+
+    if (owner == RelayOwner::Manual && turningOn && hydroControl &&
+        hydroControl->holdsDilutionValve(target.isLocal, target.slaveMac, target.relay)) {
+        lastDenyReason_ = RelayDenyReason::DilutionHold;
+        return lastDenyReason_;
+    }
+
+    const OccupancyBank* bank = target.isLocal ? &localBank : bankForMacConst(target.slaveMac);
+    if (bank && target.relay >= 0 && target.relay < 8) {
+        if (bitBlocked(bank, target.relay) && owner != RelayOwner::AutoEcDilution) {
+            lastDenyReason_ = RelayDenyReason::BlockedBit;
+            return lastDenyReason_;
+        }
+    }
+
+    if (isCirculationTarget(target)) {
+        if (turningOff && circulationRefCount > 0 &&
+            owner != RelayOwner::None &&
+            circulationOwner != RelayOwner::None &&
+            owner != circulationOwner) {
+            lastDenyReason_ = RelayDenyReason::CirculationConflict;
+            return lastDenyReason_;
+        }
+    }
+
+    if (!target.isLocal && isAutomationOwner(owner) && slaveReachableCb_) {
+        if (!slaveReachableCb_(target.slaveMac)) {
+            lastDenyReason_ = RelayDenyReason::SlaveOffline;
+            return lastDenyReason_;
+        }
+    }
+
+    if (waterInterlockEnabled_ && waterLevelOkCb_ && isAutomationOwner(owner) && turningOn) {
+        if (!waterLevelOkCb_()) {
+            lastDenyReason_ = RelayDenyReason::WaterInterlock;
+            return lastDenyReason_;
+        }
+    }
+
+    lastDenyReason_ = RelayDenyReason::Ok;
+    return lastDenyReason_;
 }
 
 void RelayCoordinator::begin(HydroControl* hydro, MasterSlaveManager* masterManagerPtr) {
@@ -101,6 +177,33 @@ void RelayCoordinator::setCirculationTarget(const uint8_t mac[6], int relayNumbe
     circulationConfigured = true;
     PreferencesManager::saveConfig(KEY_CIRC_MAC, ESPNowController::macToString(circulationMac));
     PreferencesManager::saveConfigInt(KEY_CIRC_RELAY, (int32_t)relayNumber);
+    Serial.printf("[COORD] Circulation target set: %s relay %d\n",
+        ESPNowController::macToString(circulationMac).c_str(),
+        circulationRelay + 1);
+}
+
+void RelayCoordinator::clearCirculationTarget() {
+    circulationConfigured = false;
+    memset(circulationMac, 0, sizeof(circulationMac));
+    circulationRelay = CIRCULATION_RELAY_DEFAULT;
+    PreferencesManager::removeConfig(KEY_CIRC_MAC);
+    PreferencesManager::removeConfig(KEY_CIRC_RELAY);
+    Serial.println("[COORD] Circulation target cleared");
+}
+
+CirculationMixGate RelayCoordinator::getCirculationMixGate() const {
+    if (!circulationConfigured) {
+        return CirculationMixGate::NotTyped;
+    }
+    const ObservedRelayState observed = getObservedState(getCirculationTarget());
+    if (!observed.valid || !observed.state) {
+        return CirculationMixGate::Inactive;
+    }
+    return CirculationMixGate::Ok;
+}
+
+bool RelayCoordinator::isCirculationMixActiveForDosing() const {
+    return getCirculationMixGate() == CirculationMixGate::Ok;
 }
 
 RelayTarget RelayCoordinator::getCirculationTarget() const {
@@ -161,24 +264,20 @@ ObservedRelayState RelayCoordinator::getObservedState(const RelayTarget& target)
         return observed;
     }
 
-    auto slaves = masterManager->getAllTrustedSlaves();
-    for (const auto& slave : slaves) {
-        if (!target.matchesMac(slave.macAddress)) {
-            continue;
-        }
-        if (target.relay < 0 || target.relay >= slave.numRelays || target.relay >= 8) {
-            return observed;
-        }
-        const auto& relay = slave.relayStates[target.relay];
-        observed.valid = true;
-        observed.state = relay.state;
-        observed.hasTimer = relay.hasTimer;
-        observed.remainingSec = relay.remainingTime;
-        observed.lastUpdateMs = relay.lastUpdate;
-        observed.online = slave.isOnline();
+    TrustedSlave* slave = masterManager->getTrustedSlave(target.slaveMac);
+    if (!slave) {
         return observed;
     }
-
+    if (target.relay < 0 || target.relay >= slave->numRelays || target.relay >= 8) {
+        return observed;
+    }
+    const auto& relay = slave->relayStates[target.relay];
+    observed.valid = true;
+    observed.state = relay.state;
+    observed.hasTimer = relay.hasTimer;
+    observed.remainingSec = relay.remainingTime;
+    observed.lastUpdateMs = relay.lastUpdate;
+    observed.online = slave->isOnline();
     return observed;
 }
 
@@ -273,18 +372,15 @@ uint32_t RelayCoordinator::requestActuation(
     const bool turningOn = (action == RelayActuationAction::On || action == RelayActuationAction::Toggle);
     const bool turningOff = (action == RelayActuationAction::Off);
 
-    if (owner == RelayOwner::Manual && hydroControl &&
-        hydroControl->holdsDilutionValve(target.isLocal, target.slaveMac, target.relay)) {
-        Serial.printf("[COORD] Manual denied — dilución activa R%d\n", target.relay + 1);
+    const RelayDenyReason deny = mayExecute(owner, target, action);
+    if (deny != RelayDenyReason::Ok) {
+        Serial.printf("[COORD] deny owner=%s reason=%s R%d\n",
+            relayOwnerName(owner), relayDenyReasonName(deny), target.relay + 1);
         return 0;
     }
 
     OccupancyBank* bank = target.isLocal ? &localBank : bankForMac(target.slaveMac, true);
     if (bank && target.relay >= 0 && target.relay < 8) {
-        if (bitBlocked(bank, target.relay) && owner != RelayOwner::AutoEcDilution) {
-            Serial.printf("[PROC] deny owner=%s R%d blocked\n", relayOwnerName(owner), target.relay + 1);
-            return 0;
-        }
         if (owner == RelayOwner::AutoEcDilution && turningOn) {
             bank->blockedBits |= (uint8_t)(1u << target.relay);
         }
@@ -293,18 +389,8 @@ uint32_t RelayCoordinator::requestActuation(
         }
     }
 
-    if (isCirculationTarget(target)) {
-        if (turningOff && circulationRefCount > 0 &&
-            owner != RelayOwner::None &&
-            circulationOwner != RelayOwner::None &&
-            owner != circulationOwner) {
-            Serial.printf("[COORD] OFF denied owner=%s holder=%s ref=%u\n",
-                relayOwnerName(owner), relayOwnerName(circulationOwner), circulationRefCount);
-            return 0;
-        }
-        if (turningOn && owner != RelayOwner::None) {
-            claimCirculationOwner(owner);
-        }
+    if (isCirculationTarget(target) && turningOn && owner != RelayOwner::None) {
+        claimCirculationOwner(owner);
     }
 
     String actionStr = turningOff ? "off" : "on";
@@ -452,8 +538,25 @@ void RelayCoordinator::noteObservedMask(const uint8_t mac[6], uint8_t bitsOn) {
 uint32_t RelayCoordinator::requestMask(RelayOwner owner, const uint8_t mac[6], uint8_t mask,
                                          uint16_t durationSec) {
     if (!masterManager || !mac) {
+        lastDenyReason_ = RelayDenyReason::InvalidTarget;
         return 0;
     }
+
+    if (isAutomationOwner(owner) && slaveReachableCb_ && !slaveReachableCb_(mac)) {
+        lastDenyReason_ = RelayDenyReason::SlaveOffline;
+        Serial.printf("[COORD] deny owner=%s reason=SlaveOffline mask=0x%02X\n",
+                      relayOwnerName(owner), mask);
+        return 0;
+    }
+    if (waterInterlockEnabled_ && waterLevelOkCb_ && isAutomationOwner(owner) && mask != 0) {
+        if (!waterLevelOkCb_()) {
+            lastDenyReason_ = RelayDenyReason::WaterInterlock;
+            Serial.printf("[COORD] deny owner=%s reason=WaterInterlock mask=0x%02X\n",
+                          relayOwnerName(owner), mask);
+            return 0;
+        }
+    }
+
     OccupancyBank* bank = bankForMac(mac, true);
     uint8_t blocked = bank ? bank->blockedBits : 0;
     uint8_t apply = mask & (uint8_t)~blocked;
@@ -462,9 +565,13 @@ uint32_t RelayCoordinator::requestMask(RelayOwner owner, const uint8_t mac[6], u
                       mask, apply, blocked, relayOwnerName(owner));
     }
     if (apply == 0 && mask != 0) {
-        Serial.println("[PROC] mask fully blocked");
+        lastDenyReason_ = RelayDenyReason::BlockedBit;
+        Serial.printf("[COORD] deny owner=%s reason=BlockedBit mask=0x%02X\n",
+                      relayOwnerName(owner), mask);
         return 0;
     }
+
+    lastDenyReason_ = RelayDenyReason::Ok;
     uint32_t id = masterManager->sendRelayMaskToSlave(mac, apply, durationSec, 0);
     if (id > 0 && bank) {
         bank->bitsOn = apply;

@@ -17,6 +17,10 @@ HydroControl::HydroControl()
     , pcf2_ok(false)
     , tankLevelOk(false)
     , levelInterlockMode(LEVEL_INTERLOCK_NORMAL)
+    , circulationMixOkCallback(nullptr)
+    , circulationMixOkCallbackUserData(nullptr)
+    , circulationMixStatusCallback(nullptr)
+    , circulationMixStatusCallbackUserData(nullptr)
     , ecController()  // ✅ Inicializar Controller KP
 {
     // Inicializa os estados dos relés
@@ -884,7 +888,24 @@ bool HydroControl::isAutoDosingPausedByInterlock() const {
     if (dilutionState != DILUTION_IDLE) {
         return true;
     }
-    return tankProcedureHoldCount > 0;
+    if (tankProcedureHoldCount > 0) {
+        return true;
+    }
+    if (getCirculationMixStatus() != 0) {
+        return true;
+    }
+    return false;
+}
+
+uint8_t HydroControl::getCirculationMixStatus() const {
+    if (circulationMixStatusCallback) {
+        return circulationMixStatusCallback(circulationMixStatusCallbackUserData);
+    }
+    if (circulationMixOkCallback &&
+        !circulationMixOkCallback(circulationMixOkCallbackUserData)) {
+        return 2;  // Inactive (legacy bool callback)
+    }
+    return 0;
 }
 
 void HydroControl::setTankProcedureActive(bool active) {
@@ -934,8 +955,15 @@ void HydroControl::checkAutoEC() {
             lastEcInterlockLog = nowMs;
             if (!tankLevelOk) {
                 Serial.println("⚠️ [AUTO EC] Pausado — nível de água baixo (water_level_ok=false)");
+            } else if (dilutionState != DILUTION_IDLE || tankProcedureHoldCount > 0) {
+                Serial.println("⚠️ [AUTO EC] Pausado — diluição/script tanque P1 activo");
             } else {
-                Serial.println("⚠️ [AUTO EC] Pausado — script tanque P1 activo");
+                const uint8_t circ = getCirculationMixStatus();
+                if (circ == 1) {
+                    Serial.println("⚠️ [AUTO EC] Pausado — bomba de circulação não tipada");
+                } else {
+                    Serial.println("⚠️ [AUTO EC] Pausado — recirculação inactiva (bomba OFF)");
+                }
             }
         }
         return;
@@ -2134,6 +2162,16 @@ void HydroControl::setPhysicalRecircCallback(PhysicalRecircCallback cb, void* us
     physicalRecircCallbackUserData = userData;
 }
 
+void HydroControl::setCirculationMixOkCallback(CirculationMixOkCallback cb, void* userData) {
+    circulationMixOkCallback = cb;
+    circulationMixOkCallbackUserData = userData;
+}
+
+void HydroControl::setCirculationMixStatusCallback(CirculationMixStatusCallback cb, void* userData) {
+    circulationMixStatusCallback = cb;
+    circulationMixStatusCallbackUserData = userData;
+}
+
 void HydroControl::setEcMetricCallback(EcMetricCallback cb, void* userData) {
     ecMetricCallback = cb;
     ecMetricCallbackUserData = userData;
@@ -2695,8 +2733,15 @@ void HydroControl::checkAutoPH() {
             lastPhInterlockLog = nowMs;
             if (!tankLevelOk) {
                 Serial.println("⚠️ [AUTO PH] Pausado — nível de água baixo (water_level_ok=false)");
+            } else if (dilutionState != DILUTION_IDLE || tankProcedureHoldCount > 0) {
+                Serial.println("⚠️ [AUTO PH] Pausado — diluição/script tanque P1 activo");
             } else {
-                Serial.println("⚠️ [AUTO PH] Pausado — script tanque P1 activo");
+                const uint8_t circ = getCirculationMixStatus();
+                if (circ == 1) {
+                    Serial.println("⚠️ [AUTO PH] Pausado — bomba de circulação não tipada");
+                } else {
+                    Serial.println("⚠️ [AUTO PH] Pausado — recirculação inactiva (bomba OFF)");
+                }
             }
         }
         return;
