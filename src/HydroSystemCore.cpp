@@ -236,6 +236,7 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     memset(pendingCloudAckQueue, 0, sizeof(pendingCloudAckQueue));
     memset(recentlyClosedSupabaseIds, 0, sizeof(recentlyClosedSupabaseIds));
     memset(recentlyClosedAtMs, 0, sizeof(recentlyClosedAtMs));
+    memset(pendingRuleAckSlots_, 0, sizeof(pendingRuleAckSlots_));
 #if ENABLE_MQTT
     memset(pendingRelayStateSlots_, 0, sizeof(pendingRelayStateSlots_));
     memset(lastPublishedRelayState_, 0, sizeof(lastPublishedRelayState_));
@@ -275,6 +276,9 @@ void HydroSystemCore::wireMasterManagerIntegration() {
 
         hydroControl.notifyDilutionRelayAck(commandId, success, currentState != 0);
 
+        const bool closedRuleTicket =
+            completePendingRuleAck(commandId, success, currentState != 0);
+
         // Batch SET_RELAY_MASK → ACK relé 255: bridge rejeita relay_index>15; fechar todos os tickets.
         if (relayNumber == 255 || relayNumber > 7) {
             if (success) {
@@ -291,7 +295,8 @@ void HydroSystemCore::wireMasterManagerIntegration() {
                                            currentState != 0, "failed");
 #endif
                 Serial.println("❌ [CALLBACK] Slave NACK — failed via MQTT (sin HTTPS)");
-            } else if (supabaseCommandId == 0 && !hydroControl.isDilutionAwaitingValve()) {
+            } else if (supabaseCommandId == 0 && !closedRuleTicket &&
+                       !hydroControl.isDilutionAwaitingValve()) {
                 Serial.println("⚠️ [CALLBACK] Mapeamento não encontrado para commandId=" + String(commandId));
             }
         }
@@ -572,6 +577,7 @@ void HydroSystemCore::initDecisionEngine() {
     decisionIntegration.setMasterManager(masterManager);
 #if ENABLE_MQTT && RULE_EXECUTED_MIRROR_ENABLED
     decisionEngine.setRuleExecutedMirrorCallback(&HydroSystemCore::onRuleExecutedMirrorStatic, this);
+    decisionEngine.setRuleAckTicketCallback(&HydroSystemCore::onRuleAckTicketStatic, this);
 #endif
     if (decisionEngine.begin() && decisionIntegration.begin()) {
         decisionEngineReady = true;
@@ -619,6 +625,12 @@ void HydroSystemCore::onRuleExecutedMirrorStatic(const RuleExecutedMirrorEvent& 
     }
 }
 
+void HydroSystemCore::onRuleAckTicketStatic(const RuleExecutedMirrorEvent& pending, void* userData) {
+    if (userData) {
+        static_cast<HydroSystemCore*>(userData)->registerPendingRuleAck(pending);
+    }
+}
+
 void HydroSystemCore::mirrorRuleExecuted(const RuleExecutedMirrorEvent& event) {
     if (!mqttClient.isConnected()) {
         Serial.println("[MQTT] rule_executed skipped (offline)");
@@ -631,9 +643,16 @@ void HydroSystemCore::mirrorRuleExecuted(const RuleExecutedMirrorEvent& event) {
         return;
     }
 
-    char eventId[64];
-    snprintf(eventId, sizeof(eventId), "%s-%lu-%d",
-             event.rule_id.c_str(), static_cast<unsigned long>(now), event.relay_index);
+    char eventId[72];
+    if (event.espnow_id > 0) {
+        snprintf(eventId, sizeof(eventId), "%s-%u-%d",
+                 event.rule_id.c_str(),
+                 static_cast<unsigned>(event.espnow_id),
+                 event.relay_index);
+    } else {
+        snprintf(eventId, sizeof(eventId), "%s-%lu-%d",
+                 event.rule_id.c_str(), static_cast<unsigned long>(now), event.relay_index);
+    }
 
     MqttRuleExecutedReading reading = {};
     reading.event_id = eventId;
@@ -650,6 +669,113 @@ void HydroSystemCore::mirrorRuleExecuted(const RuleExecutedMirrorEvent& event) {
     }
 }
 #endif
+
+void HydroSystemCore::registerPendingRuleAck(const RuleExecutedMirrorEvent& pending) {
+    if (pending.espnow_id == 0) {
+        return;
+    }
+
+    int freeIdx = -1;
+    int oldestIdx = 0;
+    unsigned long oldestSent = 0xFFFFFFFFUL;
+    for (size_t i = 0; i < PENDING_RULE_ACK_SLOTS; i++) {
+        PendingRuleAckSlot& s = pendingRuleAckSlots_[i];
+        if (s.open && s.espNowId == pending.espnow_id) {
+            freeIdx = static_cast<int>(i);
+            break;
+        }
+        if (!s.open && freeIdx < 0) {
+            freeIdx = static_cast<int>(i);
+        }
+        if (s.open && s.sentAtMs < oldestSent) {
+            oldestSent = s.sentAtMs;
+            oldestIdx = static_cast<int>(i);
+        }
+    }
+    if (freeIdx < 0) {
+        freeIdx = oldestIdx;
+        Serial.printf("[RULE-ACK] slot full — overwrite esp=%u\n",
+                      (unsigned)pendingRuleAckSlots_[freeIdx].espNowId);
+    }
+
+    PendingRuleAckSlot& slot = pendingRuleAckSlots_[freeIdx];
+    slot.open = true;
+    slot.espNowId = pending.espnow_id;
+    slot.relay_index = pending.relay_index;
+    slot.expectOn = pending.current_state;
+    slot.duration_sec = pending.duration_sec;
+    slot.sentAtMs = millis();
+    strncpy(slot.rule_id, pending.rule_id.c_str(), sizeof(slot.rule_id) - 1);
+    slot.rule_id[sizeof(slot.rule_id) - 1] = '\0';
+    strncpy(slot.action, pending.action.c_str(), sizeof(slot.action) - 1);
+    slot.action[sizeof(slot.action) - 1] = '\0';
+    strncpy(slot.slave_mac, pending.slave_mac.c_str(), sizeof(slot.slave_mac) - 1);
+    slot.slave_mac[sizeof(slot.slave_mac) - 1] = '\0';
+
+    Serial.printf("[RULE-ACK] pending id=%s esp=%u R%d\n",
+                  slot.rule_id, (unsigned)slot.espNowId, slot.relay_index);
+}
+
+bool HydroSystemCore::completePendingRuleAck(uint32_t espNowId, bool success, bool actualOn) {
+    if (espNowId == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < PENDING_RULE_ACK_SLOTS; i++) {
+        PendingRuleAckSlot& slot = pendingRuleAckSlots_[i];
+        if (!slot.open || slot.espNowId != espNowId) {
+            continue;
+        }
+        slot.open = false;
+        const unsigned long dt = millis() - slot.sentAtMs;
+        Serial.printf("[RULE-ACK] id=%s esp=%u ok=%d dt=%lums state=%s\n",
+                      slot.rule_id, (unsigned)espNowId, success ? 1 : 0,
+                      (unsigned long)dt, actualOn ? "ON" : "OFF");
+
+#if ENABLE_MQTT && RULE_EXECUTED_MIRROR_ENABLED
+        RuleExecutedMirrorEvent event;
+        event.rule_id = String(slot.rule_id);
+        event.relay_index = slot.relay_index;
+        event.action = String(slot.action);
+        event.current_state = actualOn;
+        event.success = success;
+        event.duration_sec = slot.duration_sec;
+        event.slave_mac = String(slot.slave_mac);
+        event.espnow_id = espNowId;
+        mirrorRuleExecuted(event);
+#endif
+        return true;
+    }
+    return false;
+}
+
+void HydroSystemCore::expirePendingRuleAcks() {
+    const unsigned long now = millis();
+    for (size_t i = 0; i < PENDING_RULE_ACK_SLOTS; i++) {
+        PendingRuleAckSlot& slot = pendingRuleAckSlots_[i];
+        if (!slot.open) {
+            continue;
+        }
+        if ((now - slot.sentAtMs) < PENDING_RULE_ACK_TTL_MS) {
+            continue;
+        }
+        slot.open = false;
+        Serial.printf("[RULE-ACK] id=%s esp=%u ok=0 dt=%lums reason=timeout\n",
+                      slot.rule_id, (unsigned)slot.espNowId,
+                      (unsigned long)(now - slot.sentAtMs));
+#if ENABLE_MQTT && RULE_EXECUTED_MIRROR_ENABLED
+        RuleExecutedMirrorEvent event;
+        event.rule_id = String(slot.rule_id);
+        event.relay_index = slot.relay_index;
+        event.action = String(slot.action);
+        event.current_state = slot.expectOn;
+        event.success = false;
+        event.duration_sec = slot.duration_sec;
+        event.slave_mac = String(slot.slave_mac);
+        event.espnow_id = slot.espNowId;
+        mirrorRuleExecuted(event);
+#endif
+    }
+}
 
 void HydroSystemCore::loop() {
     if (!systemReady) return;
@@ -878,6 +1004,7 @@ void HydroSystemCore::loop() {
             decisionEngine.loop();
             lastDecisionLoop = now;
         }
+        expirePendingRuleAcks();
     }
 
     // ===== ✅ VERIFICAR REGRAS DE AUTOMAÇÃO (30s) =====
@@ -1482,7 +1609,8 @@ void HydroSystemCore::processManualCommand(const RelayCommand& cmd, bool isSlave
             cmd.durationSeconds,
             cmd.id,
             cmd.cycleOffSeconds,
-            cmd.commandMode);
+            cmd.commandMode,
+            cmd.rule_id.length() > 0 ? cmd.rule_id.c_str() : nullptr);
         
         // ✅ CEREJA DO BOLO: Criar mapeamento IMEDIATAMENTE após enviar
         if (espNowCommandId > 0 && cmd.id > 0) {
@@ -1641,7 +1769,8 @@ bool HydroSystemCore::executeLocalRelayCommand(const RelayCommand& cmd) {
 
     const RelayOwner owner = resolveCommandOwner(cmd);
     bool success = relayCoordinator.actuateLocal(
-        owner, cmd.relayNumber, cmd.action, cmd.durationSeconds);
+        owner, cmd.relayNumber, cmd.action, cmd.durationSeconds,
+        cmd.rule_id.length() > 0 ? cmd.rule_id.c_str() : nullptr);
 
     if (success) {
         Serial.println("✅ Comando local executado com sucesso");
@@ -3818,6 +3947,8 @@ void HydroSystemCore::forceSlaveRelayMqttFullSync() {
         }
 
         masterManager->drainAllRelaysStatusWait();
+        Serial.printf("[PATH] owner=AutoSync action=status mac=%s\n",
+                      ESPNowController::macToString(macList[i]).c_str());
         Serial.printf("[AUTO-SYNC] request status mac=%s\n",
                       ESPNowController::macToString(macList[i]).c_str());
         masterManager->requestSlaveStatus(macList[i]);
@@ -4560,7 +4691,7 @@ void HydroSystemCore::releaseDecisionRuleActuators(const DecisionRule& rule) {
         if (target.isEmpty() || target.equalsIgnoreCase("local") ||
             target.equalsIgnoreCase("MASTER")) {
             const bool ok = relayCoordinator.actuateLocal(
-                RelayOwner::DecisionRule, action.target_relay, "off", 0);
+                RelayOwner::DecisionRule, action.target_relay, "off", 0, rule.id.c_str());
             Serial.printf("[RULE-OFF] local R%d rule=%s ok=%d\n",
                           action.target_relay, rule.id.c_str(), ok ? 1 : 0);
             continue;
@@ -4600,7 +4731,8 @@ void HydroSystemCore::releaseDecisionRuleActuators(const DecisionRule& rule) {
             continue;
         }
         const uint32_t cmdId = relayCoordinator.actuateSlave(
-            RelayOwner::DecisionRule, mac, action.target_relay, "off", 0);
+            RelayOwner::DecisionRule, mac, action.target_relay, "off", 0, 0, 0, "",
+            rule.id.c_str());
         Serial.printf("[RULE-OFF] slave R%d rule=%s cmd=%u\n",
                       action.target_relay, rule.id.c_str(),
                       static_cast<unsigned>(cmdId));

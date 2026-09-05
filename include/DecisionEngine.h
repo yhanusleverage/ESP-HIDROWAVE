@@ -182,7 +182,8 @@ struct SystemState {
 };
 
 /**
- * @brief Evento para espejo MQTT de ejecución DE local (post-actuate, fire-and-forget).
+ * @brief Evento para espejo MQTT de ejecución DE local.
+ * Remoto: se publica tras ACK (espnow_id > 0). Local: inmediato (espnow_id = 0).
  */
 struct RuleExecutedMirrorEvent {
     String rule_id;
@@ -192,6 +193,7 @@ struct RuleExecutedMirrorEvent {
     bool success;
     uint32_t duration_sec;
     String slave_mac;       // vacío = relé local master
+    uint32_t espnow_id;     // 0 = local / sin ticket radio
 };
 
 /**
@@ -285,6 +287,16 @@ public:
         rule_executed_mirror_user_data = user_data;
     }
 
+    /**
+     * Ticket ACK remoto: Core registra espnow_id y publica rule_executed al ACK/timeout.
+     * Si no hay callback, se mantiene espejo inmediato (legado).
+     */
+    typedef void (*RuleAckTicketCallback)(const RuleExecutedMirrorEvent& pending, void* user_data);
+    void setRuleAckTicketCallback(RuleAckTicketCallback callback, void* user_data) {
+        rule_ack_ticket_callback = callback;
+        rule_ack_ticket_user_data = user_data;
+    }
+
 private:
     // ===== CALLBACKS INTERNOS =====
     RelayControlCallback relay_control_callback;
@@ -298,6 +310,8 @@ private:
 
     RuleExecutedMirrorCallback rule_executed_mirror_callback;
     void* rule_executed_mirror_user_data;
+    RuleAckTicketCallback rule_ack_ticket_callback;
+    void* rule_ack_ticket_user_data;
     
     // ===== MÉTODOS INTERNOS =====
     bool parseRuleFromJSON(const JsonObject& json_rule, DecisionRule& rule);
@@ -321,7 +335,10 @@ private:
     bool executeRelayAction(const RuleAction& action, const String& rule_id,
                             RelayOwner owner = RelayOwner::DecisionRule);
     void notifyRuleExecutedMirror(const RuleAction& action, const String& rule_id, bool success,
-                                  const String& slave_mac);
+                                  const String& slave_mac, uint32_t espnow_id = 0);
+    /** Construye evento pendiente y pide ticket ACK al Core (remoto). */
+    void requestRuleAckTicket(const RuleAction& action, const String& rule_id,
+                              const String& slave_mac, uint32_t espnow_id);
     void executeSystemAlert(const RuleAction& action, const String& rule_id);
     void executeLogEvent(const RuleAction& action, const String& rule_id);
     

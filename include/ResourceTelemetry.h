@@ -4,9 +4,10 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <stdint.h>
 
 /**
- * Telemetría de contención Master: heap + stack HWM + loop/s.
+ * Telemetría de contención Master: heap + stack HWM + loop/s + reglas.
  * Sin task propia — tick desde HydroSystemCore::loop / registro de handle en main.
  * Ver docs/handoffs/firmware/ESP32_MASTER_RESOURCE_MAP.md
  */
@@ -21,6 +22,12 @@ void setEspNowTaskHandle(TaskHandle_t handle);
  */
 void setContext(bool mqttConnected, bool sslBusy, const char* dilPhase,
                 bool wifiConnected, int slavesOnline);
+
+/**
+ * Tras ejecutar una actuación de regla (DecisionEngine).
+ * deltaHeap = after - before (negativo = consumió RAM).
+ */
+void noteRuleFire(const char* ruleId, int32_t deltaHeap);
 
 /**
  * Cuenta un tick de loop y, si toca, imprime [RES].

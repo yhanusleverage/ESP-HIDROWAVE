@@ -14,8 +14,10 @@ enum class RelayOwner : uint8_t {
     AutoEcDilution,
     ScheduleP4,
     TankScriptP1,
-    Manual,
-    DecisionRule
+    Manual,          // UI / cloud manual
+    DecisionRule,
+    AutoSync,        // poll status ALL_RELAYS
+    Retry            // reenvío cola ESP-NOW
 };
 
 enum class RelayActuationAction : uint8_t {
@@ -112,14 +114,16 @@ public:
         uint32_t durationSec = 0,
         int supabaseCommandId = 0,
         int cycleOffSec = 0,
-        const String& commandMode = "");
+        const String& commandMode = "",
+        const char* pathRuleId = nullptr);
 
     bool releaseActuation(RelayOwner owner, const RelayTarget& target, bool tryOff = true);
 
     bool startPostDoseRecirc(RelayOwner owner);
     bool endPostDoseRecirc(RelayOwner owner);
 
-    bool actuateLocal(RelayOwner owner, int relay, const String& action, int durationSec);
+    bool actuateLocal(RelayOwner owner, int relay, const String& action, int durationSec,
+                      const char* pathRuleId = nullptr);
     uint32_t actuateSlave(
         RelayOwner owner,
         const uint8_t mac[6],
@@ -128,10 +132,12 @@ public:
         int durationSec,
         int supabaseCommandId = 0,
         int cycleOffSec = 0,
-        const String& commandMode = "");
+        const String& commandMode = "",
+        const char* pathRuleId = nullptr);
 
     /** Máscara atómica (on_all/off_all). Bits bloqueados se quitan. */
-    uint32_t requestMask(RelayOwner owner, const uint8_t mac[6], uint8_t mask, uint16_t durationSec = 0);
+    uint32_t requestMask(RelayOwner owner, const uint8_t mac[6], uint8_t mask,
+                         uint16_t durationSec = 0, const char* pathRuleId = nullptr);
     void noteObservedMask(const uint8_t mac[6], uint8_t bitsOn);
     uint8_t blockedMaskFor(const uint8_t mac[6]) const;
 
@@ -180,6 +186,11 @@ private:
 };
 
 const char* relayOwnerName(RelayOwner owner);
+/** Etiqueta corta para serial [PATH] (Manual → UI). */
+const char* pathOwnerLabel(RelayOwner owner);
 const char* relayDenyReasonName(RelayDenyReason reason);
+/** Una línea: [PATH] owner=… [rule=…] local|slave R0 on|off */
+void logRelayPath(RelayOwner owner, bool isLocal, int relayZeroBased, const char* action,
+                  const char* pathRuleId = nullptr);
 
 #endif

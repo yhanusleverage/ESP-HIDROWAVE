@@ -1,5 +1,6 @@
 #include "ResourceTelemetry.h"
 #include "Config.h"
+#include <string.h>
 
 #if RESOURCE_SERIAL_DEBUG
 
@@ -15,6 +16,11 @@ static bool wifiConnected_ = false;
 static int slavesOnline_ = 0;
 static const char* dilPhase_ = "n/a";
 
+static uint32_t rulesFireWindow_ = 0;
+static int32_t rulesHeapSumWindow_ = 0;
+static int32_t lastRuleDelta_ = 0;
+static char lastRuleId_[48] = "-";
+
 void setEspNowTaskHandle(TaskHandle_t handle) {
     espNowHandle_ = handle;
 }
@@ -27,6 +33,18 @@ void setContext(bool mqttConnected, bool sslBusy, const char* dilPhase,
     slavesOnline_ = slavesOnline < 0 ? 0 : slavesOnline;
     if (dilPhase != nullptr) {
         dilPhase_ = dilPhase;
+    }
+}
+
+void noteRuleFire(const char* ruleId, int32_t deltaHeap) {
+    rulesFireWindow_++;
+    rulesHeapSumWindow_ += deltaHeap;
+    lastRuleDelta_ = deltaHeap;
+    if (ruleId != nullptr && ruleId[0] != '\0') {
+        strncpy(lastRuleId_, ruleId, sizeof(lastRuleId_) - 1);
+        lastRuleId_[sizeof(lastRuleId_) - 1] = '\0';
+    } else {
+        strncpy(lastRuleId_, "?", sizeof(lastRuleId_) - 1);
     }
 }
 
@@ -59,7 +77,8 @@ void tick() {
 
     Serial.printf(
         "[RES] up=%lus heap=%u min=%u maxAlloc=%u loop/s≈%.0f loop_hwm=%u espnow_hwm=%u "
-        "wifi=%d mqtt=%d slaves=%d sslBusy=%d dil=%s\n",
+        "wifi=%d mqtt=%d slaves=%d sslBusy=%d dil=%s "
+        "rules_fire=%u rules_heap_sum=%ld last_rule=%s d_last=%ld\n",
         static_cast<unsigned long>(now / 1000UL),
         static_cast<unsigned>(ESP.getFreeHeap()),
         static_cast<unsigned>(ESP.getMinFreeHeap()),
@@ -71,10 +90,16 @@ void tick() {
         mqttConnected_ ? 1 : 0,
         slavesOnline_,
         sslBusy_ ? 1 : 0,
-        dilPhase_);
+        dilPhase_,
+        static_cast<unsigned>(rulesFireWindow_),
+        static_cast<long>(rulesHeapSumWindow_),
+        lastRuleId_,
+        static_cast<long>(lastRuleDelta_));
 
     windowStartMs_ = now;
     loopCount_ = 0;
+    rulesFireWindow_ = 0;
+    rulesHeapSumWindow_ = 0;
 }
 
 }  // namespace ResourceTelemetry
@@ -85,6 +110,7 @@ namespace ResourceTelemetry {
 
 void setEspNowTaskHandle(TaskHandle_t) {}
 void setContext(bool, bool, const char*, bool, int) {}
+void noteRuleFire(const char*, int32_t) {}
 void tick() {}
 
 }  // namespace ResourceTelemetry

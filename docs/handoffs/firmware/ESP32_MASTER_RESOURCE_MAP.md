@@ -61,7 +61,24 @@ AsyncTCP @ Core 1, stack 16 KB, prio 10           (mismo flag)
 
 ## Protocolo bancada A–D (checklist)
 
-Pegar del Serial Monitor **solo** líneas `[RES]` (+ opcional `[FLOW]` / `[SYNC]`) por fase.
+Pegar del Serial Monitor **solo** líneas `[RES]` (+ opcional `[FLOW]` / `[SYNC]` / `[RULE-HEAP]`) por fase.
+
+### Reglas → heap (DecisionEngine)
+
+Con `RESOURCE_SERIAL_DEBUG=1`:
+
+```text
+[RULE-HEAP] id=fn_recirculacao_continua act=on R0 before=91664 after=91568 d=-96 ok=1
+[RES] ... rules_fire=2 rules_heap_sum=-180 last_rule=fn_recirculacao_continua d_last=-96
+```
+
+| Campo | Uso |
+|-------|-----|
+| `d` / `d_last` | Delta heap (negativo = consumió); típ. &lt; 2 KB = regla barata |
+| `rules_fire` | Actuaciones DE en la ventana `[RES]` (~10 s) |
+| `last_rule` | Última `rule_id` que alimentó el sistema |
+
+Si `rules_fire=0` y el relé cambia → no fue DE (UI/MQTT/manual).
 
 ### Fase A — Baseline idle (30–60 s)
 

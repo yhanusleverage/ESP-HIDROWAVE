@@ -128,7 +128,8 @@ void DecisionEngineLoop::executeRule(const DecisionRule& rule) {
             // Comando remoto (Slave)
             if (relayCoordinator) {
                 success = relayCoordinator->actuateSlave(
-                    RelayOwner::DecisionRule, mac, rule.relay_number, rule.action, rule.duration) > 0;
+                    RelayOwner::DecisionRule, mac, rule.relay_number, rule.action, rule.duration,
+                    0, 0, "", rule.id.c_str()) > 0;
             } else {
                 success = masterManager->sendRelayCommandToSlave(
                     mac, rule.relay_number, rule.action, rule.duration, 0, true

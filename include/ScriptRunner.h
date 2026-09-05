@@ -105,6 +105,8 @@ private:
     bool evalCond(const ScriptInstr& cond, const SystemState& state);
     void runStep(ActiveScript& script, const SystemState& state, RelayFn relayFn);
     void engageProcedureGate(ActiveScript& script);
+    /** Pausa Auto EC/pH sin exigir priority >= 80 (instrucción block_auto). */
+    void holdAutoGate(ActiveScript& script);
     void releaseProcedureGate(ActiveScript& script);
 
     std::vector<ActiveScript> scripts_;

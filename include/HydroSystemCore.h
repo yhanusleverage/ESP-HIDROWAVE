@@ -190,6 +190,30 @@ private:
     void completePendingAcksForEspNowCommand(uint32_t espNowCommandId, const uint8_t* slaveMac,
                                              const char* via);
 
+    /** DE remoto: rule_executed diferido hasta ACK ESP-NOW (RAM fija, idempotente). */
+    static const size_t PENDING_RULE_ACK_SLOTS = 8;
+    static const unsigned long PENDING_RULE_ACK_TTL_MS = 6000UL;
+    struct PendingRuleAckSlot {
+        bool open;
+        uint32_t espNowId;
+        char rule_id[40];
+        char action[8];
+        char slave_mac[18];
+        int relay_index;
+        bool expectOn;
+        uint32_t duration_sec;
+        unsigned long sentAtMs;
+    };
+    PendingRuleAckSlot pendingRuleAckSlots_[PENDING_RULE_ACK_SLOTS];
+
+    void registerPendingRuleAck(const RuleExecutedMirrorEvent& pending);
+    /** @return true si había ticket DE para este espNowId. */
+    bool completePendingRuleAck(uint32_t espNowId, bool success, bool actualOn);
+    void expirePendingRuleAcks();
+#if ENABLE_MQTT && RULE_EXECUTED_MIRROR_ENABLED
+    static void onRuleAckTicketStatic(const RuleExecutedMirrorEvent& pending, void* userData);
+#endif
+
     /** Espera de ACK slave (fallback via ALL_RELAYS_STATUS) */
     struct PendingSlaveCommandAck {
         int supabaseCommandId;

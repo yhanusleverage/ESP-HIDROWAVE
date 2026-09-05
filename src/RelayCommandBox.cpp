@@ -139,7 +139,7 @@ bool RelayCommandBox::setRelayWithTimer(int relayNumber, bool state, int seconds
 
     stopCycle(relayNumber);
     
-    // Validar duração máxima
+    // Teto só se o comando pediu timer explícito (não aplica a duration=0 / permanente)
     if (seconds > DEFAULT_MAX_DURATION) {
         Serial.println("⚠️ Duração limitada a " + String(DEFAULT_MAX_DURATION) + " segundos");
         seconds = DEFAULT_MAX_DURATION;

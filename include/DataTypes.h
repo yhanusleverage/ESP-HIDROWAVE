@@ -5,42 +5,20 @@
 #include "Config.h"
 
 /**
- * @brief Configurações para cada relé
- * Define o comportamento e limites de cada relé
+ * @brief Configurações por relé (placeholders — o corte real é só o timer do comando).
+ * maxDuration/safetyLock NÃO inventam OFF em ON permanente (evita R0~3600s / R6~60s fantasmas).
+ * Política: durationSec==0 → permanente; durationSec>0 → countdown explícito.
  */
 struct RelayConfig {
-    bool autoMode;                       // Se true, permite controle automático baseado em sensores
-    uint32_t maxDuration;               // Duração máxima em segundos que o relé pode ficar ligado
-    bool safetyLock;                    // Se true, requer confirmação para operações críticas
+    bool autoMode;                       // Reservado (legado)
+    uint32_t maxDuration;               // Placeholder; não aplica corte automático
+    bool safetyLock;                    // Placeholder; não força timer
 
-    /**
-     * @brief Valida as configurações do relé
-     * @return true se a configuração é válida
-     */
     bool isValid() const {
-        // Verifica duração máxima (24 horas)
-        if (maxDuration > 86400) return false;
-        
-        // Duração mínima (1 segundo)
-        if (maxDuration < 1) return false;
-        
-        // Se modo automático está ativo, safetyLock deve estar ativo para relés críticos
-        if (autoMode && !safetyLock && maxDuration > 3600) return false;
-        
         return true;
     }
 
-    /**
-     * @brief Retorna uma mensagem de erro se a configuração for inválida
-     * @return String vazia se válido, ou mensagem de erro
-     */
     String getValidationError() const {
-        if (maxDuration > 86400) 
-            return "Duração máxima excede 24 horas";
-        if (maxDuration < 1) 
-            return "Duração mínima deve ser 1 segundo";
-        if (autoMode && !safetyLock && maxDuration > 3600)
-            return "Relés com duração > 1h precisam de trava de segurança no modo automático";
         return "";
     }
 };
@@ -57,16 +35,16 @@ static const char* const RELAY_NAMES[MAX_RELAYS] = {
     "Relé 7"
 };
 
-// Configurações padrão dos relés para 8 relés
+// Placeholders uniformes — duração vem só do comando (duration_s / timer UI).
 static const RelayConfig RELAY_CONFIGS[MAX_RELAYS] = {
-    {true, 3600, true},
-    {true, 43200, false},
-    {true, 7200, false},
-    {true, 3600, true},
-    {true, 300, true},
-    {true, 300, true},
-    {true, 60, false},
-    {true, 3600, true}
+    {false, 86400, false},
+    {false, 86400, false},
+    {false, 86400, false},
+    {false, 86400, false},
+    {false, 86400, false},
+    {false, 86400, false},
+    {false, 86400, false},
+    {false, 86400, false}
 };
 
 // Verificações em tempo de compilação

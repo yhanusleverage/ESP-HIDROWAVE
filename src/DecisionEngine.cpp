@@ -3,6 +3,7 @@
 #include "MasterSlaveManager.h"
 #include "RelayCoordinator.h"
 #include "ScriptRunner.h"
+#include "ResourceTelemetry.h"
 
 namespace {
 
@@ -62,6 +63,24 @@ bool evaluateWaterLevelCondition(const RuleCondition& condition, const SystemSta
     }
 }
 
+bool finishRuleActuation(const String& rule_id, const char* act, int relay,
+                         uint32_t heapBefore, bool ok) {
+    const uint32_t heapAfter = ESP.getFreeHeap();
+    const int32_t d = static_cast<int32_t>(heapAfter) - static_cast<int32_t>(heapBefore);
+    ResourceTelemetry::noteRuleFire(rule_id.c_str(), d);
+#if RESOURCE_SERIAL_DEBUG
+    Serial.printf("[RULE-HEAP] id=%s act=%s R%d before=%u after=%u d=%ld ok=%d\n",
+                  rule_id.c_str(),
+                  act != nullptr ? act : "?",
+                  relay,
+                  static_cast<unsigned>(heapBefore),
+                  static_cast<unsigned>(heapAfter),
+                  static_cast<long>(d),
+                  ok ? 1 : 0);
+#endif
+    return ok;
+}
+
 }  // namespace
 
 // ===== CONSTRUTOR E DESTRUTOR =====
@@ -75,7 +94,9 @@ DecisionEngine::DecisionEngine() :
     masterManager(nullptr),
     relayCoordinator(nullptr),
     rule_executed_mirror_callback(nullptr),
-    rule_executed_mirror_user_data(nullptr) {
+    rule_executed_mirror_user_data(nullptr),
+    rule_ack_ticket_callback(nullptr),
+    rule_ack_ticket_user_data(nullptr) {
 }
 
 DecisionEngine::~DecisionEngine() {
@@ -564,7 +585,8 @@ bool DecisionEngine::compareValues(float sensor_value, CompareOperator op, float
 }
 
 void DecisionEngine::notifyRuleExecutedMirror(const RuleAction& action, const String& rule_id,
-                                              bool success, const String& slave_mac) {
+                                              bool success, const String& slave_mac,
+                                              uint32_t espnow_id) {
     if (!rule_executed_mirror_callback) {
         return;
     }
@@ -575,6 +597,7 @@ void DecisionEngine::notifyRuleExecutedMirror(const RuleAction& action, const St
     event.success = success;
     event.duration_sec = static_cast<uint32_t>(action.duration_ms / 1000UL);
     event.slave_mac = slave_mac;
+    event.espnow_id = espnow_id;
 
     const bool state = (action.type == RELAY_ON || action.type == RELAY_PULSE);
     event.current_state = state;
@@ -585,6 +608,30 @@ void DecisionEngine::notifyRuleExecutedMirror(const RuleAction& action, const St
     }
 
     rule_executed_mirror_callback(event, rule_executed_mirror_user_data);
+}
+
+void DecisionEngine::requestRuleAckTicket(const RuleAction& action, const String& rule_id,
+                                          const String& slave_mac, uint32_t espnow_id) {
+    if (!rule_ack_ticket_callback || espnow_id == 0) {
+        notifyRuleExecutedMirror(action, rule_id, true, slave_mac, espnow_id);
+        return;
+    }
+
+    RuleExecutedMirrorEvent pending;
+    pending.rule_id = rule_id;
+    pending.relay_index = action.target_relay;
+    pending.success = true;
+    pending.duration_sec = static_cast<uint32_t>(action.duration_ms / 1000UL);
+    pending.slave_mac = slave_mac;
+    pending.espnow_id = espnow_id;
+    const bool state = (action.type == RELAY_ON || action.type == RELAY_PULSE);
+    pending.current_state = state;
+    if (action.type == RELAY_PULSE) {
+        pending.action = "toggle";
+    } else {
+        pending.action = state ? "on" : "off";
+    }
+    rule_ack_ticket_callback(pending, rule_ack_ticket_user_data);
 }
 
 String DecisionEngine::sanitizeDeviceIdOrMac(const String& raw) {
@@ -604,6 +651,7 @@ String DecisionEngine::sanitizeDeviceIdOrMac(const String& raw) {
 
 bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& rule_id,
                                         RelayOwner owner) {
+    const uint32_t heapBefore = ESP.getFreeHeap();
     bool state = (action.type == RELAY_ON || action.type == RELAY_PULSE);
     String actionStr = state ? "on" : "off";
     if (action.type == RELAY_PULSE) {
@@ -618,21 +666,22 @@ bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& 
                 owner,
                 action.target_relay,
                 actionStr,
-                (int)durationSec);
+                (int)durationSec,
+                rule_id.c_str());
             Serial.printf("⚡ [LOCAL/COORD] Relé %d: %s por %lu ms (regra: %s) owner=%s ok=%d\n",
                 action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str(),
                 relayOwnerName(owner), ok ? 1 : 0);
             notifyRuleExecutedMirror(action, rule_id, ok, "");
-            return ok;
+            return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, ok);
         } else if (relay_control_callback) {
             relay_control_callback(action.target_relay, state, action.duration_ms);
             Serial.printf("⚡ [LOCAL] Relé %d: %s por %lu ms (regra: %s)\n",
                 action.target_relay, state ? "ON" : "OFF", action.duration_ms, rule_id.c_str());
             notifyRuleExecutedMirror(action, rule_id, true, "");
-            return true;
+            return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, true);
         } else {
             notifyRuleExecutedMirror(action, rule_id, false, "");
-            return false;
+            return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, false);
         }
     }
 
@@ -640,14 +689,14 @@ bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& 
         Serial.printf("⚠️ [REMOTO] RelayCoordinator ausente — no bypass ESP-NOW (regra: %s device=%s)\n",
             rule_id.c_str(), targetId.c_str());
         notifyRuleExecutedMirror(action, rule_id, false, "");
-        return false;
+        return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, false);
     }
 
     if (!masterManager) {
         Serial.printf("⚠️ [REMOTO] MasterSlaveManager não disponível - device_id=%s relay=%d (regra: %s)\n",
             targetId.c_str(), action.target_relay, rule_id.c_str());
         notifyRuleExecutedMirror(action, rule_id, false, "");
-        return false;
+        return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, false);
     }
 
     uint8_t resolvedMac[6] = {0};
@@ -679,7 +728,7 @@ bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& 
         Serial.printf("⚠️ [REMOTO] Slave '%s' não encontrado (regra: %s)\n",
             targetId.c_str(), rule_id.c_str());
         notifyRuleExecutedMirror(action, rule_id, false, "");
-        return false;
+        return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, false);
     }
 
     const uint8_t* targetMac = resolvedMac;
@@ -688,25 +737,32 @@ bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& 
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
              targetMac[0], targetMac[1], targetMac[2], targetMac[3], targetMac[4], targetMac[5]);
 
-    const bool success = relayCoordinator->actuateSlave(
+    const uint32_t espNowId = relayCoordinator->actuateSlave(
         owner,
         targetMac,
         action.target_relay,
         actionStr,
-        (int)durationSec) > 0;
+        (int)durationSec,
+        0,
+        0,
+        "",
+        rule_id.c_str());
+    const bool success = espNowId > 0;
 
     if (success) {
-        Serial.printf("✅ [REMOTO] device_id=%s relay=%d: %s por %lu ms (regra: %s) owner=%s\n",
+        Serial.printf("✅ [REMOTO] device_id=%s relay=%d: %s por %lu ms (regra: %s) owner=%s esp=%u\n",
             targetId.c_str(), action.target_relay,
-            actionStr.c_str(), action.duration_ms, rule_id.c_str(), relayOwnerName(owner));
+            actionStr.c_str(), action.duration_ms, rule_id.c_str(), relayOwnerName(owner),
+            (unsigned)espNowId);
+        requestRuleAckTicket(action, rule_id, String(macStr), espNowId);
     } else {
         Serial.printf("❌ [REMOTO] Falha/deny - device_id=%s relay=%d (regra: %s) owner=%s reason=%s\n",
             targetId.c_str(), action.target_relay, rule_id.c_str(),
             relayOwnerName(owner),
             relayDenyReasonName(relayCoordinator->lastDenyReason()));
+        notifyRuleExecutedMirror(action, rule_id, false, String(macStr), 0);
     }
-    notifyRuleExecutedMirror(action, rule_id, success, String(macStr));
-    return success;
+    return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, success);
 }
 
 void DecisionEngine::executeSystemAlert(const RuleAction& action, const String& rule_id) {

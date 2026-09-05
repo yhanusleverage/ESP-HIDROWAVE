@@ -912,9 +912,9 @@ void HydroControl::setTankProcedureActive(bool active) {
     if (active) {
         tankProcedureHoldCount++;
         if (tankProcedureHoldCount == 1) {
-            Serial.printf(
-                "🔒 [INTERLOCK P1] Auto EC/pH pausados — procedimento tanque ativo (priority >= %d)\n",
-                TANK_SCRIPT_PRIORITY_THRESHOLD);
+            Serial.println(
+                "🔒 [INTERLOCK P1] Auto EC/pH pausados — procedimento de tanque ativo "
+                "(block_auto e/ou priority >= limiar)");
         }
         return;
     }
@@ -922,7 +922,7 @@ void HydroControl::setTankProcedureActive(bool active) {
         tankProcedureHoldCount--;
     }
     if (tankProcedureHoldCount == 0) {
-        Serial.println("🔓 [INTERLOCK P1] Auto EC/pH liberados — procedimento tanque terminou");
+        Serial.println("🔓 [INTERLOCK P1] Auto EC/pH liberados — procedimento de tanque terminou");
     }
 }
 

@@ -2118,6 +2118,14 @@ void MasterSlaveManager::processRetryQueue() {
             }
             Serial.printf("🔄 [RETRY] esp=%u %s try=%u/%u\n",
                           it->commandId, what, it->retryCount + 1, MAX_RELAY_RETRIES);
+            if (it->relayNumber == 255) {
+                Serial.printf("[PATH] owner=Retry slave mask=0x%02X esp=%u try=%u\n",
+                              it->relayMask, it->commandId, it->retryCount + 1);
+            } else {
+                Serial.printf("[PATH] owner=Retry slave R%d %s esp=%u try=%u\n",
+                              it->relayNumber, it->action.c_str(), it->commandId,
+                              it->retryCount + 1);
+            }
             
             bool success = false;
             if (it->relayNumber == 255) {

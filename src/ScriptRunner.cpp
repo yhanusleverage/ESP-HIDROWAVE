@@ -37,6 +37,20 @@ void ScriptRunnerManager::engageProcedureGate(ActiveScript& script) {
     tankGateCb_(true);
 }
 
+void ScriptRunnerManager::holdAutoGate(ActiveScript& script) {
+    if (script.procedureGateHeld) {
+        return;
+    }
+    if (!tankGateCb_) {
+        Serial.println("⚠️ [SCRIPT] block_auto — sin callback tank gate");
+        return;
+    }
+    script.procedureGateHeld = true;
+    tankGateCb_(true);
+    Serial.printf("🔒 [SCRIPT] block_auto rule=%s — Auto EC/pH pausados\n",
+                  script.ruleId.c_str());
+}
+
 void ScriptRunnerManager::releaseProcedureGate(ActiveScript& script) {
     if (!script.procedureGateHeld) {
         return;
@@ -45,6 +59,8 @@ void ScriptRunnerManager::releaseProcedureGate(ActiveScript& script) {
     if (tankGateCb_) {
         tankGateCb_(false);
     }
+    Serial.printf("🔓 [SCRIPT] unblock_auto/end rule=%s — Auto EC/pH liberados\n",
+                  script.ruleId.c_str());
 }
 
 bool ScriptRunnerManager::parseHHMM(const String& hhmm, int& outMin) {
@@ -151,6 +167,16 @@ bool ScriptRunnerManager::parseInstr(const JsonObject& j, ScriptInstr& out) {
     }
     if (out.type == "delay") {
         out.delayMs = j["duration_ms"] | j["delay_ms"] | 1000UL;
+        return true;
+    }
+    if (out.type == "block_auto" || out.type == "unblock_auto" ||
+        out.type == "pause_auto" || out.type == "resume_auto") {
+        // Aliases: pause_auto≡block_auto, resume_auto≡unblock_auto
+        if (out.type == "pause_auto") {
+            out.type = "block_auto";
+        } else if (out.type == "resume_auto") {
+            out.type = "unblock_auto";
+        }
         return true;
     }
     if (out.type == "wait_liters") {
@@ -327,6 +353,18 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
     }
 
     const ScriptInstr& ins = (*seq)[*pc];
+
+    if (ins.type == "block_auto") {
+        holdAutoGate(script);
+        (*pc)++;
+        return;
+    }
+
+    if (ins.type == "unblock_auto") {
+        releaseProcedureGate(script);
+        (*pc)++;
+        return;
+    }
 
     if (ins.type == "while") {
         engageProcedureGate(script);

@@ -99,9 +99,11 @@ void DiagWebServer::setupAPIEndpoints() {
             relay["id"] = i;
             relay["name"] = RELAY_NAMES[i];
             relay["state"] = relayStates[i];
-            relay["config"]["auto_mode"] = RELAY_CONFIGS[i].autoMode;
-            relay["config"]["max_duration"] = RELAY_CONFIGS[i].maxDuration;
-            relay["config"]["safety_lock"] = RELAY_CONFIGS[i].safetyLock;
+            // Sem techos fantasma por relé: corte = só duration_s do comando.
+            relay["config"]["timer_policy"] = "command_only";
+            relay["config"]["auto_mode"] = false;
+            relay["config"]["max_duration"] = 0;  // 0 = sem maxDuration automático
+            relay["config"]["safety_lock"] = false;
         }
         
         String response;

@@ -18,7 +18,29 @@ const char* relayOwnerName(RelayOwner owner) {
         case RelayOwner::TankScriptP1: return "TankScriptP1";
         case RelayOwner::Manual: return "Manual";
         case RelayOwner::DecisionRule: return "DecisionRule";
+        case RelayOwner::AutoSync: return "AutoSync";
+        case RelayOwner::Retry: return "Retry";
         default: return "None";
+    }
+}
+
+const char* pathOwnerLabel(RelayOwner owner) {
+    if (owner == RelayOwner::Manual) {
+        return "UI";
+    }
+    return relayOwnerName(owner);
+}
+
+void logRelayPath(RelayOwner owner, bool isLocal, int relayZeroBased, const char* action,
+                  const char* pathRuleId) {
+    const char* act = action && action[0] ? action : "?";
+    if (pathRuleId && pathRuleId[0]) {
+        Serial.printf("[PATH] owner=%s rule=%s %s R%d %s\n",
+                      pathOwnerLabel(owner), pathRuleId, isLocal ? "local" : "slave",
+                      relayZeroBased, act);
+    } else {
+        Serial.printf("[PATH] owner=%s %s R%d %s\n",
+                      pathOwnerLabel(owner), isLocal ? "local" : "slave", relayZeroBased, act);
     }
 }
 
@@ -368,7 +390,8 @@ uint32_t RelayCoordinator::requestActuation(
     uint32_t durationSec,
     int supabaseCommandId,
     int cycleOffSec,
-    const String& commandMode) {
+    const String& commandMode,
+    const char* pathRuleId) {
     const bool turningOn = (action == RelayActuationAction::On || action == RelayActuationAction::Toggle);
     const bool turningOff = (action == RelayActuationAction::Off);
 
@@ -410,6 +433,7 @@ uint32_t RelayCoordinator::requestActuation(
     }
 
     if (ok) {
+        logRelayPath(owner, target.isLocal, target.relay, actionStr.c_str(), pathRuleId);
         Serial.printf("[COORD] %s %s relay %d owner=%s dur=%lus\n",
             target.isLocal ? "LOCAL" : "SLAVE",
             actionStr.c_str(),
@@ -449,7 +473,8 @@ bool RelayCoordinator::endPostDoseRecirc(RelayOwner owner) {
     return releaseActuation(owner, target, true);
 }
 
-bool RelayCoordinator::actuateLocal(RelayOwner owner, int relay, const String& action, int durationSec) {
+bool RelayCoordinator::actuateLocal(RelayOwner owner, int relay, const String& action, int durationSec,
+                                    const char* pathRuleId) {
     RelayTarget target = RelayTarget::local(relay);
     RelayActuationAction act = RelayActuationAction::Toggle;
     if (action == "on") {
@@ -457,7 +482,7 @@ bool RelayCoordinator::actuateLocal(RelayOwner owner, int relay, const String& a
     } else if (action == "off") {
         act = RelayActuationAction::Off;
     }
-    return requestActuation(owner, target, act, (uint32_t)durationSec, 0) > 0;
+    return requestActuation(owner, target, act, (uint32_t)durationSec, 0, 0, "", pathRuleId) > 0;
 }
 
 uint32_t RelayCoordinator::actuateSlave(
@@ -468,7 +493,8 @@ uint32_t RelayCoordinator::actuateSlave(
     int durationSec,
     int supabaseCommandId,
     int cycleOffSec,
-    const String& commandMode) {
+    const String& commandMode,
+    const char* pathRuleId) {
     RelayTarget target = RelayTarget::remote(mac, relay);
     RelayActuationAction act = RelayActuationAction::Toggle;
     if (action == "on" || action == "timed_on") {
@@ -477,7 +503,7 @@ uint32_t RelayCoordinator::actuateSlave(
         act = RelayActuationAction::Off;
     }
     return requestActuation(owner, target, act, (uint32_t)durationSec, supabaseCommandId, cycleOffSec,
-                            commandMode);
+                            commandMode, pathRuleId);
 }
 
 RelayCoordinator::OccupancyBank* RelayCoordinator::bankForMac(const uint8_t mac[6], bool create) {
@@ -536,7 +562,7 @@ void RelayCoordinator::noteObservedMask(const uint8_t mac[6], uint8_t bitsOn) {
 }
 
 uint32_t RelayCoordinator::requestMask(RelayOwner owner, const uint8_t mac[6], uint8_t mask,
-                                         uint16_t durationSec) {
+                                         uint16_t durationSec, const char* pathRuleId) {
     if (!masterManager || !mac) {
         lastDenyReason_ = RelayDenyReason::InvalidTarget;
         return 0;
@@ -580,6 +606,14 @@ uint32_t RelayCoordinator::requestMask(RelayOwner owner, const uint8_t mac[6], u
             if (apply & (1u << i)) {
                 bank->owners[i] = owner;
             }
+        }
+    }
+    if (id > 0) {
+        if (pathRuleId && pathRuleId[0]) {
+            Serial.printf("[PATH] owner=%s rule=%s slave mask=0x%02X\n",
+                          pathOwnerLabel(owner), pathRuleId, apply);
+        } else {
+            Serial.printf("[PATH] owner=%s slave mask=0x%02X\n", pathOwnerLabel(owner), apply);
         }
     }
     Serial.printf("[PROC] owner=%s mask=0x%02X deny=0x%02X id=%u\n",
