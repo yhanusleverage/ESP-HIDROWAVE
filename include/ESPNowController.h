@@ -44,7 +44,8 @@ enum class MessageType : uint8_t {
     ALL_RELAYS_STATUS = 0x0E,   // slave → Master: estado real 8 relés
     SET_RELAY_MASK = 0x0F,       // Master → slave: máscara atómica (contrato SLAVE)
     CHANNEL_CHANGE = 0x10,       // Master → slave: novo canal operativo
-    PERSISTENT_STATE_SYNC = 0x11 // NVS persistente (não usar 0x0F)
+    PERSISTENT_STATE_SYNC = 0x11, // NVS persistente (não usar 0x0F)
+    WIFI_CREDENTIALS_ACK = 0x12  // slave → Master: creds OK (ainda no ch CONFIG)
 };
 
 /**
@@ -302,6 +303,9 @@ public:
      */
     bool sendWiFiCredentialsBroadcast(const String& ssid, const String& password, uint8_t channel = 0);
 
+    /** Unicast creds (redundância no burst CONFIG; sem heap extra) */
+    bool sendWiFiCredentialsTo(const uint8_t* targetMac, const String& ssid, const String& password, uint8_t channel = 0);
+
     /**
      * @brief Salta temporariamente para um canal WiFi (sem desconectar STA)
      */
@@ -323,6 +327,15 @@ public:
      * @return true se credenciais são válidas
      */
     bool validateWiFiCredentials(const WiFiCredentialsData& credentials);
+
+    /** Provisioning handshake: slave ACK de creds no ch CONFIG */
+    bool sendWifiCredentialsAck(const uint8_t* masterMac, uint8_t opChannel, uint8_t status = 1);
+    static void clearWifiCredentialsAckFlag();
+    static bool takeWifiCredentialsAckFlag();
+    static void noteWifiCredentialsAck(uint8_t opChannel);
+    /** true se algum ACK de creds chegou neste boot (latched) */
+    static bool hasWifiCredentialsAckLatched();
+    static void clearWifiCredentialsAckLatched();
     
     /**
      * @brief Inicia handshake bidirecional com dispositivo

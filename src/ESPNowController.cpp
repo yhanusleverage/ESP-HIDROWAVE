@@ -518,92 +518,86 @@ bool ESPNowController::sendDiscoveryBroadcast() {
 #endif
 }
 
+bool ESPNowController::sendWiFiCredentialsTo(const uint8_t* targetMac, const String& ssid, const String& password, uint8_t channel) {
+    if (!initialized || !targetMac) return false;
+
+    if (ssid.length() == 0 || ssid.length() > 32) {
+        return false;
+    }
+    if (password.length() > 63) {
+        return false;
+    }
+
+    WiFiCredentialsData creds;
+    strncpy(creds.ssid, ssid.c_str(), sizeof(creds.ssid) - 1);
+    creds.ssid[sizeof(creds.ssid) - 1] = '\0';
+    strncpy(creds.password, password.c_str(), sizeof(creds.password) - 1);
+    creds.password[sizeof(creds.password) - 1] = '\0';
+
+    if (channel > 0) {
+        creds.channel = channel;
+    } else {
+        wifi_second_chan_t secondChan;
+        esp_wifi_get_channel(&creds.channel, &secondChan);
+    }
+    creds.calculateChecksum();
+    if (!creds.isValid()) {
+        return false;
+    }
+
+    static const uint8_t kBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    const bool isBcast = (memcmp(targetMac, kBroadcast, 6) == 0);
+    if (!isBcast) {
+        addPeerSafe(targetMac, "creds-uni");
+    }
+
+    ESPNowMessage message = {};
+    message.type = MessageType::WIFI_CREDENTIALS;
+    getLocalMac(message.senderId);
+    memcpy(message.targetId, targetMac, 6);
+    message.messageId = ++messageCounter;
+    message.timestamp = millis();
+    message.dataSize = sizeof(WiFiCredentialsData);
+    memcpy(message.data, &creds, sizeof(WiFiCredentialsData));
+    message.checksum = calculateChecksum(message);
+
+    return sendMessage(message, targetMac);
+}
+
 bool ESPNowController::sendWiFiCredentialsBroadcast(const String& ssid, const String& password, uint8_t channel) {
     if (!initialized) return false;
     
     Serial.println("\n📢 === ENVIANDO CREDENCIAIS WiFi EM BROADCAST ===");
     
-    // Validar SSID
     if (ssid.length() == 0 || ssid.length() > 32) {
         Serial.println("❌ SSID inválido (deve ter 1-32 caracteres)");
         return false;
     }
-    
-    // Validar senha
     if (password.length() > 63) {
         Serial.println("❌ Senha inválida (máximo 63 caracteres)");
         return false;
     }
-    
-    // Criar estrutura de credenciais
-    WiFiCredentialsData creds;
-    
-    // Copiar SSID
-    strncpy(creds.ssid, ssid.c_str(), sizeof(creds.ssid) - 1);
-    creds.ssid[sizeof(creds.ssid) - 1] = '\0';
-    
-    // Copiar senha
-    strncpy(creds.password, password.c_str(), sizeof(creds.password) - 1);
-    creds.password[sizeof(creds.password) - 1] = '\0';
-    
-    // Obter canal WiFi
-    if (channel > 0) {
-        creds.channel = channel;  // Usar canal fornecido
-        Serial.println("📶 Usando canal fornecido: " + String(channel));
-    } else {
-        // Obter canal atual do WiFi
-        wifi_second_chan_t secondChan;
-        esp_wifi_get_channel(&creds.channel, &secondChan);
-        Serial.println("📶 Usando canal atual: " + String(creds.channel));
-    }
-    
-    // Calcular checksum
-    creds.calculateChecksum();
-    
-    // Debug
+
+    uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    Serial.println("📶 Usando canal fornecido: " + String(channel > 0 ? channel : wifiChannel));
     Serial.println("📤 Dados a enviar:");
     Serial.println("   SSID: " + ssid);
     Serial.print("   Senha: ");
     for (size_t i = 0; i < password.length(); i++) Serial.print("*");
     Serial.println();
-    Serial.println("   Canal: " + String(creds.channel));
-    Serial.println("   Tamanho: " + String(sizeof(creds)) + " bytes");
-    Serial.println("   Checksum: 0x" + String(creds.checksum, HEX));
+    Serial.println("   Canal: " + String(channel));
     Serial.println("   Alcance: TODOS os dispositivos");
-    
-    // Validar antes de enviar
-    if (!creds.isValid()) {
-        Serial.println("❌ Erro: Checksum inválido antes de enviar!");
-        return false;
-    }
-    
-    // Criar mensagem ESP-NOW
-    ESPNowMessage message = {};
-    message.type = MessageType::WIFI_CREDENTIALS;
-    
-    // Configurar sender (local)
-    getLocalMac(message.senderId);
-    
-    // Configurar target (broadcast)
-    uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    memcpy(message.targetId, broadcastMac, 6);
-    
-    // Configurar dados
-    message.dataSize = sizeof(WiFiCredentialsData);
-    memcpy(message.data, &creds, sizeof(WiFiCredentialsData));
-    
-    // Enviar mensagem
-    bool success = sendMessage(message, broadcastMac);
+
+    bool success = sendWiFiCredentialsTo(broadcastMac, ssid, password, channel);
     
     if (success) {
         Serial.println("✅ Credenciais enviadas em broadcast com sucesso!");
         Serial.println("================================================\n");
         return true;
-    } else {
-        Serial.println("❌ Falha ao enviar credenciais via ESP-NOW");
-        Serial.println("================================================\n");
-        return false;
     }
+    Serial.println("❌ Falha ao enviar credenciais via ESP-NOW");
+    Serial.println("================================================\n");
+    return false;
 }
 
 bool ESPNowController::hopToChannel(uint8_t channel) {
@@ -1422,6 +1416,23 @@ void ESPNowController::processReceivedMessage(const ESPNowMessage& message, cons
             }
             break;
         }
+
+        case MessageType::WIFI_CREDENTIALS_ACK: {
+            uint8_t opCh = 0;
+            uint8_t st = 0;
+            if (message.dataSize >= 2) {
+                opCh = message.data[0];
+                st = message.data[1];
+            }
+            Serial.printf("[CREDS-ACK] ← %s op=%u status=%u\n",
+                          macToString(senderMac).c_str(),
+                          static_cast<unsigned>(opCh),
+                          static_cast<unsigned>(st));
+            if (st != 0) {
+                noteWifiCredentialsAck(opCh);
+            }
+            break;
+        }
         
         case MessageType::HANDSHAKE_REQUEST: {
             if (message.dataSize >= sizeof(HandshakeData)) {
@@ -2015,6 +2026,70 @@ bool ESPNowController::validateWiFiCredentials(const WiFiCredentialsData& creden
     Serial.println("   SSID: " + String(credentials.ssid));
     Serial.println("   Canal: " + String(credentials.channel));
     return true;
+}
+
+namespace {
+volatile bool s_wifiCredsAckFlag = false;
+volatile bool s_wifiCredsAckLatched = false;
+volatile uint8_t s_wifiCredsAckOp = 0;
+}
+
+void ESPNowController::clearWifiCredentialsAckFlag() {
+    s_wifiCredsAckFlag = false;
+    s_wifiCredsAckOp = 0;
+}
+
+bool ESPNowController::takeWifiCredentialsAckFlag() {
+    if (!s_wifiCredsAckFlag) {
+        return false;
+    }
+    s_wifiCredsAckFlag = false;
+    return true;
+}
+
+void ESPNowController::noteWifiCredentialsAck(uint8_t opChannel) {
+    s_wifiCredsAckOp = opChannel;
+    s_wifiCredsAckFlag = true;
+    s_wifiCredsAckLatched = true;
+}
+
+bool ESPNowController::hasWifiCredentialsAckLatched() {
+    return s_wifiCredsAckLatched;
+}
+
+void ESPNowController::clearWifiCredentialsAckLatched() {
+    s_wifiCredsAckLatched = false;
+}
+
+bool ESPNowController::sendWifiCredentialsAck(const uint8_t* masterMac, uint8_t opChannel, uint8_t status) {
+    if (!initialized || !masterMac) {
+        return false;
+    }
+    addPeerSafe(masterMac, "Master-creds");
+
+    ESPNowMessage message = {};
+    message.type = MessageType::WIFI_CREDENTIALS_ACK;
+    WiFi.macAddress(message.senderId);
+    memcpy(message.targetId, masterMac, 6);
+    message.messageId = ++messageCounter;
+    message.timestamp = millis();
+    uint8_t payload[2] = { opChannel, status };
+    message.dataSize = 2;
+    memcpy(message.data, payload, 2);
+    message.checksum = calculateChecksum(message);
+
+    bool ok = false;
+    for (int i = 0; i < 3; ++i) {
+        if (sendMessage(message, masterMac)) {
+            ok = true;
+        }
+        delay(40);
+    }
+    Serial.printf("[CREDS-ACK] → master op=%u status=%u ok=%d\n",
+                  static_cast<unsigned>(opChannel),
+                  static_cast<unsigned>(status),
+                  ok ? 1 : 0);
+    return ok;
 }
 
 // Mantido para uso em handshakes (não usado para credenciais WiFi)

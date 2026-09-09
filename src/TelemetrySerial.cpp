@@ -20,10 +20,14 @@ void printTelemetrySerialLine(const MqttTelemetryReading& reading) {
     } else {
         Serial.print("--");
     }
-    Serial.printf(" | Temp ar: %.1f C | Umidade: %.0f%% | Nivel: %s (L1-%s L4-%s)\n",
+    const char* wl = reading.waterLevel ? reading.waterLevel : "?";
+    const char* tag =
+        reading.levelsSimulated ? " [SIM]" : (!reading.levelsOnline ? " [PCF-OFF]" : "");
+    Serial.printf(" | Temp ar: %.1f C | Umidade: %.0f%% | Nivel: %s (L1-%s L4-%s)%s\n",
         reading.airTemperature,
         reading.humidity,
-        reading.waterLevel ? reading.waterLevel : "?",
+        wl,
         reading.level1Wet ? "ON" : "OFF",
-        reading.level4Wet ? "ON" : "OFF");
+        reading.level4Wet ? "ON" : "OFF",
+        tag);
 }

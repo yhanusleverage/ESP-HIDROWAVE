@@ -319,8 +319,26 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
     size_t* pc = &script.pc;
 
     if (script.inBody && !script.whileStack.empty()) {
-        auto& frame = script.whileStack.back();
+        const auto& frame = script.whileStack.back();
+        if (frame.whilePc >= script.instructions.size()) {
+            Serial.printf("⚠️ [SCRIPT] whilePc OOB rule=%s — abort script\n", script.ruleId.c_str());
+            script.whileStack.clear();
+            script.inBody = false;
+            script.bodyPc = 0;
+            script.pc = script.instructions.size();  // não reentrar em loop
+            releaseProcedureGate(script);
+            return;
+        }
         const ScriptInstr& whileInstr = script.instructions[frame.whilePc];
+        if (whileInstr.type != "while") {
+            Serial.printf("⚠️ [SCRIPT] whilePc não é while rule=%s — abort script\n", script.ruleId.c_str());
+            script.whileStack.clear();
+            script.inBody = false;
+            script.bodyPc = 0;
+            script.pc = script.instructions.size();
+            releaseProcedureGate(script);
+            return;
+        }
         seq = &whileInstr.body;
         pc = &script.bodyPc;
     }
@@ -328,20 +346,37 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
     if (*pc >= seq->size()) {
         if (script.inBody && !script.whileStack.empty()) {
             auto& frame = script.whileStack.back();
+            if (frame.whilePc >= script.instructions.size()) {
+                script.whileStack.clear();
+                script.inBody = false;
+                script.bodyPc = 0;
+                return;
+            }
             const ScriptInstr& whileInstr = script.instructions[frame.whilePc];
             frame.iterations++;
             if (whileInstr.maxIterations > 0 && frame.iterations >= whileInstr.maxIterations) {
                 script.whileStack.pop_back();
                 script.inBody = false;
                 script.bodyPc = 0;
-                (*pc)++;
+                script.pc = frame.whilePc + 1;
+                return;
+            }
+            // Cap de segurança: evita loop infinito sem delay (LoadProhibited / WDT)
+            if (whileInstr.maxIterations <= 0 && frame.iterations >= 500) {
+                Serial.printf("⚠️ [SCRIPT] while sem max_iterations >500 — abort rule=%s\n",
+                              script.ruleId.c_str());
+                script.whileStack.pop_back();
+                script.inBody = false;
+                script.bodyPc = 0;
+                script.pc = frame.whilePc + 1;
+                releaseProcedureGate(script);
                 return;
             }
             if (!evalCond(whileInstr, state)) {
                 script.whileStack.pop_back();
                 script.inBody = false;
                 script.bodyPc = 0;
-                (*pc)++;
+                script.pc = frame.whilePc + 1;
                 return;
             }
             script.bodyPc = 0;
@@ -367,6 +402,12 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
     }
 
     if (ins.type == "while") {
+        if (script.whileStack.size() >= 4) {
+            Serial.printf("⚠️ [SCRIPT] while aninhado demais rule=%s — skip\n",
+                          script.ruleId.c_str());
+            (*pc)++;
+            return;
+        }
         engageProcedureGate(script);
         if (!evalCond(ins, state)) {
             (*pc)++;
@@ -394,8 +435,16 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
                 return;
             }
         }
+        if (relay < 0 || relay > 7) {
+            Serial.printf("⚠️ [SCRIPT] relay=%d fora 0-7 rule=%s — skip\n",
+                          relay, script.ruleId.c_str());
+            (*pc)++;
+            return;
+        }
         const bool on = (ins.action == "on" || ins.action == "toggle");
-        relayFn(relay, on, target, ins.durationMs, script.priority);
+        if (relayFn) {
+            relayFn(relay, on, target, ins.durationMs, script.priority, script.ruleId);
+        }
         (*pc)++;
         return;
     }
@@ -417,9 +466,9 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
             script.waitLitersTarget = ins.liters;
             Serial.printf("⏳ [SCRIPT] wait_liters target=%.2f L\n", script.waitLitersTarget);
         }
-        const float L = flowLitersCb_ ? flowLitersCb_() : 0.0f;
-        if (L + 0.05f >= script.waitLitersTarget) {
-            Serial.printf("✅ [SCRIPT] wait_liters done (%.2f L)\n", L);
+        float liters = flowLitersCb_ ? flowLitersCb_() : 0.0f;
+        if (liters + 0.05f >= script.waitLitersTarget) {
+            Serial.printf("✅ [SCRIPT] wait_liters done (%.2f L)\n", liters);
             script.waitLitersArmed = false;
             script.waitLitersTarget = 0.0f;
             (*pc)++;
@@ -430,8 +479,6 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
     if (ins.type == "wait_level") {
         engageProcedureGate(script);
         if (evalCond(ins, state)) {
-            Serial.printf("✅ [SCRIPT] wait_level %s %s %s\n",
-                          ins.sensor.c_str(), ins.op.c_str(), ins.value.c_str());
             (*pc)++;
         }
         return;
@@ -445,7 +492,7 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
                 sec = defaultRecircSecCb_();
             }
             if (sec == 0) {
-                sec = 60UL;
+                sec = 60;
             }
             if (recircCb_) {
                 recircCb_(true);
@@ -463,6 +510,9 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
         return;
     }
 
+    // Tipo desconhecido — avançar para não travar
+    Serial.printf("⚠️ [SCRIPT] instr tipo desconhecido '%s' rule=%s — skip\n",
+                  ins.type.c_str(), script.ruleId.c_str());
     (*pc)++;
 }
 

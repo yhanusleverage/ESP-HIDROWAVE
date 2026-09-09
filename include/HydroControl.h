@@ -15,7 +15,6 @@
 #include "PHSensor.h"
 #endif
 #include "EcAnalogSensor.h"
-#include "LevelSensor.h"
 #include "DiscreteLevelBank.h"
 #include "Controller.h"  // ✅ Controller KP para controle automático de EC
 #include "EcDilutionController.h"
@@ -198,6 +197,17 @@ public:
     bool isLevelWet(int levelIndex) const;
     const char* getWaterLevelAggregate() const;
     bool isDiscreteLevelBankActive() const { return levelBank.isAvailable(); }
+    /** PCF niveles online (I2C). false = no inventar L1–L4. */
+    bool isLevelPcfOnline() const { return pcf1_ok && levelBank.isAvailable(); }
+    /** true solo con HIDRO_SIMULATE_WATER_LEVELS=1 (compile). Offline ≠ simulated. */
+    bool areLevelsCompileSimulated() const {
+#if HIDRO_SIMULATE_WATER_LEVELS
+        return true;
+#else
+        return false;
+#endif
+    }
+    uint8_t getLevelPcfAddress() const { return levelPcfAddress; }
     
     // Getters para leituras dos sensores
     float& getTemperature() { return temperature; }
@@ -378,13 +388,23 @@ private:
     phSensor* pHSensor;
 #endif
     EcAnalogSensor* ecSensor;
-    LevelSensor* tankSensor;
     DiscreteLevelBank levelBank;
     
     // Status dos PCF8574
     bool pcf1_ok;
     bool pcf2_ok;
+    uint8_t levelPcfAddress;  // addr real del PCF niveles (scan; excluye 0x24 relés)
+    unsigned long lastLevelPcfRetryMs;
     bool writeLocalPumpPin(int relay, bool logicalOn);
+
+    /** Scan 0x20–0x27 / 0x38–0x3F (salta ADDR_2 relés). Paridad 4level_sensors. */
+    bool discoverAndBindLevelPcf();
+    bool tryBindLevelPcf(uint8_t address);
+    void maybeRetryLevelPcf();
+    /** Poll L1-L4 cada LEVEL_POLL_MS (antes de Modbus/EC). */
+    void pollDiscreteLevels();
+    void refreshTankLevelOkFromAggregate();
+    void loadLevelInterlockModeFromNVS();
     
     // Status dos sensores
     bool sensorsOk;
@@ -580,10 +600,6 @@ private:
     
     // Funções internas
     void updateSensors();
-    /** Poll L1-L4 cada LEVEL_POLL_MS (antes de Modbus/EC). */
-    void pollDiscreteLevels();
-    void refreshTankLevelOkFromAggregate();
-    void loadLevelInterlockModeFromNVS();
     void checkRelayTimers();
     void checkAutoEC();
     void checkAutoPH();  // ✅ Verificar e ajustar pH automaticamente

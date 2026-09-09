@@ -3,6 +3,7 @@
 #include "PreferencesManager.h"
 #include "Config.h"
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include "MASTER_CONFIG.h"
 #include "ObjectPoolManager.h"  // ✅ Object Pool Pattern
 #include <Preferences.h>
@@ -379,13 +380,19 @@ void MasterSlaveManager::refreshEspNowPeersOnCurrentChannel() {
         return;
     }
 
-    uint8_t channel = WiFi.channel();
+    // STA down (provisioning ch11): WiFi.channel() inválido — usar radio actual
+    uint8_t channel = 0;
+    wifi_second_chan_t secondChan;
+    esp_wifi_get_channel(&channel, &secondChan);
     if (channel < 1 || channel > 13) {
-        Serial.println("⚠️ Refresh peers: canal STA inválido");
+        channel = WiFi.channel();
+    }
+    if (channel < 1 || channel > 13) {
+        Serial.println("⚠️ Refresh peers: canal rádio inválido");
         return;
     }
 
-    Serial.printf("🔄 Re-add ESP-NOW peers no canal STA %u (sem deinit)\n", channel);
+    Serial.printf("🔄 Re-add ESP-NOW peers no canal rádio %u (sem deinit)\n", channel);
 
     uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     espNowController->removePeer(broadcastMac);
@@ -397,7 +404,9 @@ void MasterSlaveManager::refreshEspNowPeersOnCurrentChannel() {
         Serial.printf("   peer %s → ch %u\n",
                       ESPNowController::macToString(slave.macAddress).c_str(), channel);
     });
-    saveEspNowLastChannel(channel);
+    if (channel != ESPNOW_CONFIG_CHANNEL) {
+        saveEspNowLastChannel(channel);
+    }
 }
 
 void MasterSlaveManager::saveEspNowLastChannel(uint8_t channel) {
@@ -415,19 +424,53 @@ void MasterSlaveManager::runProvisioningIfNeeded() {
     if (!initialized || !espNowController) {
         return;
     }
-
-    static unsigned long lastBurstMs = 0;
-    static const unsigned long bootMs = millis();
-    const unsigned long now = millis();
-
-    if (now - bootMs > ESPNOW_PROVISIONING_BURST_MS) {
+    if (EspNowChannelPolicy::isProvisioningStaSuspendActive()) {
         return;
     }
 
-    const int trusted = getTrustedSlaveCount();
-    const int online = getOnlineSlaveCount();
-    if (trusted > 0 && online >= trusted) {
+    static unsigned long lastBurstMs = 0;
+    static unsigned long lastRescueMs = 0;
+    static const unsigned long bootMs = millis();
+    const unsigned long now = millis();
+
+    const bool inBootWindow = (now - bootMs) <= ESPNOW_PROVISIONING_BURST_MS;
+
+    // Handshake OK neste boot: não reenviar creds (Slave já sync — re-burst derruba link)
+    if (ESPNowController::hasWifiCredentialsAckLatched() && inBootWindow) {
         return;
+    }
+
+    if (!inBootWindow) {
+#if ESPNOW_LOST_SLAVE_RESCUE_AFTER_MS > 0
+        if (lastRescueMs != 0 &&
+            (now - lastRescueMs) < ESPNOW_LOST_SLAVE_RESCUE_COOLDOWN_MS) {
+            return;
+        }
+        bool needRescue = false;
+        forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (needRescue) return;
+            if (!isSlaveReachable(slave) ||
+                slave.lastSeen == 0 ||
+                (now - slave.lastSeen) >= ESPNOW_LOST_SLAVE_RESCUE_AFTER_MS) {
+                needRescue = true;
+            }
+        });
+        if (!needRescue) {
+            return;
+        }
+        // Só 1 burst; limpar latch para permitir este rescue
+        Serial.println("[PROV] lost-slave rescue — 1 burst CONFIG");
+        lastRescueMs = now;
+        ESPNowController::clearWifiCredentialsAckLatched();
+#else
+        return;
+#endif
+    } else {
+        const int trusted = getTrustedSlaveCount();
+        const int online = getOnlineSlaveCount();
+        if (trusted > 0 && online >= trusted && ESPNowController::hasWifiCredentialsAckLatched()) {
+            return;
+        }
     }
 
     if (lastBurstMs != 0 && (now - lastBurstMs) < 4000UL) {
@@ -445,7 +488,8 @@ void MasterSlaveManager::runProvisioningIfNeeded() {
     uint8_t opChannel = ESPNOW_CHANNEL;
     if (WiFi.isConnected()) {
         opChannel = WiFi.channel();
-    } else if (storedChannel >= 1 && storedChannel <= 13) {
+    } else if (storedChannel >= 1 && storedChannel <= 13 &&
+               storedChannel != ESPNOW_CONFIG_CHANNEL) {
         opChannel = storedChannel;
     }
 
@@ -563,6 +607,24 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
                                                      int cycleOffDuration, const String& commandMode) {
     // ✅ MUDANÇA 1: Retornar 0 em vez de false (compatível: 0 = false, >0 = true)
     if (!initialized || !espNowController) return 0;
+
+    // Não comandar durante STA suspend (Master em ch11) nem antes do sync op pós-provisioning.
+    if (EspNowChannelPolicy::isProvisioningStaSuspendActive()) {
+        uint32_t commandId = generateCommandId();
+        addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, false,
+                        cycleOffDuration, commandMode);
+        Serial.println("⏸️ [PROV] comando enfileirado (STA suspend CONFIG)");
+        return commandId;
+    }
+    if (EspNowChannelPolicy::isProvisioningWindowActive() &&
+        !ESPNowController::hasWifiCredentialsAckLatched()) {
+        // Ainda na janela de boot sem ACK: evitar ON no canal partido
+        uint32_t commandId = generateCommandId();
+        addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, false,
+                        cycleOffDuration, commandMode);
+        Serial.println("⏸️ [PROV] comando enfileirado (aguardando creds-ack/op)");
+        return commandId;
+    }
     
     TrustedSlave* slave = nullptr;
     if (!lookupTrustedSlave(macAddress, &slave)) {

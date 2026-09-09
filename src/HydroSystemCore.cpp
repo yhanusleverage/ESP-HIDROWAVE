@@ -337,6 +337,7 @@ void HydroSystemCore::wireMasterManagerIntegration() {
 
     masterManager->setAllRelaysSnapshotCallback([this](const uint8_t* mac, const bool states[8], uint8_t numRelays) {
         reconcilePendingSlaveAcks(mac, states, numRelays);
+        reconcilePendingRuleAcksFromSnapshot(mac, states, numRelays);
         if (hydroControl.isDilutionAwaitingValve() && mac && states) {
             const uint8_t n = numRelays > 8 ? 8 : numRelays;
             for (uint8_t i = 0; i < n; i++) {
@@ -599,7 +600,8 @@ void HydroSystemCore::wireRelayCoordinatorPolicyCallbacks() {
         }
         return masterManager->isSlaveReachable(*slave);
     });
-    // Water interlock default off (hook preparado; no romper bancada).
+    // Water interlock default off: agua solo frena Auto EC/pH (HydroControl),
+    // no recirculación/reglas vía Coord (evita deny global a DecisionRule/Schedule).
     relayCoordinator.setWaterLevelOkCallback(
         [this]() -> bool {
             return hydroControl.isWaterLevelOk();
@@ -1230,6 +1232,8 @@ void HydroSystemCore::printSensorReadings() {
     reading.interlockMode = hydroControl.getLevelInterlockModeName();
     reading.circulationTyped = relayCoordinator.isCirculationConfigured();
     reading.circulationMixOk = relayCoordinator.isCirculationMixActiveForDosing();
+    reading.levelsSimulated = hydroControl.areLevelsCompileSimulated();
+    reading.levelsOnline = hydroControl.isLevelPcfOnline();
     reading.airTemperature = NAN;
     reading.humidity = NAN;
     printTelemetrySerialLine(reading);
@@ -1851,6 +1855,8 @@ void HydroSystemCore::publishMqttTelemetry() {
     reading.interlockMode = hydroControl.getLevelInterlockModeName();
     reading.circulationTyped = relayCoordinator.isCirculationConfigured();
     reading.circulationMixOk = relayCoordinator.isCirculationMixActiveForDosing();
+    reading.levelsSimulated = hydroControl.areLevelsCompileSimulated();
+    reading.levelsOnline = hydroControl.isLevelPcfOnline();
     // Sin DHT cableado: no enviar ambiente simulado (evita environment_data basura)
     reading.airTemperature = NAN;
     reading.humidity = NAN;
@@ -1876,11 +1882,8 @@ void HydroSystemCore::publishMqttLevels() {
     reading.interlockMode = hydroControl.getLevelInterlockModeName();
     reading.circulationTyped = relayCoordinator.isCirculationConfigured();
     reading.circulationMixOk = relayCoordinator.isCirculationMixActiveForDosing();
-#if HIDRO_SIMULATE_WATER_LEVELS
-    reading.levelsSimulated = true;
-#else
-    reading.levelsSimulated = false;
-#endif
+    reading.levelsSimulated = hydroControl.areLevelsCompileSimulated();
+    reading.levelsOnline = hydroControl.isLevelPcfOnline();
     if (mqttClient.publishLevels(reading)) {
         notifyCloudSend();
         lastMqttLevelsPublishMs = millis();
@@ -2812,7 +2815,7 @@ void HydroSystemCore::syncAllRelayStatesToSupabase() {
             masterManager->drainAllRelaysStatusWait();
             masterManager->requestSlaveStatus(macPtr);
             touchLastForceRfPollMs(macPtr, now);
-            const bool gotStatus = masterManager->waitForAllRelaysStatus(800);
+            const bool gotStatus = masterManager->waitForAllRelaysStatus(ALL_RELAYS_WAIT_MS);
             esp_task_wdt_reset();
 
             TrustedSlave* slave = masterManager->getTrustedSlave(macPtr);
@@ -3812,6 +3815,38 @@ void HydroSystemCore::reconcilePendingSlaveAcks(const uint8_t* slaveMac, const b
     }
 }
 
+void HydroSystemCore::reconcilePendingRuleAcksFromSnapshot(const uint8_t* slaveMac,
+                                                           const bool relayStates[8],
+                                                           uint8_t numRelays) {
+    if (!slaveMac || !relayStates || numRelays == 0) {
+        return;
+    }
+
+    const String macStr = ESPNowController::macToString(slaveMac);
+    const uint8_t n = numRelays > 8 ? 8 : numRelays;
+
+    for (size_t i = 0; i < PENDING_RULE_ACK_SLOTS; i++) {
+        PendingRuleAckSlot& slot = pendingRuleAckSlots_[i];
+        if (!slot.open || slot.espNowId == 0) {
+            continue;
+        }
+        if (slot.relay_index < 0 || static_cast<uint8_t>(slot.relay_index) >= n) {
+            continue;
+        }
+        if (macStr.length() == 0 || !macStr.equalsIgnoreCase(slot.slave_mac)) {
+            continue;
+        }
+        const bool actualOn = relayStates[slot.relay_index];
+        if (actualOn != slot.expectOn) {
+            continue;
+        }
+        Serial.printf("[RULE-ACK] fallback ALL_RELAYS id=%s esp=%u R%d state=%s\n",
+                      slot.rule_id, (unsigned)slot.espNowId, slot.relay_index,
+                      actualOn ? "ON" : "OFF");
+        completePendingRuleAck(slot.espNowId, true, actualOn);
+    }
+}
+
 // ✅ NOVO: Função auxiliar para atualizar relay_slaves após ACK
 void HydroSystemCore::updateRelaySlaveState(const String& slaveDeviceId, 
                                             const uint8_t* slaveMac, 
@@ -3952,7 +3987,7 @@ void HydroSystemCore::forceSlaveRelayMqttFullSync() {
         Serial.printf("[AUTO-SYNC] request status mac=%s\n",
                       ESPNowController::macToString(macList[i]).c_str());
         masterManager->requestSlaveStatus(macList[i]);
-        const bool gotStatus = masterManager->waitForAllRelaysStatus(800);
+        const bool gotStatus = masterManager->waitForAllRelaysStatus(ALL_RELAYS_WAIT_MS);
         esp_task_wdt_reset();
 
         if (gotStatus) {

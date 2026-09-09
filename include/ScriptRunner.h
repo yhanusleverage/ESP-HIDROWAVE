@@ -63,7 +63,8 @@ struct ActiveScript {
 class ScriptRunnerManager {
 public:
     using RelayFn = std::function<void(int relay, bool on, const String& targetDeviceId,
-                                       unsigned long durationMs, int priority)>;
+                                       unsigned long durationMs, int priority,
+                                       const String& ruleId)>;
     /** true = procedimento tanque activo; false = terminó. */
     using TankGateFn = std::function<void(bool active)>;
     using FlowResetFn = std::function<void()>;

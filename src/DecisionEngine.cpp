@@ -148,10 +148,16 @@ void DecisionEngine::loop() {
 
     ScriptRunnerManager::instance().tickAll(current_state,
         [this](int relay, bool on, const String& targetDeviceId, unsigned long durationMs,
-               int priority) {
+               int priority, const String& ruleId) {
             if (dry_run_mode) {
-                Serial.printf("🧪 [SCRIPT DRY-RUN] relay=%d %s device=%s %lu ms pri=%d\n",
-                    relay, on ? "ON" : "OFF", targetDeviceId.c_str(), durationMs, priority);
+                Serial.printf("🧪 [SCRIPT DRY-RUN] rule=%s relay=%d %s device=%s %lu ms pri=%d\n",
+                    ruleId.c_str(), relay, on ? "ON" : "OFF", targetDeviceId.c_str(),
+                    durationMs, priority);
+                return;
+            }
+            if (relay < 0 || relay >= MAX_RELAYS) {
+                Serial.printf("⚠️ [SCRIPT] relay=%d inválido (regra=%s) — skip\n",
+                              relay, ruleId.c_str());
                 return;
             }
             RuleAction action;
@@ -162,7 +168,8 @@ void DecisionEngine::loop() {
             const RelayOwner owner = (priority >= TANK_SCRIPT_PRIORITY_THRESHOLD)
                 ? RelayOwner::TankScriptP1
                 : RelayOwner::DecisionRule;
-            executeRelayAction(action, "script", owner);
+            const String rid = ruleId.length() > 0 ? ruleId : String("script");
+            executeRelayAction(action, rid, owner);
         });
 }
 
@@ -241,6 +248,11 @@ bool DecisionEngine::saveRulesToFile(const String& filename) {
     for (const auto& rule : rules) {
         JsonObject rule_json = rules_array.createNestedObject();
         ruleToJSON(rule, rule_json, doc);
+    }
+
+    if (doc.overflowed()) {
+        Serial.println("❌ [DE] saveRulesToFile: JSON overflow — aumente JSON_BUFFER_SIZE");
+        return false;
     }
     
     File file = SPIFFS.open(filename, "w");
@@ -661,6 +673,12 @@ bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& 
     const String targetId = sanitizeDeviceIdOrMac(action.target_device_id);
 
     if (targetId.isEmpty() || targetId.equalsIgnoreCase("local") || targetId.equalsIgnoreCase("MASTER")) {
+        if (action.target_relay < 0 || action.target_relay >= MAX_RELAYS) {
+            Serial.printf("⚠️ [LOCAL] Relé %d inválido (regra: %s)\n",
+                          action.target_relay, rule_id.c_str());
+            notifyRuleExecutedMirror(action, rule_id, false, "");
+            return finishRuleActuation(rule_id, actionStr.c_str(), action.target_relay, heapBefore, false);
+        }
         if (relayCoordinator) {
             const bool ok = relayCoordinator->actuateLocal(
                 owner,
@@ -736,6 +754,14 @@ bool DecisionEngine::executeRelayAction(const RuleAction& action, const String& 
     char macStr[18];
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
              targetMac[0], targetMac[1], targetMac[2], targetMac[3], targetMac[4], targetMac[5]);
+
+    // Seed tipagem NVS a partir da regra de recirculação (SAFETY precisa de circ_slave_mac)
+    if (relayCoordinator && !relayCoordinator->isCirculationConfigured() &&
+        (rule_id == "fn_recirculacao_continua" || rule_id == "fn_circulation")) {
+        relayCoordinator->setCirculationTarget(targetMac, action.target_relay);
+        Serial.printf("[CIRC] tipagem seeded from rule %s → %s R%d\n",
+                      rule_id.c_str(), macStr, action.target_relay);
+    }
 
     const uint32_t espNowId = relayCoordinator->actuateSlave(
         owner,
@@ -1264,11 +1290,18 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
     }
 
     rule.has_script = false;
+    rule.script_json = "";
+    rule.procedure_triggers_json = "";
     JsonObject scriptObj = rule_body["script"].as<JsonObject>();
     if (!scriptObj.isNull() && scriptObj.containsKey("instructions")) {
         JsonArray scriptInstr = scriptObj["instructions"].as<JsonArray>();
         if (!scriptInstr.isNull() && scriptInstr.size() > 0) {
             rule.has_script = true;
+            {
+                String scriptBlob;
+                serializeJson(scriptObj, scriptBlob);
+                rule.script_json = scriptBlob;
+            }
             rule.condition.type = TIME_WINDOW;
             rule.condition.sensor_name = "time_window";
             if (rule.trigger_type.isEmpty()) {
@@ -1281,6 +1314,11 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
                 triggers = rule_body["procedure_triggers"];
             } else if (rule_body.containsKey("triggers")) {
                 triggers = rule_body["triggers"];
+            }
+            if (!triggers.isNull()) {
+                String trigBlob;
+                serializeJson(triggers, trigBlob);
+                rule.procedure_triggers_json = trigBlob;
             }
             ScriptRunnerManager::instance().loadFromRuleJson(
                 rule.id, rule.priority, rule_body, triggers);
@@ -1328,6 +1366,15 @@ void DecisionEngine::ruleToJSON(const DecisionRule& rule, JsonObject& out, JsonD
             JsonObject safety_cond = safety_json.createNestedObject("condition");
             conditionToJSON(safety.condition, safety_cond, doc);
         }
+    }
+
+    // Persistir script sequencial (senão DRENO some no reboot / regrava SPIFFS)
+    if (rule.has_script && rule.script_json.length() > 0) {
+        // serialized() injeta JSON cru como objeto (evita cópia frágil entre docs)
+        out["script"] = serialized(rule.script_json.c_str());
+    }
+    if (rule.procedure_triggers_json.length() > 0) {
+        out["procedure_triggers"] = serialized(rule.procedure_triggers_json.c_str());
     }
 }
 

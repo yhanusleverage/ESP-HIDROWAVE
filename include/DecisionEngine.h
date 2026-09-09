@@ -130,6 +130,10 @@ struct DecisionRule {
     unsigned long hour_reset_time;
     bool currently_active;
     bool has_script;
+    /** JSON do objeto script (instruções) — persistido no SPIFFS. */
+    String script_json;
+    /** JSON opcional de triggers do procedimento. */
+    String procedure_triggers_json;
     
     DecisionRule() : enabled(true), priority(50), trigger_interval_ms(30000),
                     cooldown_ms(0), max_executions_per_hour(0),
@@ -216,7 +220,8 @@ private:
     
     // Configurações
     static const size_t MAX_RULES = 50;
-    static const size_t JSON_BUFFER_SIZE = 8192;
+    /** Regras + scripts sequenciais (DRENO etc.) — 8K truncava e corrompia. */
+    static const size_t JSON_BUFFER_SIZE = 32768;
     static const unsigned long DEFAULT_EVALUATION_INTERVAL = 5000; // 5s
     
 public:

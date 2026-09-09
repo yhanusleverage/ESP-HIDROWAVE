@@ -228,10 +228,24 @@
 #define ESPNOW_PROVISIONING_STA_SUSPEND 1
 #endif
 #ifndef ESPNOW_PROVISIONING_STA_SUSPEND_MS
-#define ESPNOW_PROVISIONING_STA_SUSPEND_MS 4000UL
+#define ESPNOW_PROVISIONING_STA_SUSPEND_MS 7000UL
 #endif
 #ifndef ESPNOW_PROVISIONING_WIFI_RECONNECT_MS
 #define ESPNOW_PROVISIONING_WIFI_RECONNECT_MS 8000UL
+#endif
+/** Espera WIFI_CREDENTIALS_ACK do slave no ch CONFIG antes de voltar ao op */
+#ifndef ESPNOW_CREDS_ACK_WAIT_MS
+#define ESPNOW_CREDS_ACK_WAIT_MS 2000UL
+#endif
+/**
+ * Contrato: slave encontra Master no CONFIG (ch11); canal op vem nas creds.
+ * Após boot: rescue raro se Slave trusted offline (1 burst + cooldown).
+ */
+#ifndef ESPNOW_LOST_SLAVE_RESCUE_AFTER_MS
+#define ESPNOW_LOST_SLAVE_RESCUE_AFTER_MS 90000UL
+#endif
+#ifndef ESPNOW_LOST_SLAVE_RESCUE_COOLDOWN_MS
+#define ESPNOW_LOST_SLAVE_RESCUE_COOLDOWN_MS 300000UL
 #endif
 /** 1 = log PING/PONG e peer repetido; 0 = só eventos novos/erros */
 #ifndef ESPNOW_LINK_VERBOSE
@@ -310,9 +324,7 @@
 // #define TDS_RX_PIN 36
 // #define TDS_TX_PIN 17
 #define TEMP_PIN 4                     // Legacy DS18 — OBSOLETO; pin = YF-B5 (FLOW_SENSOR_PIN)
-// Legacy GPIO nivel — NO usar con RS485 (32=DE/RE, 33=EC); niveles vía PCF8574 P0-P3
-#define TANK_LOW_PIN 32
-#define TANK_HIGH_PIN 33
+// GPIO 32 = PH_RS485_DE_RE; GPIO 33 = EC analog — NO usar para niveles
 
 #ifndef USE_PH_MODBUS_SENSOR
 #define USE_PH_MODBUS_SENSOR 1
@@ -327,13 +339,12 @@
 
 // ===== 4 SONDAS NPN VIA PCF8574 #1 (P0-P3) =====
 #define LEVEL_DEBOUNCE_MS 300
-#define LEVEL_POLL_MS 200              // Paridad 4level_sensors LevelSensor(200)
-#define LEVEL_LOG_MS 1000              // Línea LEVEL en serial (no 10 s)
+#define LEVEL_POLL_MS 200              // Paridad 4level_sensors
+#define LEVEL_LOG_MS 1000              // Línea LEVEL en serial
+#define LEVEL_PCF_RETRY_MS 5000        // Reintento I2C si PCF niveles offline
 #define LEVEL_NPN_ACTIVE_LOW 1         // NPN ON → LOW no PCF (directo, sin PC817)
-// L1 base (P3) → L4 topo (P0). Cable físico igual: P0=arriba, P3=abajo.
-// Histórico V1 (L1=P0 topo): docs/handoffs/hydraulics/LEVEL_LOGIC_VERSIONS.md
+// L1 base (P3) → L4 topo (P0). Ver LEVEL_LOGIC_VERSIONS.md
 #define LEVEL_SENSOR_PCF_PINS 3, 2, 1, 0
-    // Sensor de nível PNP
 
 // I2C - Barramento compartilhado (100 kHz como bancada CAT6)
 #define I2C_SDA 21
@@ -346,8 +357,8 @@
 #define STATUS_LED_PIN 2               // LED de status (built-in)
 
 // ===== ENDEREÇOS I2C =====
-#define PCF8574_ADDR_1 0x20           // Primeiro PCF8574
-#define PCF8574_ADDR_2 0x24           // Segundo PCF8574 (se usado)
+#define PCF8574_ADDR_1 0x20           // Preferido: PCF niveles
+#define PCF8574_ADDR_2 0x24           // PCF relés peristálticos (NUNCA usar como niveles)
 
 // ===== INTERVALOS DE TEMPO (em milissegundos) =====
 #define SENSOR_READ_INTERVAL_MS 30000     // 30 segundos

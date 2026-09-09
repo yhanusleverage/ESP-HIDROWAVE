@@ -3,6 +3,7 @@
 #include "ScriptRunner.h"
 #include "Config.h"
 #include <ArduinoJson.h>
+#include <math.h>
 
 // ===== CONSTRUTOR E DESTRUTOR =====
 DecisionEngineIntegration::DecisionEngineIntegration(DecisionEngine* engine, HydroControl* hydro, SupabaseClient* supa, MasterSlaveManager* masterMgr) :
@@ -137,17 +138,18 @@ void DecisionEngineIntegration::end() {
 
 // ===== CONTROLE DE MODO =====
 void DecisionEngineIntegration::setEmergencyMode(bool enabled) {
-    if (emergency_mode != enabled) {
-        emergency_mode = enabled;
-        Serial.printf("🚨 Modo emergência %s\n", enabled ? "ATIVADO" : "DESATIVADO");
-        
-        if (enabled) {
-            // Em modo emergência, desligar relés críticos
-            emergencyShutdown("Modo emergência ativado manualmente");
-        }
-        
-        addToExecutionLog("Emergency mode " + String(enabled ? "ENABLED" : "DISABLED"));
+    if (emergency_mode == enabled) {
+        return;
     }
+    emergency_mode = enabled;
+    Serial.printf("🚨 Modo emergência %s\n", enabled ? "ATIVADO" : "DESATIVADO");
+
+    if (enabled) {
+        // OFF explícito tipado — sem reentrar em emergencyShutdown (evita ON/OFF por toggle)
+        shutOffCirculationActuator();
+    }
+
+    addToExecutionLog("Emergency mode " + String(enabled ? "ENABLED" : "DISABLED"));
 }
 
 void DecisionEngineIntegration::setManualOverride(bool enabled) {
@@ -283,11 +285,11 @@ void DecisionEngineIntegration::handleRelayControl(int relay, bool state, unsign
             addToExecutionLog("Relay " + String(relay) + " via RelayCoordinator");
         }
     } else if (duration > 0) {
-        hydroControl->toggleRelay(relay, duration / 1000); // HydroControl usa segundos
-        Serial.printf("⚡ Relé %d acionado por %lu ms\n", relay, duration);
+        hydroControl->setRelay(relay, state, duration / 1000); // HydroControl usa segundos
+        Serial.printf("⚡ Relé %d %s por %lu ms\n", relay, state ? "ligado" : "desligado", duration);
         addToExecutionLog("Relay " + String(relay) + " pulsed for " + String(duration) + "ms");
     } else {
-        hydroControl->toggleRelay(relay, 0); // Toggle permanente
+        hydroControl->setRelay(relay, state, 0); // OFF/ON explícito (nunca toggle)
         Serial.printf("⚡ Relé %d %s\n", relay, state ? "ligado" : "desligado");
         addToExecutionLog("Relay " + String(relay) + " " + (state ? "ON" : "OFF"));
     }
@@ -346,6 +348,7 @@ void DecisionEngineIntegration::handleLogEvent(const String& event, const String
 
 // ===== VALIDAÇÃO E SEGURANÇA =====
 bool DecisionEngineIntegration::validateRelayCommand(int relay_id, bool state, unsigned long duration) {
+    (void)state;
     // Verificar ID do relé
     if (relay_id < 0 || relay_id >= MAX_RELAYS) {
         Serial.printf("❌ ID de relé inválido: %d\n", relay_id);
@@ -358,91 +361,86 @@ bool DecisionEngineIntegration::validateRelayCommand(int relay_id, bool state, u
         return false;
     }
     
-    // Verificar se o sistema está saudável
+    // Heap / emergência — nível de água NÃO bloqueia recirculação (só Auto EC/pH)
     if (!isSystemHealthy()) {
         Serial.println("❌ Sistema não está saudável para executar comandos");
         return false;
     }
-    
-    // Verificações específicas por tipo de relé
-    // Relés 0-2: Bombas críticas (precisam de água)
-    if (relay_id <= 2 && !checkWaterLevelInterlock()) {
-        Serial.printf("❌ Nível de água insuficiente para relé crítico %d\n", relay_id);
-        return false;
-    }
-    
-    // Verificar temperatura para relés de aquecimento/circulação
-    if ((relay_id == 5 || relay_id == 6) && !checkTemperatureInterlock()) {
-        Serial.printf("❌ Temperatura fora dos limites para relé %d\n", relay_id);
-        return false;
-    }
-    
+
     return true;
 }
 
 void DecisionEngineIntegration::performSafetyChecks() {
     static unsigned long last_check = 0;
     if (millis() - last_check < 5000) return; // A cada 5 segundos
-    
-    bool system_safe = true;
-    String safety_issues = "";
-    
-    // Verificar interlocks
-    if (!checkWaterLevelInterlock()) {
-        system_safe = false;
-        safety_issues += "Water level low; ";
-    }
-    
-    if (!checkTemperatureInterlock()) {
-        system_safe = false;
-        safety_issues += "Temperature out of range; ";
-    }
-    
-    if (!checkMemoryInterlock()) {
-        system_safe = false;
-        safety_issues += "Low memory; ";
-    }
-    
-    if (!checkPowerSupplyInterlock()) {
-        system_safe = false;
-        safety_issues += "Power supply issues; ";
-    }
-    
-    // Se há problemas de segurança críticos, ativar emergência
-    if (!system_safe && !emergency_mode) {
-        Serial.println("🚨 Problemas de segurança detectados: " + safety_issues);
-        emergencyShutdown("Safety checks failed: " + safety_issues);
-    }
-    
     last_check = millis();
+
+    // Nível de água: NÃO apaga recirculação tipada (evita pelea con fn_recirculacao_continua).
+    // Auto EC/pH siguen pausados vía HydroControl::isAutoDosingPausedByInterlock / tankLevelOk.
+
+    // Temp fora de faixa só se leitura for válida (NaN/desconhecida = OK)
+    if (!checkTemperatureInterlock()) {
+        Serial.println("⚠️ [SAFETY] Temperatura fora da faixa — aviso (sem emergência)");
+    }
+
+    // Heap crítico: hard — emergência real
+    if (!checkMemoryInterlock() && !emergency_mode) {
+        Serial.println("🚨 [SAFETY] Heap baixo — emergência");
+        emergencyShutdown("Low memory");
+    }
 }
 
 void DecisionEngineIntegration::emergencyShutdown(const String& reason) {
     Serial.println("🚨 PARADA DE EMERGÊNCIA: " + reason);
-    
-    // Desligar relés críticos
-    int critical_relays[] = {0, 1, 2, 5}; // Bombas principais e aquecedor
-    for (int relay : critical_relays) {
-        if (hydroControl) {
-            hydroControl->toggleRelay(relay, 0); // Desligar
+
+    shutOffCirculationActuator();
+
+    if (!emergency_mode) {
+        emergency_mode = true;
+        Serial.println("🚨 Modo emergência ATIVADO");
+        addToExecutionLog("EMERGENCY SHUTDOWN: " + reason);
+    }
+
+    // Sem POST HTTPS aqui: em stress de heap o SSL (BIGNUM) falha e piora a situação
+    Serial.println("ℹ️ [SAFETY] emergency_shutdown registado só em serial (sem HTTPS)");
+}
+
+void DecisionEngineIntegration::shutOffCirculationActuator() {
+    if (!relayCoordinator || !relayCoordinator->isCirculationConfigured()) {
+        Serial.println("ℹ️ [SAFETY] Sem recirculação tipada — skip OFF");
+        return;
+    }
+
+    const RelayTarget target = relayCoordinator->getCirculationTarget();
+    if (target.isLocal) {
+        if (relayCoordinator->actuateLocal(RelayOwner::DecisionRule, target.relay, "off", 0, "safety_off")) {
+            Serial.printf("🔌 [SAFETY] Recirculação local R%d → OFF\n", target.relay);
         }
+        return;
     }
-    
-    setEmergencyMode(true);
-    addToExecutionLog("EMERGENCY SHUTDOWN: " + reason);
-    
-    // Notificar via Supabase
-    if (supabase && supabase->isReady()) {
-        DynamicJsonDocument doc(512);
-        doc["device_id"] = WiFi.macAddress();
-        doc["event_type"] = "emergency_shutdown";
-        doc["reason"] = reason;
-        doc["timestamp"] = millis();
-        
-        String json_str;
-        serializeJson(doc, json_str);
-        supabase->insert("system_events", json_str);
+
+    const uint32_t cmdId = relayCoordinator->actuateSlave(
+        RelayOwner::DecisionRule,
+        target.slaveMac,
+        target.relay,
+        "off",
+        0,
+        0,
+        0,
+        "",
+        "safety_off");
+    if (cmdId > 0) {
+        Serial.printf("🔌 [SAFETY] Recirculação slave R%d → OFF (cmd=%lu)\n",
+                      target.relay, static_cast<unsigned long>(cmdId));
     }
+}
+
+bool DecisionEngineIntegration::isLocalCirculationRelay(int relay_id) const {
+    if (!relayCoordinator || !relayCoordinator->isCirculationConfigured()) {
+        return false;
+    }
+    const RelayTarget target = relayCoordinator->getCirculationTarget();
+    return target.isLocal && target.relay == relay_id;
 }
 
 // ===== INTERLOCKS DE SEGURANÇA =====
@@ -453,14 +451,21 @@ bool DecisionEngineIntegration::checkWaterLevelInterlock() {
 
 bool DecisionEngineIntegration::checkTemperatureInterlock() {
     if (!hydroControl) return true; // Se não há sensor, assumir OK
-    
-    float water_temp = hydroControl->getWaterTemp();
-    float env_temp = hydroControl->getTemperature();
-    
-    // Verificar limites de temperatura
-    bool water_temp_ok = (water_temp >= 15.0 && water_temp <= 35.0);
-    bool env_temp_ok = (env_temp >= 10.0 && env_temp <= 40.0);
-    
+
+    const float water_temp = hydroControl->getWaterTemp();
+    const float env_temp = hydroControl->getTemperature();
+
+    // NaN / não finito = sensor ainda não leu → não tratar como falha
+    auto inRangeOrUnknown = [](float t, float lo, float hi) -> bool {
+        if (!isfinite(t)) {
+            return true;
+        }
+        return (t >= lo && t <= hi);
+    };
+
+    const bool water_temp_ok = inRangeOrUnknown(water_temp, 15.0f, 35.0f);
+    const bool env_temp_ok = inRangeOrUnknown(env_temp, 10.0f, 40.0f);
+
     return water_temp_ok && env_temp_ok;
 }
 
@@ -522,10 +527,9 @@ void DecisionEngineIntegration::addToExecutionLog(const String& log_entry) {
 }
 
 bool DecisionEngineIntegration::isSystemHealthy() {
-    return checkWaterLevelInterlock() && 
-           checkTemperatureInterlock() && 
-           checkMemoryInterlock() && 
-           !emergency_mode;
+    // Nível/temp são soft-interlocks (não bloqueiam o DE globalmente).
+    // Emergência + heap crítico sim.
+    return checkMemoryInterlock() && !emergency_mode;
 }
 
 void DecisionEngineIntegration::updateSupabaseWithRuleExecution(const String& rule_id, const String& action, bool success) {

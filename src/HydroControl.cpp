@@ -15,6 +15,8 @@ HydroControl::HydroControl()
 #endif
     , pcf1_ok(false)
     , pcf2_ok(false)
+    , levelPcfAddress(PCF8574_ADDR_1)
+    , lastLevelPcfRetryMs(0)
     , tankLevelOk(false)
     , levelInterlockMode(LEVEL_INTERLOCK_NORMAL)
     , circulationMixOkCallback(nullptr)
@@ -29,10 +31,7 @@ HydroControl::HydroControl()
         startTimes[i] = 0;
         timerSeconds[i] = 0;
     }
-#if !HIDRO_SIMULATE_WATER_LEVELS
-    tankSensor = new LevelSensor(TANK_LOW_PIN, TANK_HIGH_PIN);
-#else
-    tankSensor = nullptr;
+#if HIDRO_SIMULATE_WATER_LEVELS
     tankLevelOk = true;
 #endif
     
@@ -125,7 +124,6 @@ HydroControl::HydroControl()
     pHSensor = nullptr;
 #endif
     ecSensor = nullptr;
-    tankSensor = nullptr;
     temperature = NAN;
     pH = NAN;
     tds = NAN;
@@ -200,9 +198,9 @@ HydroControl::HydroControl()
  * 4. Temp agua producción = Modbus pH reg0
  * 5. pHSensor / PhModbusSensor
  * 6. ecSensor = new EcAnalogSensor() - Sensor EC analógico
- * 7. tankSensor / DiscreteLevelBank - Sensor de nível
+ * 7. DiscreteLevelBank — L1-L4 vía PCF I2C (sin XKR GPIO)
  * 8. delay(100) - Estabilizar barramento I2C
- * 9. pcf1.begin(0xFF) - PCF8574 #1 (niveles) — NUNCA begin(false) (= write 0x00)
+ * 9. pcf1.begin(0xFF) - PCF8574 niveles — NUNCA begin(false) (= write 0x00)
  * 10. pcf2.begin(0xFF) - PCF8574 #2 (relés)
  * 
  * ⚠️ DEPENDÊNCIAS CRÍTICAS:
@@ -286,11 +284,7 @@ bool HydroControl::begin() {
                   FLOW_SENSOR_PIN, FLOW_HZ_PER_LPM, initialCal);
 
 #if !HIDRO_SIMULATE_WATER_LEVELS
-    if (tankSensor == nullptr) {
-        tankSensor = new LevelSensor(TANK_LOW_PIN, TANK_HIGH_PIN);
-    }
-    tankSensor->begin();
-    Serial.println("[LEVEL] HIDRO_SIMULATE_WATER_LEVELS=0 — L1-L4 vía PCF8574 @ 0x20 (NPN directo)");
+    Serial.println("[LEVEL] HIDRO_SIMULATE_WATER_LEVELS=0 — L1-L4 vía PCF8574 (scan I2C; sin XKR GPIO)");
 #else
     Serial.println("[LEVEL] HIDRO_SIMULATE_WATER_LEVELS=1 — L1-L4 simulados ON");
 #endif
@@ -303,35 +297,21 @@ bool HydroControl::begin() {
     Serial.println("\n╔════════════════════════════════════════════════════╗");
     Serial.println("║   🔧 INICIALIZANDO PCF8574                          ║");
     Serial.println("╚════════════════════════════════════════════════════╝");
-    
-    // ✅ CORREÇÃO: Verificar se PCF8574 está presente antes de inicializar
-    Wire.beginTransmission(0x20);
-    bool pcf1Present = (Wire.endTransmission() == 0);
-    
-    Wire.beginTransmission(0x24);
-    bool pcf2Present = (Wire.endTransmission() == 0);
-    
-    // ✅ PCF1 (0x20) - Sensores capacitivos (ENTRADAS)
-    // RobTillaart begin(uint8_t): el arg es el valor del puerto, NO "skip Wire".
-    // begin(false) ≡ begin(0) ≡ write8(0x00) → P0-P3 stuck LOW → siempre MOJADO.
-    if (pcf1Present) {
-        pcf1_ok = pcf1.begin(0xFF);  // todos HIGH = modo entrada + pull-up débil
-        if (!pcf1_ok) {
-            Serial.println("❌ [PCF1] Falha ao inicializar PCF8574 #1 (0x20)");
-            Serial.println("   ⚠️ Verifique conexões I2C e endereço");
-        } else {
-            Serial.println("✅ [PCF1] PCF8574 #1 inicializado (0x20) - Sensores capacitivos");
-            pcf1.write8(0xFF);  // asegurar pull-ups en P0-P7
-            Serial.println("   📥 P0-P7 HIGH (entradas L1-L4 + reserva)");
-            levelBank.begin();
-            levelBank.dumpRawPins(pcf1);
-        }
-    } else {
-        Serial.println("⚠️ [PCF1] PCF8574 #1 (0x20) não detectado no barramento I2C");
-        pcf1_ok = false;
+
+#if !HIDRO_SIMULATE_WATER_LEVELS
+    // Niveles: descubrir addr (0x20 preferido; excluye 0x24 = relés). Paridad 4level_sensors.
+    if (!discoverAndBindLevelPcf()) {
+        Serial.println("⚠️ [LEVEL] PCF niveles OFFLINE — no se publicarán L1-L4 reales");
+        Serial.println("   Checklist: VCC/GND PCF, SDA21/SCL22, pull-ups, A0-A2≠relés(0x24)");
+        Serial.println("   Reintento cada LEVEL_PCF_RETRY_MS (serial: LEVEL offline …)");
     }
+#else
+    pcf1_ok = false;
+#endif
     
     // ✅ PCF2 (0x24) - Relés peristálticos (SAÍDAS) - TODOS os relés (0-7)
+    Wire.beginTransmission(PCF8574_ADDR_2);
+    bool pcf2Present = (Wire.endTransmission() == 0);
     if (pcf2Present) {
         pcf2_ok = pcf2.begin(0xFF);  // HIGH = relé off; no usar begin(false)
         if (!pcf2_ok) {
@@ -354,7 +334,11 @@ bool HydroControl::begin() {
     }
     
     Serial.println("✅ [PCF8574] Inicialização completa");
-    Serial.printf("[PCF] pcf1=%d pcf2=%d\n", pcf1_ok ? 1 : 0, pcf2_ok ? 1 : 0);
+    Serial.printf("[PCF] levels_addr=0x%02X pcf1=%d pcf2=%d sim=%d\n",
+                  static_cast<unsigned>(levelPcfAddress),
+                  pcf1_ok ? 1 : 0,
+                  pcf2_ok ? 1 : 0,
+                  areLevelsCompileSimulated() ? 1 : 0);
     Serial.println("╚════════════════════════════════════════════════════╝\n");
 
     // Resetar estados dos relés
@@ -434,6 +418,8 @@ void HydroControl::pollDiscreteLevels() {
     static unsigned long lastLevelLogMs = 0;
     const unsigned long now = millis();
 
+    maybeRetryLevelPcf();
+
     if (now - lastLevelPollMs < LEVEL_POLL_MS) {
         return;
     }
@@ -443,18 +429,98 @@ void HydroControl::pollDiscreteLevels() {
         refreshTankLevelOkFromAggregate();
         if (now - lastLevelLogMs >= LEVEL_LOG_MS) {
             lastLevelLogMs = now;
-            Serial.printf("LEVEL L1=%s L2=%s L3=%s L4=%s → %s ilock=%s\n",
+            // Formato auditable (grep LEVEL / PCF=) — paridad 4level_sensors
+            Serial.printf(
+                "LEVEL L1=%s L2=%s L3=%s L4=%s → %s | PCF=0x%02X | ilock=%s ok=%d\n",
                 levelBank.isWet(1) ? "MOJADO" : "SECO",
                 levelBank.isWet(2) ? "MOJADO" : "SECO",
                 levelBank.isWet(3) ? "MOJADO" : "SECO",
                 levelBank.isWet(4) ? "MOJADO" : "SECO",
                 levelBank.getWaterLevel(),
-                getLevelInterlockModeName());
+                static_cast<unsigned>(levelPcfAddress),
+                getLevelInterlockModeName(),
+                tankLevelOk ? 1 : 0);
         }
-    } else if (tankSensor) {
-        tankLevelOk = tankSensor->checkWaterLevel();
     } else {
         tankLevelOk = false;
+        if (now - lastLevelLogMs >= LEVEL_LOG_MS) {
+            lastLevelLogMs = now;
+            Serial.printf(
+                "LEVEL offline pcf1=%d addr=0x%02X pcf2=%d — sin L1-L4 reales (no XKR) | retry=%lums\n",
+                pcf1_ok ? 1 : 0,
+                static_cast<unsigned>(levelPcfAddress),
+                pcf2_ok ? 1 : 0,
+                static_cast<unsigned long>(LEVEL_PCF_RETRY_MS));
+        }
+    }
+#endif
+}
+
+bool HydroControl::tryBindLevelPcf(uint8_t address) {
+    if (address == PCF8574_ADDR_2) {
+        return false;  // 0x24 = relés — nunca niveles
+    }
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() != 0) {
+        return false;
+    }
+    if (!pcf1.setAddress(address)) {
+        Serial.printf("❌ [LEVEL] setAddress(0x%02X) falló\n", static_cast<unsigned>(address));
+        return false;
+    }
+    // begin(0xFF): entradas HIGH. NUNCA begin(false) → write 0x00 → falso MOJADO.
+    if (!pcf1.begin(0xFF)) {
+        Serial.printf("❌ [LEVEL] PCF begin(0x%02X) falló\n", static_cast<unsigned>(address));
+        return false;
+    }
+    if (!pcf1.isConnected()) {
+        Serial.printf("❌ [LEVEL] PCF 0x%02X ACK pero isConnected=0\n", static_cast<unsigned>(address));
+        return false;
+    }
+    pcf1.write8(0xFF);
+    levelPcfAddress = address;
+    pcf1_ok = true;
+    levelBank.begin();
+    Serial.printf("✅ [LEVEL] PCF niveles @ 0x%02X (NPN active-LOW P0-P3)\n",
+                  static_cast<unsigned>(address));
+    levelBank.dumpRawPins(pcf1);
+    return true;
+}
+
+bool HydroControl::discoverAndBindLevelPcf() {
+    // Preferir 0x20, luego resto PCF8574, luego PCF8574A — excluye 0x24 (relés)
+    static const uint8_t order[] = {
+        0x20, 0x21, 0x22, 0x23, /* skip 0x24 */ 0x25, 0x26, 0x27,
+        0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F
+    };
+    Serial.println("[LEVEL] scan PCF niveles 0x20-0x27 / 0x38-0x3F (skip 0x24 relés)…");
+    for (uint8_t i = 0; i < sizeof(order); i++) {
+        if (tryBindLevelPcf(order[i])) {
+            return true;
+        }
+    }
+    pcf1_ok = false;
+    levelBank.begin();  // available=false
+    Serial.println("✗ [LEVEL] ningún PCF niveles en bus (solo relés 0x24 u offline)");
+    return false;
+}
+
+void HydroControl::maybeRetryLevelPcf() {
+#if HIDRO_SIMULATE_WATER_LEVELS
+    return;
+#else
+    if (pcf1_ok && levelBank.isAvailable()) {
+        return;
+    }
+    const unsigned long now = millis();
+    if (now - lastLevelPcfRetryMs < LEVEL_PCF_RETRY_MS) {
+        return;
+    }
+    lastLevelPcfRetryMs = now;
+    Serial.println("[LEVEL] reintento I2C / PCF niveles…");
+    Wire.setClock(I2C_CLOCK_HZ);
+    if (discoverAndBindLevelPcf()) {
+        Serial.println("[LEVEL] PCF niveles recuperado — L1-L4 activos");
     }
 #endif
 }
@@ -687,8 +753,6 @@ void HydroControl::updateSensors() {
 #else
     if (levelBank.isAvailable()) {
         refreshTankLevelOkFromAggregate();
-    } else if (tankSensor) {
-        tankLevelOk = tankSensor->checkWaterLevel();
     } else {
         tankLevelOk = false;
     }
@@ -702,20 +766,10 @@ bool HydroControl::isLevelWet(int levelIndex) const {
     }
     return false;
 #else
-    if (levelBank.isAvailable()) {
-        return levelBank.isWet(levelIndex);
+    if (!levelBank.isAvailable() || levelIndex < 1 || levelIndex > 4) {
+        return false;  // offline: no inventar mojado
     }
-    if (!tankSensor || levelIndex < 1 || levelIndex > 4) {
-        return false;
-    }
-    const String status = tankSensor->getStatus();
-    if (levelIndex == 4) {
-        return status != "BAIXO" && status != "ERRO";
-    }
-    if (levelIndex == 1) {
-        return status == "CHEIO";
-    }
-    return status == "MÉDIO" || status == "CHEIO";
+    return levelBank.isWet(levelIndex);
 #endif
 }
 
@@ -726,14 +780,7 @@ const char* HydroControl::getWaterLevelAggregate() const {
     if (levelBank.isAvailable()) {
         return levelBank.getWaterLevel();
     }
-    if (!tankSensor) {
-        return "vazio";
-    }
-    const String status = tankSensor->getStatus();
-    if (status == "CHEIO") return "alto";
-    if (status == "MÉDIO") return "medio";
-    if (status == "BAIXO") return "baixo";
-    return "vazio";
+    return "vazio";  // offline honesto
 #endif
 }
 
@@ -865,14 +912,27 @@ void HydroControl::updateRelayTimers() {
 }
 
 String HydroControl::getTankStatus() {
-    if (!tankSensor) {
 #if HIDRO_SIMULATE_WATER_LEVELS
-        return "CHEIO";
+    return "CHEIO";
 #else
-        return "ERRO";
-#endif
+    if (!levelBank.isAvailable()) {
+        return "ERRO";  // PCF offline
     }
-    return tankSensor->getStatus();
+    const char* wl = levelBank.getWaterLevel();
+    if (!wl) {
+        return "ERRO";
+    }
+    if (strcmp(wl, "alto") == 0 || strcmp(wl, "medio_alto") == 0) {
+        return "CHEIO";
+    }
+    if (strcmp(wl, "medio") == 0 || strcmp(wl, "baixo") == 0) {
+        return "MÉDIO";
+    }
+    if (strcmp(wl, "vazio") == 0) {
+        return "BAIXO";
+    }
+    return "ERRO";
+#endif
 }
 
 float HydroControl::getWaterTemp() {

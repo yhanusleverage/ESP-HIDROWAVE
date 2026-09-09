@@ -106,13 +106,15 @@ Pull-ups I2C 4.7 kΩ SDA/SCL → 3.3 V en el Master.
 | Clase | `DiscreteLevelBank` — poll cada **200 ms** en `HydroControl::update()` (antes de Modbus/EC) |
 | Flag producción | **`HIDRO_SIMULATE_WATER_LEVELS=0`** (`platformio.ini` + default `Config.h`) |
 | Flag bancada sin sondas | `=1` — L1–L4 forzados ON (solo E2E) |
-| Fallback GPIO 32/33 | **No usar** con RS485/EC activos |
+| Fallback XKR GPIO 32/33 | **Eliminado** (chocaba con RS485 DE/RE=32 y mentía `alto`) |
+| Discovery | Scan `0x20–0x27` / `0x38–0x3F` (**skip `0x24` relés**); retry cada `LEVEL_PCF_RETRY_MS` |
 | Poll / log | `LEVEL_POLL_MS=200`, `LEVEL_LOG_MS=1000`, `[WET-TEST]` on-change, `[LEVEL-RAW]` al boot |
-| Telemetría | MQTT/HTTPS: `level_1..4`, `water_level`, `water_level_ok`, `interlock_mode`, **`levels_simulated` siempre** (`false` en producción) |
+| Serial auditable | Online: `LEVEL L1=… → medio \| PCF=0x20 \| ilock=… ok=…` — Offline: `LEVEL offline …` |
+| Telemetría | MQTT: `level_1..4`, `water_level`, `water_level_ok`, `interlock_mode`, `levels_simulated`, **`levels_online`** |
 | Interlock | NVS `lvl_ilock` = `normal`\|`carrera`; MQTT `set_level_interlock` |
 | Motor | `DecisionEngine` / `ScriptRunner` leen `level_1..4` / `water_level` (medio|medio_alto) |
 
-Al boot con niveles reales **no** debe aparecer `[LEVEL] HIDRO_SIMULATE_WATER_LEVELS=1`. Debe aparecer `[LEVEL-RAW] P0=…` (H=seco esperado sin GND).
+Al boot: `[LEVEL] HIDRO_SIMULATE_WATER_LEVELS=0`, `[PCF] levels_addr=0x.. pcf1=…`, y o bien `[LEVEL-RAW]` o `LEVEL offline` cada 1 s (nunca L1-ON inventado).
 
 ---
 

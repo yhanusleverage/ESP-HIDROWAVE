@@ -16,18 +16,29 @@ namespace {
     static constexpr const char* NVS_CH_KEY_LEGACY = "espnow_last_channel";
 
     void sendProvisioningBurstOnCurrentChannel(ESPNowController* controller,
+                                               MasterSlaveManager* manager,
                                                const String& ssid,
                                                const String& password,
                                                uint8_t opChannel) {
-        for (int i = 0; i < 3; ++i) {
-            controller->sendWiFiCredentialsBroadcast(ssid, password, opChannel);
-            delay(150);
-        }
+        // 1) Discovery primeiro — Slave acorda / adiciona peer
         for (int i = 0; i < 3; ++i) {
             controller->sendDiscoveryBroadcast();
             if (i < 2) {
-                delay(150);
+                delay(120);
             }
+        }
+        delay(80);
+        // 2) Creds broadcast
+        for (int i = 0; i < 3; ++i) {
+            controller->sendWiFiCredentialsBroadcast(ssid, password, opChannel);
+            delay(120);
+        }
+        // 3) Creds unicast a trusted (redundância, stack only)
+        if (manager) {
+            manager->forEachTrustedSlave([controller, &ssid, &password, opChannel](const TrustedSlave& slave) {
+                controller->sendWiFiCredentialsTo(slave.macAddress, ssid, password, opChannel);
+                delay(40);
+            });
         }
     }
 
@@ -66,11 +77,41 @@ namespace {
 
         Serial.printf("[CHANNEL] hop config=%u ok (STA down)\n",
                       static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL));
-        delay(50);
+        delay(80);
+        // Peers aún en ch STA → 0x3066. Re-add en CONFIG antes del burst (patch sobre REF).
+        manager->refreshEspNowPeersOnCurrentChannel();
+        delay(40);
         Serial.printf("[PROV] burst creds+disc ch%u payload_op=%u\n",
                       static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL),
                       static_cast<unsigned>(opChannel));
-        sendProvisioningBurstOnCurrentChannel(controller, ssid, password, opChannel);
+        ESPNowController::clearWifiCredentialsAckFlag();
+        sendProvisioningBurstOnCurrentChannel(controller, manager, ssid, password, opChannel);
+
+        // Espera ACK; se ainda não veio a meio, reenvia creds (redundância sem heap)
+        const unsigned long ackWaitStart = millis();
+        bool gotCredsAck = false;
+        bool midReburstDone = false;
+        while ((millis() - ackWaitStart) < ESPNOW_CREDS_ACK_WAIT_MS) {
+            if (ESPNowController::takeWifiCredentialsAckFlag()) {
+                gotCredsAck = true;
+                break;
+            }
+            if (!midReburstDone && (millis() - ackWaitStart) >= (ESPNOW_CREDS_ACK_WAIT_MS / 2)) {
+                midReburstDone = true;
+                Serial.println("[PROV] mid-wait reburst creds");
+                for (int i = 0; i < 2; ++i) {
+                    controller->sendWiFiCredentialsBroadcast(ssid, password, opChannel);
+                    delay(80);
+                }
+                manager->forEachTrustedSlave([controller, &ssid, &password, opChannel](const TrustedSlave& slave) {
+                    controller->sendWiFiCredentialsTo(slave.macAddress, ssid, password, opChannel);
+                });
+            }
+            delay(20);
+        }
+        Serial.printf("[PROV] creds-ack %s (+%lums)\n",
+                      gotCredsAck ? "ok" : "timeout",
+                      millis() - ackWaitStart);
 
         if (!EspNowChannelPolicy::hopToOperationalChannel(controller, opChannel)) {
             Serial.printf("[PROV] hop op=%u fail after burst\n", static_cast<unsigned>(opChannel));
@@ -209,7 +250,7 @@ void EspNowChannelPolicy::runProvisioningBurst(ESPNowController* controller,
                       static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL),
                       static_cast<unsigned>(opChannel));
         delay(50);
-        sendProvisioningBurstOnCurrentChannel(controller, ssid, password, opChannel);
+        sendProvisioningBurstOnCurrentChannel(controller, manager, ssid, password, opChannel);
         if (staUp && opChannel != ESPNOW_CONFIG_CHANNEL) {
             hopToOperationalChannel(controller, opChannel);
             delay(50);
@@ -225,10 +266,10 @@ void EspNowChannelPolicy::runProvisioningBurst(ESPNowController* controller,
 #endif
         Serial.printf("[CHANNEL] hop config skip (STA ch=%u) — burst op direct\n",
                       static_cast<unsigned>(WiFi.channel()));
-        sendProvisioningBurstOnCurrentChannel(controller, ssid, password, opChannel);
+        sendProvisioningBurstOnCurrentChannel(controller, manager, ssid, password, opChannel);
     } else {
         Serial.println("[CHANNEL] hop config fail, sem STA — burst no canal atual");
-        sendProvisioningBurstOnCurrentChannel(controller, ssid, password, opChannel);
+        sendProvisioningBurstOnCurrentChannel(controller, manager, ssid, password, opChannel);
     }
 
     manager->refreshEspNowPeersOnCurrentChannel();

@@ -2,7 +2,10 @@
 
 **Estado:** implementado (Master + Slave)  
 **Repos:** `ESP-HIDROWAVE-main` (Master) + `ESPNOW-SLAVE-TASK-main` (Slave)  
-**Fecha:** 2 sep 2026
+**Fecha:** 2 sep 2026  
+
+> **Actualización 2026-09-09:** anti-re-burst / ACK-only y latch Master — ver  
+> [`HANDOFF_PROVISIONING_CREDS_STABLE.md`](./HANDOFF_PROVISIONING_CREDS_STABLE.md)
 
 ---
 

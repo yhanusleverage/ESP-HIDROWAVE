@@ -22,6 +22,8 @@ struct MqttTelemetryReading {
     bool tempValid;
     bool circulationTyped;
     bool circulationMixOk;
+    bool levelsSimulated;  // compile HIDRO_SIMULATE_WATER_LEVELS
+    bool levelsOnline;     // PCF niveles I2C OK
 };
 
 struct MqttHeartbeatReading {
@@ -80,6 +82,7 @@ struct MqttLevelsReading {
     bool level4Wet;
     const char* waterLevel;
     bool levelsSimulated;
+    bool levelsOnline;  // PCF I2C OK (false = offline, no inventar)
     const char* interlockMode;  // normal|carrera
     bool circulationTyped;
     bool circulationMixOk;

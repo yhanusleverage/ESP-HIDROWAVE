@@ -308,8 +308,9 @@ bool MqttClientWrapper::publishTelemetry(const MqttTelemetryReading& reading) {
 #if HIDRO_SIMULATE_WATER_LEVELS
     doc["levels_simulated"] = true;
 #else
-    doc["levels_simulated"] = false;
+    doc["levels_simulated"] = reading.levelsSimulated;
 #endif
+    doc["levels_online"] = reading.levelsOnline;
     if (reading.interlockMode && reading.interlockMode[0]) {
         doc["interlock_mode"] = reading.interlockMode;
     }
@@ -350,6 +351,7 @@ bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
         doc["water_level"] = reading.waterLevel;
     }
     doc["levels_simulated"] = reading.levelsSimulated;
+    doc["levels_online"] = reading.levelsOnline;
     if (reading.interlockMode && reading.interlockMode[0]) {
         doc["interlock_mode"] = reading.interlockMode;
     }
@@ -364,7 +366,8 @@ bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
 
     bool published = mqtt.publish(levelsTopic.c_str(), payload, false);
     if (published) {
-        Serial.printf("[MQTT] levels L1=%d L2=%d L3=%d L4=%d wl=%s ok=%d sim=%d ilock=%s circ=%d/%d\n",
+        Serial.printf(
+            "[MQTT] levels L1=%d L2=%d L3=%d L4=%d wl=%s ok=%d sim=%d online=%d ilock=%s circ=%d/%d\n",
                       reading.level1Wet ? 1 : 0,
                       reading.level2Wet ? 1 : 0,
                       reading.level3Wet ? 1 : 0,
@@ -372,6 +375,7 @@ bool MqttClientWrapper::publishLevels(const MqttLevelsReading& reading) {
                       reading.waterLevel ? reading.waterLevel : "-",
                       reading.waterLevelOk ? 1 : 0,
                       reading.levelsSimulated ? 1 : 0,
+                      reading.levelsOnline ? 1 : 0,
                       reading.interlockMode ? reading.interlockMode : "-",
                       reading.circulationTyped ? 1 : 0,
                       reading.circulationMixOk ? 1 : 0);

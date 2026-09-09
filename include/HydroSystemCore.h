@@ -143,8 +143,11 @@ private:
     static const unsigned long STATUS_SEND_INTERVAL = 60000;      // 1 min (mantido para device_status)
     static const unsigned long STATUS_SEND_INTERVAL_MQTT_OFFLINE = 120000; // 2 min fallback HTTPS
     static const unsigned long RELAY_STATES_SYNC_INTERVAL = 30000; // 30s — espelho relay_master/slaves
-    static const unsigned long RELAY_STATES_SYNC_FORCE_RF_MS = 60000; // backup ALL_RELAYS RF a cada 60s
+    /** Backup ALL_RELAYS RF — radio calmada (30 s; wait 2.5 s evita timeout falso) */
+    static const unsigned long RELAY_STATES_SYNC_FORCE_RF_MS = 30000;
     static const unsigned long SLAVE_RELAY_HEARTBEAT_INTERVAL = 45000; // relay/state periódico p/ cloud
+    /** Espera 0x0E após request status (800 ms era curto demais → SYNC timeout falso) */
+    static const unsigned long ALL_RELAYS_WAIT_MS = 2500UL;
     unsigned long lastSlaveRelayHeartbeat;
     unsigned long lastSlaveRelayFullSync;
     static const unsigned long MQTT_CLOUD_LAST_SEEN_INTERVAL = 240000UL; // 4 min — margem sob UI 5 min
@@ -192,7 +195,7 @@ private:
 
     /** DE remoto: rule_executed diferido hasta ACK ESP-NOW (RAM fija, idempotente). */
     static const size_t PENDING_RULE_ACK_SLOTS = 8;
-    static const unsigned long PENDING_RULE_ACK_TTL_MS = 6000UL;
+    static const unsigned long PENDING_RULE_ACK_TTL_MS = 12000UL;  // margem p/ retry ESP-NOW
     struct PendingRuleAckSlot {
         bool open;
         uint32_t espNowId;
@@ -230,6 +233,9 @@ private:
     void registerPendingSlaveAck(int supabaseCommandId, uint32_t espNowCommandId,
                                  const uint8_t* slaveMac, int relayNumber, const String& action);
     void reconcilePendingSlaveAcks(const uint8_t* slaveMac, const bool relayStates[8], uint8_t numRelays);
+    /** Fecha RULE-ACK abertos se ALL_RELAYS confirma MAC+relé+estado (fallback sem RELAY_ACK). */
+    void reconcilePendingRuleAcksFromSnapshot(const uint8_t* slaveMac, const bool relayStates[8],
+                                              uint8_t numRelays);
     void cleanupExpiredPendingSlaveAcks();
     void completeSlaveCommand(int supabaseCommandId, uint32_t espNowCommandId,
                               const uint8_t* slaveMac, int relayNumber, bool currentState,
