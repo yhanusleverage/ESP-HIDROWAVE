@@ -58,6 +58,18 @@ struct ActiveScript {
     bool waitLitersArmed = false;
     float waitLitersTarget = 0.0f;
     bool recircStarted = false;
+    /** Clasificación historial: simple vs procedure (Full recharge / dreno / fill). */
+    bool isProcedure = false;
+    String procedureKind;  // full_recharge | drain_only | fill_only | generic | simple
+    bool finishedNotified = false;
+};
+
+/** Espejo MQTT procedure_finished (Complete/Aborted). */
+struct ProcedureFinishedEvent {
+    String rule_id;
+    String status;   // completed | aborted
+    String reason;   // end | while_timeout | abort | removed | clear
+    String kind;     // procedure_kind
 };
 
 class ScriptRunnerManager {
@@ -72,6 +84,7 @@ public:
     using RecircFn = std::function<void(bool starting)>;
     using DefaultRecircSecFn = std::function<unsigned long()>;
     using RoleResolveFn = std::function<bool(const String& role, String& outMac, int& outRelay)>;
+    using ProcedureFinishedFn = std::function<void(const ProcedureFinishedEvent& event)>;
 
     static ScriptRunnerManager& instance();
 
@@ -95,6 +108,7 @@ public:
         defaultRecircSecCb_ = defaultSecFn;
     }
     void setHydraulicRoleResolver(RoleResolveFn cb) { roleResolveCb_ = cb; }
+    void setProcedureFinishedCallback(ProcedureFinishedFn cb) { procedureFinishedCb_ = cb; }
 
 private:
     ScriptRunnerManager() = default;
@@ -108,7 +122,14 @@ private:
     void engageProcedureGate(ActiveScript& script);
     /** Pausa Auto EC/pH sin exigir priority >= 80 (instrucción block_auto). */
     void holdAutoGate(ActiveScript& script);
+    void setLastRelayFn(RelayFn fn) { lastRelayFn_ = std::move(fn); }
+
     void releaseProcedureGate(ActiveScript& script);
+    void classifyScript(ActiveScript& script, const JsonObject& ruleJson);
+    void notifyProcedureFinished(ActiveScript& script, const char* status, const char* reason);
+    void abortScript(ActiveScript& script, const char* reason);
+    void forceOffScriptActuators(const ActiveScript& script);
+    void collectRelayTargets(const ScriptInstr& instr, std::vector<std::pair<int, String>>& out) const;
 
     std::vector<ActiveScript> scripts_;
     TankGateFn tankGateCb_;
@@ -117,6 +138,8 @@ private:
     RecircFn recircCb_;
     DefaultRecircSecFn defaultRecircSecCb_;
     RoleResolveFn roleResolveCb_;
+    ProcedureFinishedFn procedureFinishedCb_;
+    RelayFn lastRelayFn_;
     int currentGrowWeek_ = 0;
 };
 

@@ -15,6 +15,7 @@
  *   hidrowave/+/ph_gain         → PATCH ph_config_view k_acid/k_base
  *   hidrowave/+/command_ack     → RPC complete_relay_command
  *   hidrowave/+/rule_executed   → INSERT relay_commands (DE local espejo)
+ *   hidrowave/+/procedure_finished → INSERT procedure_events (Complete/Aborted)
  *   hidrowave/+/relay/state     → PATCH relay_master / relay_slaves
  */
 import 'dotenv/config';
@@ -42,6 +43,7 @@ const TOPICS = [
   'hidrowave/+/ec_dilution',
   'hidrowave/+/command_ack',
   'hidrowave/+/rule_executed',
+  'hidrowave/+/procedure_finished',
   'hidrowave/+/relay/state',
 ];
 
@@ -106,6 +108,11 @@ const relayHeartbeatThrottleMs = parseInt(process.env.RELAY_HEARTBEAT_THROTTLE_M
 const COMMAND_ACK_STATUSES = new Set(['completed', 'failed']);
 const RULE_EXECUTED_ACTIONS = new Set(['on', 'off', 'toggle']);
 const RULE_EXECUTED_DEDUP_MS = parseInt(process.env.RULE_EXECUTED_DEDUP_MS || '60000', 10);
+const PROCEDURE_FINISHED_STATUSES = new Set(['completed', 'aborted']);
+const PROCEDURE_FINISHED_DEDUP_MS = parseInt(
+  process.env.PROCEDURE_FINISHED_DEDUP_MS || '60000',
+  10
+);
 
 // Alinhado com CHECK Supabase: environment_data_temperature_check / environment_data_humidity_check
 const ENV_TEMP_MIN = 0;
@@ -127,6 +134,7 @@ const lastRelayHeartbeatPatchByDevice = new Map();
 const pendingRelayStatePatches = new Map();
 const completedCommandAckIds = new Map();
 const ruleExecutedEventIds = new Map();
+const procedureFinishedEventIds = new Map();
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -1993,6 +2001,84 @@ async function insertRuleExecutedMirror(row) {
   return true;
 }
 
+function validateProcedureFinished(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const eventId = String(payload.event_id || '').trim();
+  const ruleId = String(payload.rule_id || '').trim();
+  const status = String(payload.status || '').trim().toLowerCase();
+  const reason = payload.reason != null ? String(payload.reason).trim().slice(0, 128) : null;
+  const kind = payload.kind != null ? String(payload.kind).trim().slice(0, 64) : null;
+
+  if (!eventId || eventId.length > 128) {
+    return { ok: false, reason: 'event_id required (max 128 chars)' };
+  }
+  if (!ruleId || ruleId.length > 128) {
+    return { ok: false, reason: 'rule_id required (max 128 chars)' };
+  }
+  if (!PROCEDURE_FINISHED_STATUSES.has(status)) {
+    return {
+      ok: false,
+      reason: `status must be one of ${[...PROCEDURE_FINISHED_STATUSES].join(', ')}`,
+    };
+  }
+
+  return {
+    ok: true,
+    row: {
+      deviceId,
+      eventId,
+      ruleId,
+      status,
+      reason: reason || null,
+      kind: kind || null,
+    },
+  };
+}
+
+async function insertProcedureFinished(row) {
+  const dedupeKey = `${row.deviceId}:${row.eventId}`;
+  const lastAt = procedureFinishedEventIds.get(dedupeKey);
+  if (lastAt && Date.now() - lastAt < PROCEDURE_FINISHED_DEDUP_MS) {
+    console.log(`[bridge] procedure_finished dedup ${dedupeKey}`);
+    return true;
+  }
+
+  const insertRow = {
+    device_id: row.deviceId,
+    event_id: row.eventId,
+    rule_id: row.ruleId,
+    status: row.status,
+    reason: row.reason,
+    kind: row.kind,
+    created_at: new Date().toISOString(),
+  };
+
+  const { error } = await supabase.from('procedure_events').insert(insertRow);
+  if (error) {
+    if (error.code === '23505') {
+      procedureFinishedEventIds.set(dedupeKey, Date.now());
+      console.log(`[bridge] procedure_finished unique hit ${dedupeKey}`);
+      return true;
+    }
+    console.error(
+      `[bridge] procedure_finished INSERT failed event=${row.eventId} rule=${row.ruleId}:`,
+      error.message
+    );
+    return false;
+  }
+
+  procedureFinishedEventIds.set(dedupeKey, Date.now());
+  console.log(
+    `[bridge] procedure_finished INSERT rule=${row.ruleId} status=${row.status}`
+  );
+  return true;
+}
+
 function validateRelayState(deviceId, payload) {
   if (!isValidDeviceId(deviceId)) {
     return { ok: false, reason: 'invalid device_id format' };
@@ -2215,6 +2301,27 @@ async function handleRuleExecuted(topic, message) {
   await insertRuleExecutedMirror(validated.row);
 }
 
+async function handleProcedureFinished(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'procedure_finished');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateProcedureFinished(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await insertProcedureFinished(validated.row);
+}
+
 async function handleRelayState(topic, message) {
   const parts = topic.split('/');
   if (parts.length !== 4 || parts[0] !== 'hidrowave' || parts[2] !== 'relay' || parts[3] !== 'state') {
@@ -2355,6 +2462,8 @@ client.on('message', (topic, message, packet) => {
       await handleCommandAck(topic, message);
     } else if (suffix === 'rule_executed') {
       await handleRuleExecuted(topic, message);
+    } else if (suffix === 'procedure_finished') {
+      await handleProcedureFinished(topic, message);
     } else if (topic.endsWith('/relay/state')) {
       await handleRelayState(topic, message);
     }

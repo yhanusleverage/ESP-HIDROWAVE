@@ -19,6 +19,8 @@
 #include "RelayCoordinator.h"
 #include "DecisionEngine.h"
 #include "DecisionEngineIntegration.h"
+#include "ScriptRunner.h"
+#include "TankProcedureFsm.h"
 #include "StateCacheTypes.h"
 #include "StatePersistenceManager.h"
 #include "StatusLED.h"
@@ -268,6 +270,7 @@ private:
     bool isMqttCommandPathStable() const;
     static void onRuleExecutedMirrorStatic(const RuleExecutedMirrorEvent& event, void* userData);
     void mirrorRuleExecuted(const RuleExecutedMirrorEvent& event);
+    void mirrorProcedureFinished(const ProcedureFinishedEvent& event);
     bool tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
                                    const uint8_t* slaveMac, int relayNumber, bool currentState,
                                    const char* status = "completed");
@@ -407,6 +410,7 @@ private:
     bool upsertFnCirculationRule(const char* slaveMac, int relayIndex, bool enabled);
     bool applyRuleUpsertMqtt(const char* payload, size_t length);
     bool applyRulesManifestMqtt(const char* payload, size_t length);
+    bool applyProcedureCmdMqtt(const char* payload, size_t length);
     /** Ao desactivar regra: OFF dos relés que a regra mantinha em ON. */
     void releaseDecisionRuleActuators(const DecisionRule& rule);
     bool parseMqttEcConfigJson(const char* json, size_t len, ECConfig& config);

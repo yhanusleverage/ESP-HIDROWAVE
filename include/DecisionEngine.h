@@ -132,6 +132,8 @@ struct DecisionRule {
     bool has_script;
     /** JSON do objeto script (instruções) — persistido no SPIFFS. */
     String script_json;
+    /** JSON opcional do bloque fsm v2 (TankProcedure). */
+    String fsm_json;
     /** JSON opcional de triggers do procedimento. */
     String procedure_triggers_json;
     
@@ -220,8 +222,8 @@ private:
     
     // Configurações
     static const size_t MAX_RULES = 50;
-    /** Regras + scripts sequenciais (DRENO etc.) — 8K truncava e corrompia. */
-    static const size_t JSON_BUFFER_SIZE = 32768;
+    /** Regras + scripts (Full recharge) — 32k overflow con 2 procedures. */
+    static const size_t JSON_BUFFER_SIZE = 65536;
     static const unsigned long DEFAULT_EVALUATION_INTERVAL = 5000; // 5s
     
 public:

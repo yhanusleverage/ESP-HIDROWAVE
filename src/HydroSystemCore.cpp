@@ -26,6 +26,7 @@
 #include "ESPNowController.h"   // ✅ Include completo para usar métodos
 #include "MasterSlaveManager.h" // ✅ Para integración ESP-NOW
 #include "ScriptRunner.h"
+#include "TankProcedureFsm.h"
 #include <math.h>
 #include <cstdio>
 // ✅ NÃO incluir ESPNowTypes.h aqui - master relays são LOCAIS, não ESP-NOW
@@ -579,6 +580,10 @@ void HydroSystemCore::initDecisionEngine() {
 #if ENABLE_MQTT && RULE_EXECUTED_MIRROR_ENABLED
     decisionEngine.setRuleExecutedMirrorCallback(&HydroSystemCore::onRuleExecutedMirrorStatic, this);
     decisionEngine.setRuleAckTicketCallback(&HydroSystemCore::onRuleAckTicketStatic, this);
+    ScriptRunnerManager::instance().setProcedureFinishedCallback(
+        [this](const ProcedureFinishedEvent& event) { mirrorProcedureFinished(event); });
+    TankProcedureFsmManager::instance().setProcedureFinishedCallback(
+        [this](const ProcedureFinishedEvent& event) { mirrorProcedureFinished(event); });
 #endif
     if (decisionEngine.begin() && decisionIntegration.begin()) {
         decisionEngineReady = true;
@@ -669,6 +674,30 @@ void HydroSystemCore::mirrorRuleExecuted(const RuleExecutedMirrorEvent& event) {
     if (mqttClient.publishRuleExecuted(reading)) {
         lastRuleExecutedMirrorMs = now;
     }
+}
+
+void HydroSystemCore::mirrorProcedureFinished(const ProcedureFinishedEvent& event) {
+    if (!mqttClient.isConnected()) {
+        Serial.println("[MQTT] procedure_finished skipped (offline)");
+        return;
+    }
+    if (event.rule_id.length() == 0 || event.status.length() == 0) {
+        return;
+    }
+
+    const unsigned long now = millis();
+    char eventId[96];
+    snprintf(eventId, sizeof(eventId), "pf-%s-%lu",
+             event.rule_id.c_str(), static_cast<unsigned long>(now));
+
+    MqttProcedureFinishedReading reading = {};
+    reading.event_id = eventId;
+    reading.rule_id = event.rule_id.c_str();
+    reading.status = event.status.c_str();
+    reading.reason = event.reason.length() > 0 ? event.reason.c_str() : nullptr;
+    reading.kind = event.kind.length() > 0 ? event.kind.c_str() : nullptr;
+
+    mqttClient.publishProcedureFinished(reading);
 }
 #endif
 
@@ -4526,6 +4555,10 @@ void HydroSystemCore::handleMqttIncoming(const char* topic, const char* payload,
         }
         return;
     }
+    if (strstr(topic, "/procedure/cmd") != nullptr) {
+        applyProcedureCmdMqtt(payload, length);
+        return;
+    }
     if (strstr(topic, "/rules/manifest") != nullptr) {
         applyRulesManifestMqtt(payload, length);
         return;
@@ -4641,79 +4674,116 @@ bool HydroSystemCore::applyRuleUpsertMqtt(const char* payload, size_t length) {
         return false;
     }
 
-    // Envelope MQTT + rule_json aninhado — 3k estourava e rule_json virava null
-    DynamicJsonDocument doc(8192);
-    DeserializationError err = deserializeJson(doc, payload, length);
-    if (err) {
-        Serial.printf("[MQTT] rules upsert parse: %s (len=%u)\n", err.c_str(),
-                      static_cast<unsigned>(length));
-        return false;
-    }
-    if (doc.overflowed()) {
-        Serial.printf("[MQTT] rules upsert overflow mem=%u len=%u\n",
-                      static_cast<unsigned>(doc.memoryUsage()),
-                      static_cast<unsigned>(length));
-    }
-
-    const char* op = doc["op"] | "upsert";
-    const char* ruleId = doc["rule_id"] | "";
-    if (!ruleId[0] && doc["rule"].is<JsonObject>()) {
-        ruleId = doc["rule"]["rule_id"] | doc["rule"]["id"] | "";
-    }
-
-    if (strcmp(op, "delete") == 0) {
-        if (ruleId[0]) {
-            DecisionRule* existing = decisionEngine.getRule(ruleId);
-            if (existing) {
-                releaseDecisionRuleActuators(*existing);
-            }
-            decisionEngine.removeRule(ruleId);
-            decisionEngine.saveRulesToFile();
-            Serial.printf("[MQTT] rules delete → %s\n", ruleId);
-        }
-        return true;
-    }
-
-    // disable: manter regra no SPIFFS com enabled=false (ativar no Motor sem re-tipar)
-    if (strcmp(op, "disable") == 0) {
-        if (ruleId[0]) {
-            DecisionRule* existing = decisionEngine.getRule(ruleId);
-            if (existing) {
-                releaseDecisionRuleActuators(*existing);
-                existing->enabled = false;
-                ScriptRunnerManager::instance().removeByRuleId(ruleId);
-                decisionEngine.saveRulesToFile();
-                Serial.printf("[MQTT] rules disable (keep) → %s (+OFF actuators)\n", ruleId);
-            } else {
-                Serial.printf("[MQTT] rules disable — %s ausente (noop)\n", ruleId);
-            }
-        }
-        return true;
-    }
-
-    JsonObject ruleObj = doc["rule"].as<JsonObject>();
-    if (ruleObj.isNull()) {
-        ruleObj = doc.as<JsonObject>();
-    }
-    if (ruleObj.isNull()) {
+    // Envelope + script aninhado (Full recharge). 8k truncava → ScriptRunner morto.
+    static const size_t kMqttRuleDocCap = 16384;
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+    if (length > 12000 || maxAlloc < 20000) {
+        Serial.printf(
+            "[MQTT] rules upsert refuse len=%u heap=%u maxAlloc=%u (script anterior preservado)\n",
+            static_cast<unsigned>(length), freeHeap, maxAlloc);
         return false;
     }
 
-    const bool wasEnabled = [&]() {
-        DecisionRule* prev = ruleId[0] ? decisionEngine.getRule(ruleId) : nullptr;
-        return prev && prev->enabled;
-    }();
+    bool ok = false;
+    bool needSave = false;
+    bool releaseAfterDisable = false;
+    String ruleIdStr;
+    String opStr = "upsert";
 
-    const bool ok = decisionEngine.upsertRuleFromJson(ruleObj, true);
-    DecisionRule* after = ruleId[0] ? decisionEngine.getRule(ruleId) : nullptr;
-    const bool nowEnabled = after && after->enabled;
-    if (ok && after && wasEnabled && !nowEnabled) {
-        releaseDecisionRuleActuators(*after);
+    {
+        DynamicJsonDocument doc(kMqttRuleDocCap);
+        DeserializationError err = deserializeJson(doc, payload, length);
+        if (err) {
+            Serial.printf("[MQTT] rules upsert parse: %s (len=%u heap=%u maxAlloc=%u)\n",
+                          err.c_str(), static_cast<unsigned>(length), freeHeap, maxAlloc);
+            return false;
+        }
+        if (doc.overflowed()) {
+            Serial.printf(
+                "[MQTT] rules upsert overflow mem=%u len=%u heap=%u — abort (script preservado)\n",
+                static_cast<unsigned>(doc.memoryUsage()), static_cast<unsigned>(length),
+                freeHeap);
+            return false;
+        }
+
+        opStr = doc["op"] | "upsert";
+        const char* ruleId = doc["rule_id"] | "";
+        if (!ruleId[0] && doc["rule"].is<JsonObject>()) {
+            ruleId = doc["rule"]["rule_id"] | doc["rule"]["id"] | "";
+        }
+        ruleIdStr = ruleId;
+
+        if (opStr == "delete") {
+            if (ruleIdStr.length() > 0) {
+                DecisionRule* existing = decisionEngine.getRule(ruleIdStr);
+                if (existing) {
+                    releaseDecisionRuleActuators(*existing);
+                }
+                decisionEngine.removeRule(ruleIdStr);
+                needSave = true;
+                ok = true;
+                Serial.printf("[MQTT] rules delete → %s\n", ruleIdStr.c_str());
+            }
+        } else if (opStr == "disable") {
+            if (ruleIdStr.length() > 0) {
+                DecisionRule* existing = decisionEngine.getRule(ruleIdStr);
+                if (existing) {
+                    releaseDecisionRuleActuators(*existing);
+                    existing->enabled = false;
+                    ScriptRunnerManager::instance().removeByRuleId(ruleIdStr);
+                    TankProcedureFsmManager::instance().removeByRuleId(ruleIdStr);
+                    needSave = true;
+                    ok = true;
+                    Serial.printf("[MQTT] rules disable (keep) → %s (+OFF actuators)\n",
+                                  ruleIdStr.c_str());
+                } else {
+                    Serial.printf("[MQTT] rules disable — %s ausente (noop)\n",
+                                  ruleIdStr.c_str());
+                    ok = true;
+                }
+            }
+        } else {
+            JsonObject ruleObj = doc["rule"].as<JsonObject>();
+            if (ruleObj.isNull()) {
+                ruleObj = doc.as<JsonObject>();
+            }
+            if (ruleObj.isNull()) {
+                return false;
+            }
+
+            const bool wasEnabled = [&]() {
+                DecisionRule* prev =
+                    ruleIdStr.length() > 0 ? decisionEngine.getRule(ruleIdStr) : nullptr;
+                return prev && prev->enabled;
+            }();
+
+            ok = decisionEngine.upsertRuleFromJson(ruleObj, false);
+            DecisionRule* after =
+                ruleIdStr.length() > 0 ? decisionEngine.getRule(ruleIdStr) : nullptr;
+            const bool nowEnabled = after && after->enabled;
+            if (ok && after && wasEnabled && !nowEnabled) {
+                releaseAfterDisable = true;
+            }
+            needSave = ok;
+            Serial.printf("[MQTT] rules upsert %s enabled=%d → %s len=%u heap=%u\n",
+                          ruleIdStr.length() > 0 ? ruleIdStr.c_str() : "?",
+                          nowEnabled ? 1 : 0,
+                          ok ? "ok" : "fail",
+                          static_cast<unsigned>(length),
+                          static_cast<unsigned>(ESP.getFreeHeap()));
+        }
+    }  // doc MQTT liberado → maxAlloc sobe para SPIFFS
+
+    if (releaseAfterDisable && ruleIdStr.length() > 0) {
+        DecisionRule* after = decisionEngine.getRule(ruleIdStr);
+        if (after) {
+            releaseDecisionRuleActuators(*after);
+        }
     }
-    Serial.printf("[MQTT] rules upsert %s enabled=%d → %s\n",
-                  ruleId[0] ? ruleId : "?",
-                  nowEnabled ? 1 : 0,
-                  ok ? "ok" : "fail");
+    if (needSave) {
+        decisionEngine.saveRulesToFile();
+    }
     return ok;
 }
 
@@ -4774,6 +4844,27 @@ void HydroSystemCore::releaseDecisionRuleActuators(const DecisionRule& rule) {
     }
 }
 
+bool HydroSystemCore::applyProcedureCmdMqtt(const char* payload, size_t length) {
+    if (!payload || length == 0 || !decisionEngineReady) {
+        return false;
+    }
+    StaticJsonDocument<384> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+        Serial.printf("[MQTT] procedure/cmd parse: %s\n", err.c_str());
+        return false;
+    }
+    const char* ruleId = doc["rule_id"] | "";
+    const char* op = doc["op"] | "";
+    if (!ruleId[0] || !op[0]) {
+        Serial.println("[MQTT] procedure/cmd missing rule_id/op");
+        return false;
+    }
+    const bool ok = TankProcedureFsmManager::instance().handleCmd(String(ruleId), String(op));
+    Serial.printf("[MQTT] procedure/cmd rule=%s op=%s → %s\n", ruleId, op, ok ? "ok" : "ignored");
+    return ok;
+}
+
 bool HydroSystemCore::applyRulesManifestMqtt(const char* payload, size_t length) {
     if (!payload || length == 0 || !decisionEngineReady) {
         return false;
@@ -4814,6 +4905,7 @@ bool HydroSystemCore::applyRulesManifestMqtt(const char* payload, size_t length)
                 releaseDecisionRuleActuators(local);
                 local.enabled = false;
                 ScriptRunnerManager::instance().removeByRuleId(local.id);
+                TankProcedureFsmManager::instance().removeByRuleId(local.id);
                 Serial.printf("[MQTT] manifest → disable local %s (+OFF)\n", local.id.c_str());
             }
         }

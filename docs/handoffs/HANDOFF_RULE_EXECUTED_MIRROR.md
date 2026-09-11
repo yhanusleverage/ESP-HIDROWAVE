@@ -40,6 +40,13 @@ Bridge INSERT:
 - `created_by`: `decision_engine_local#{rule_id}`
 - Sin fila `pending` previa
 
+## Relación con `procedure_finished`
+
+ACK de relé (`rule_executed`) **no** equivale al éxito de un Full recharge.
+El resultado oficial de procedimientos se publica en `hidrowave/{id}/procedure_finished`
+→ `procedure_events` (ver `HIDROWAVE-main/docs/engineering/PROCEDURE_SIMPLE_VS_FULL_RECHARGE.md`).
+Ambos flujos conviven; no sustituir `rule_executed`.
+
 ## Firmware
 
 | Flag | Default | Descripción |

@@ -8,8 +8,139 @@ ScriptRunnerManager& ScriptRunnerManager::instance() {
     return mgr;
 }
 
+void ScriptRunnerManager::notifyProcedureFinished(ActiveScript& script, const char* status,
+                                                   const char* reason) {
+    if (!script.isProcedure || script.finishedNotified) {
+        return;
+    }
+    script.finishedNotified = true;
+    ProcedureFinishedEvent ev;
+    ev.rule_id = script.ruleId;
+    ev.status = status ? status : "aborted";
+    ev.reason = reason ? reason : "";
+    ev.kind = script.procedureKind.length() > 0 ? script.procedureKind : "procedure";
+    Serial.printf("[SCRIPT] procedure_finished rule=%s status=%s reason=%s kind=%s\n",
+                  ev.rule_id.c_str(), ev.status.c_str(), ev.reason.c_str(), ev.kind.c_str());
+    if (procedureFinishedCb_) {
+        procedureFinishedCb_(ev);
+    }
+}
+
+void ScriptRunnerManager::abortScript(ActiveScript& script, const char* reason) {
+    forceOffScriptActuators(script);
+    script.whileStack.clear();
+    script.inBody = false;
+    script.bodyPc = 0;
+    script.pc = script.instructions.size();
+    script.delayTicksLeft = 0;
+    script.waitLitersArmed = false;
+    script.recircStarted = false;
+    releaseProcedureGate(script);
+    notifyProcedureFinished(script, "aborted", reason);
+}
+
+void ScriptRunnerManager::collectRelayTargets(
+    const ScriptInstr& instr, std::vector<std::pair<int, String>>& out) const {
+    if (instr.type == "relay_action") {
+        int relay = instr.relay;
+        String target = instr.targetDeviceId;
+        if (instr.role.length() > 0 && roleResolveCb_) {
+            if (!roleResolveCb_(instr.role, target, relay)) {
+                return;
+            }
+        }
+        if (relay < 0 || relay > 7) {
+            return;
+        }
+        for (const auto& existing : out) {
+            if (existing.first == relay && existing.second == target) {
+                return;
+            }
+        }
+        out.push_back({relay, target});
+        return;
+    }
+    if (instr.type == "while") {
+        for (const auto& child : instr.body) {
+            collectRelayTargets(child, out);
+        }
+    }
+}
+
+void ScriptRunnerManager::forceOffScriptActuators(const ActiveScript& script) {
+    if (!lastRelayFn_) {
+        return;
+    }
+    std::vector<std::pair<int, String>> targets;
+    for (const auto& instr : script.instructions) {
+        collectRelayTargets(instr, targets);
+    }
+    for (const auto& t : targets) {
+        Serial.printf("🛑 [SCRIPT] force OFF R%d device=%s rule=%s\n",
+                      t.first, t.second.c_str(), script.ruleId.c_str());
+        lastRelayFn_(t.first, false, t.second, 0, script.priority, script.ruleId);
+    }
+}
+
+void ScriptRunnerManager::classifyScript(ActiveScript& script, const JsonObject& ruleJson) {
+    String execClass = ruleJson["execution_class"] | "";
+    execClass.toLowerCase();
+    String kind = ruleJson["procedure_kind"] | "";
+    kind.toLowerCase();
+
+    bool hasWhile = false;
+    bool hasWait = false;
+    bool hasDrainRole = false;
+    bool hasFillRole = false;
+    for (const auto& ins : script.instructions) {
+        if (ins.type == "while" || ins.type == "wait_level" || ins.type == "wait_liters" ||
+            ins.type == "recirc" || ins.type == "block_auto") {
+            hasWhile = hasWhile || (ins.type == "while");
+            hasWait = hasWait || (ins.type == "wait_level" || ins.type == "wait_liters" ||
+                                  ins.type == "recirc" || ins.type == "block_auto");
+        }
+        if (ins.type == "while") {
+            for (const auto& child : ins.body) {
+                if (child.role == "drain") hasDrainRole = true;
+                if (child.role == "fill") hasFillRole = true;
+            }
+        }
+        if (ins.role == "drain") hasDrainRole = true;
+        if (ins.role == "fill") hasFillRole = true;
+    }
+
+    const bool looksProcedure = hasWhile || hasWait || execClass == "procedure";
+    if (execClass == "simple") {
+        script.isProcedure = false;
+        script.procedureKind = "simple";
+        return;
+    }
+
+    script.isProcedure = looksProcedure || execClass == "procedure";
+    if (!script.isProcedure) {
+        script.procedureKind = "simple";
+        return;
+    }
+
+    if (kind.length() > 0) {
+        script.procedureKind = kind;
+    } else if (hasDrainRole && hasFillRole) {
+        script.procedureKind = "full_recharge";
+    } else if (hasDrainRole) {
+        script.procedureKind = "drain_only";
+    } else if (hasFillRole) {
+        script.procedureKind = "fill_only";
+    } else {
+        script.procedureKind = "generic";
+    }
+}
+
 void ScriptRunnerManager::clear() {
     for (auto& script : scripts_) {
+        if (script.isProcedure && !script.finishedNotified) {
+            notifyProcedureFinished(script, "aborted", "clear");
+        }
+        forceOffScriptActuators(script);
         releaseProcedureGate(script);
     }
     scripts_.clear();
@@ -18,6 +149,10 @@ void ScriptRunnerManager::clear() {
 bool ScriptRunnerManager::removeByRuleId(const String& ruleId) {
     for (auto it = scripts_.begin(); it != scripts_.end(); ++it) {
         if (it->ruleId == ruleId) {
+            if (it->isProcedure && !it->finishedNotified) {
+                notifyProcedureFinished(*it, "aborted", "removed");
+            }
+            forceOffScriptActuators(*it);
             releaseProcedureGate(*it);
             scripts_.erase(it);
             return true;
@@ -140,7 +275,22 @@ bool ScriptRunnerManager::parseInstr(const JsonObject& j, ScriptInstr& out) {
     }
     out.type.toLowerCase();
     if (out.type == "relay_action") {
-        out.relay = j["relay_number"] | j["relay"] | 0;
+        // No encadenar JsonVariant con | (puede devolver default y caer a R0).
+        if (!j["relay_number"].isNull()) {
+            out.relay = j["relay_number"].is<const char*>()
+                            ? String(j["relay_number"].as<const char*>()).toInt()
+                            : j["relay_number"].as<int>();
+        } else if (!j["relay"].isNull()) {
+            out.relay = j["relay"].is<const char*>()
+                            ? String(j["relay"].as<const char*>()).toInt()
+                            : j["relay"].as<int>();
+        } else {
+            out.relay = -1;
+        }
+        if (out.relay < 0 || out.relay > 7) {
+            Serial.println("⚠️ [SCRIPT] relay_action sin relay_number válido — skip");
+            return false;
+        }
         out.action = j["action"] | "on";
         out.action.toLowerCase();
         if (j.containsKey("role")) {
@@ -156,6 +306,10 @@ bool ScriptRunnerManager::parseInstr(const JsonObject& j, ScriptInstr& out) {
                 out.targetDeviceId = j["slave_mac"].as<String>();
             } else if (target == "slave" && j.containsKey("target_device_id")) {
                 out.targetDeviceId = j["target_device_id"].as<String>();
+            } else if (target == "slave") {
+                Serial.printf("⚠️ [SCRIPT] relay_action slave sin MAC R%d — skip parse\n",
+                              out.relay);
+                return false;
             }
         }
         if (j.containsKey("duration_ms")) {
@@ -256,14 +410,35 @@ bool ScriptRunnerManager::loadFromRuleJson(const String& ruleId, int priority,
         }
     }
     parseTriggers(trigVar, active.timeWindow, active.cycleWeek);
+    classifyScript(active, ruleJson);
 
+    int whileCount = 0;
+    for (const auto& ins : active.instructions) {
+        if (ins.type == "while") {
+            whileCount++;
+        }
+    }
+
+    bool replaced = false;
     for (auto it = scripts_.begin(); it != scripts_.end(); ++it) {
         if (it->ruleId == ruleId) {
             *it = active;
-            return true;
+            replaced = true;
+            break;
         }
     }
-    scripts_.push_back(active);
+    if (!replaced) {
+        scripts_.push_back(active);
+    }
+
+    Serial.printf("[SCRIPT] loaded rule=%s instr=%u while=%d kind=%s pri=%d heap=%u%s\n",
+                  ruleId.c_str(),
+                  static_cast<unsigned>(active.instructions.size()),
+                  whileCount,
+                  active.procedureKind.c_str(),
+                  priority,
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  replaced ? " (replaced)" : "");
     return true;
 }
 
@@ -322,21 +497,13 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
         const auto& frame = script.whileStack.back();
         if (frame.whilePc >= script.instructions.size()) {
             Serial.printf("⚠️ [SCRIPT] whilePc OOB rule=%s — abort script\n", script.ruleId.c_str());
-            script.whileStack.clear();
-            script.inBody = false;
-            script.bodyPc = 0;
-            script.pc = script.instructions.size();  // não reentrar em loop
-            releaseProcedureGate(script);
+            abortScript(script, "abort");
             return;
         }
         const ScriptInstr& whileInstr = script.instructions[frame.whilePc];
         if (whileInstr.type != "while") {
             Serial.printf("⚠️ [SCRIPT] whilePc não é while rule=%s — abort script\n", script.ruleId.c_str());
-            script.whileStack.clear();
-            script.inBody = false;
-            script.bodyPc = 0;
-            script.pc = script.instructions.size();
-            releaseProcedureGate(script);
+            abortScript(script, "abort");
             return;
         }
         seq = &whileInstr.body;
@@ -347,32 +514,28 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
         if (script.inBody && !script.whileStack.empty()) {
             auto& frame = script.whileStack.back();
             if (frame.whilePc >= script.instructions.size()) {
-                script.whileStack.clear();
-                script.inBody = false;
-                script.bodyPc = 0;
+                abortScript(script, "abort");
                 return;
             }
             const ScriptInstr& whileInstr = script.instructions[frame.whilePc];
             frame.iterations++;
+            // Timeout while = Aborted (Full recharge no finge éxito parcial).
             if (whileInstr.maxIterations > 0 && frame.iterations >= whileInstr.maxIterations) {
-                script.whileStack.pop_back();
-                script.inBody = false;
-                script.bodyPc = 0;
-                script.pc = frame.whilePc + 1;
+                Serial.printf("⚠️ [SCRIPT] while max_iterations rule=%s — aborted\n",
+                              script.ruleId.c_str());
+                abortScript(script, "while_timeout");
                 return;
             }
             // Cap de segurança: evita loop infinito sem delay (LoadProhibited / WDT)
             if (whileInstr.maxIterations <= 0 && frame.iterations >= 500) {
                 Serial.printf("⚠️ [SCRIPT] while sem max_iterations >500 — abort rule=%s\n",
                               script.ruleId.c_str());
-                script.whileStack.pop_back();
-                script.inBody = false;
-                script.bodyPc = 0;
-                script.pc = frame.whilePc + 1;
-                releaseProcedureGate(script);
+                abortScript(script, "while_timeout");
                 return;
             }
             if (!evalCond(whileInstr, state)) {
+                Serial.printf("[SCRIPT] exit while rule=%s after %d iter (wl=%s)\n",
+                              script.ruleId.c_str(), frame.iterations, state.water_level);
                 script.whileStack.pop_back();
                 script.inBody = false;
                 script.bodyPc = 0;
@@ -382,8 +545,9 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
             script.bodyPc = 0;
             return;
         }
-        // Secuencia terminada — liberar Auto EC/pH.
+        // Secuencia terminada — liberar Auto EC/pH + Complete.
         releaseProcedureGate(script);
+        notifyProcedureFinished(script, "completed", "end");
         return;
     }
 
@@ -410,9 +574,22 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
         }
         engageProcedureGate(script);
         if (!evalCond(ins, state)) {
+            Serial.printf("[SCRIPT] skip while rule=%s %s %s %s (wl=%s)\n",
+                          script.ruleId.c_str(),
+                          ins.sensor.c_str(),
+                          ins.op.c_str(),
+                          ins.value.c_str(),
+                          state.water_level);
             (*pc)++;
             return;
         }
+        Serial.printf("[SCRIPT] enter while rule=%s %s %s %s (wl=%s) maxIter=%d\n",
+                      script.ruleId.c_str(),
+                      ins.sensor.c_str(),
+                      ins.op.c_str(),
+                      ins.value.c_str(),
+                      state.water_level,
+                      ins.maxIterations);
         ActiveScript::WhileCtx frame;
         frame.whilePc = *pc;
         frame.iterations = 0;
@@ -517,6 +694,7 @@ void ScriptRunnerManager::runStep(ActiveScript& script, const SystemState& state
 }
 
 void ScriptRunnerManager::tickAll(const SystemState& state, RelayFn relayFn) {
+    lastRelayFn_ = relayFn;
     for (auto& script : scripts_) {
         if (!inTimeWindow(script.timeWindow)) {
             continue;

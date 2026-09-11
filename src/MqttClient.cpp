@@ -97,6 +97,14 @@ bool MqttClientWrapper::subscribeInboundTopics() {
             ok = false;
         }
     }
+    if (procedureCmdTopic.length() > 0) {
+        if (mqtt.subscribe(procedureCmdTopic.c_str(), 1)) {
+            Serial.printf("[MQTT] subscribe procedure/cmd QoS1 %s\n", procedureCmdTopic.c_str());
+        } else {
+            Serial.println("[MQTT] subscribe procedure/cmd failed");
+            ok = false;
+        }
+    }
     return ok;
 }
 
@@ -112,6 +120,7 @@ bool MqttClientWrapper::begin(const String& id) {
     circConfigTopic = String("hidrowave/") + deviceId + "/circ/config";
     rulesWildcardTopic = String("hidrowave/") + deviceId + "/rules/#";
     rulesManifestTopic = String("hidrowave/") + deviceId + "/rules/manifest";
+    procedureCmdTopic = String("hidrowave/") + deviceId + "/procedure/cmd";
     ecOperationTopic = String("hidrowave/") + deviceId + "/ec_operation";
     doseTopic = String("hidrowave/") + deviceId + "/dose";
     phOperationTopic = String("hidrowave/") + deviceId + "/ph_operation";
@@ -123,6 +132,7 @@ bool MqttClientWrapper::begin(const String& id) {
     ecDilutionTopic = String("hidrowave/") + deviceId + "/ec_dilution";
     commandAckTopic = String("hidrowave/") + deviceId + "/command_ack";
     ruleExecutedTopic = String("hidrowave/") + deviceId + "/rule_executed";
+    procedureFinishedTopic = String("hidrowave/") + deviceId + "/procedure_finished";
     relayStateTopic = String("hidrowave/") + deviceId + "/relay/state";
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     callbackInstance = this;
@@ -820,6 +830,42 @@ bool MqttClientWrapper::publishRuleExecuted(const MqttRuleExecutedReading& readi
                       reading.success ? 1 : 0);
     } else {
         Serial.println("[MQTT] rule_executed publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishProcedureFinished(const MqttProcedureFinishedReading& reading) {
+    if (!mqtt.connected() || !reading.event_id || !reading.event_id[0] ||
+        !reading.rule_id || !reading.rule_id[0] || !reading.status || !reading.status[0]) {
+        return false;
+    }
+
+    StaticJsonDocument<384> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["ts"] = (uint32_t)(millis() / 1000UL);
+    doc["event_id"] = reading.event_id;
+    doc["rule_id"] = reading.rule_id;
+    doc["status"] = reading.status;
+    if (reading.reason && reading.reason[0]) {
+        doc["reason"] = reading.reason;
+    }
+    if (reading.kind && reading.kind[0]) {
+        doc["kind"] = reading.kind;
+    }
+
+    char payload[384];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0 || len >= sizeof(payload)) {
+        return false;
+    }
+
+    bool published = mqtt.publish(procedureFinishedTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] procedure_finished event=%s rule=%s status=%s\n",
+                      reading.event_id, reading.rule_id, reading.status);
+    } else {
+        Serial.println("[MQTT] procedure_finished publish failed");
     }
     return published;
 }

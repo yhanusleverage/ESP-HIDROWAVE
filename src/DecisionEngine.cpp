@@ -3,6 +3,7 @@
 #include "MasterSlaveManager.h"
 #include "RelayCoordinator.h"
 #include "ScriptRunner.h"
+#include "TankProcedureFsm.h"
 #include "ResourceTelemetry.h"
 
 namespace {
@@ -132,6 +133,12 @@ bool DecisionEngine::begin() {
                 tank_procedure_gate_callback(active);
             }
         });
+    TankProcedureFsmManager::instance().setTankProcedureGateCallback(
+        [this](bool active) {
+            if (tank_procedure_gate_callback) {
+                tank_procedure_gate_callback(active);
+            }
+        });
     
     return true;
 }
@@ -171,6 +178,28 @@ void DecisionEngine::loop() {
             const String rid = ruleId.length() > 0 ? ruleId : String("script");
             executeRelayAction(action, rid, owner);
         });
+
+    TankProcedureFsmManager::instance().tickAll(current_state,
+        [this](int relay, bool on, const String& targetDeviceId, unsigned long durationMs,
+               int priority, const String& ruleId) {
+            if (dry_run_mode) {
+                Serial.printf("🧪 [PROC DRY-RUN] rule=%s relay=%d %s\n",
+                              ruleId.c_str(), relay, on ? "ON" : "OFF");
+                return;
+            }
+            if (relay < 0 || relay >= MAX_RELAYS) {
+                return;
+            }
+            RuleAction action;
+            action.type = on ? RELAY_ON : RELAY_OFF;
+            action.target_relay = relay;
+            action.target_device_id = sanitizeDeviceIdOrMac(targetDeviceId);
+            action.duration_ms = durationMs;
+            const RelayOwner owner = (priority >= TANK_SCRIPT_PRIORITY_THRESHOLD)
+                ? RelayOwner::TankScriptP1
+                : RelayOwner::DecisionRule;
+            executeRelayAction(action, ruleId.length() > 0 ? ruleId : String("proc"), owner);
+        });
 }
 
 void DecisionEngine::end() {
@@ -204,6 +233,7 @@ bool DecisionEngine::loadRulesFromFile(const String& filename) {
     
     rules.clear();
     ScriptRunnerManager::instance().clear();
+    TankProcedureFsmManager::instance().clear();
 
     int skipped = 0;
     JsonArray rules_array = doc["rules"].as<JsonArray>();
@@ -242,7 +272,20 @@ bool DecisionEngine::loadRulesFromFile(const String& filename) {
 }
 
 bool DecisionEngine::saveRulesToFile(const String& filename) {
-    DynamicJsonDocument doc(JSON_BUFFER_SIZE);
+    // 65k fijos fallan con maxAlloc~47k (heap fragmentado) → overflow falso.
+    const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+    size_t cap = JSON_BUFFER_SIZE;
+    if (maxAlloc > 12288) {
+        const size_t safe = static_cast<size_t>(maxAlloc) - 8192;
+        if (safe < cap) {
+            cap = safe;
+        }
+    } else {
+        Serial.printf("❌ [DE] saveRulesToFile: maxAlloc=%u insuficiente\n", maxAlloc);
+        return false;
+    }
+
+    DynamicJsonDocument doc(cap);
     JsonArray rules_array = doc.createNestedArray("rules");
     
     for (const auto& rule : rules) {
@@ -251,7 +294,11 @@ bool DecisionEngine::saveRulesToFile(const String& filename) {
     }
 
     if (doc.overflowed()) {
-        Serial.println("❌ [DE] saveRulesToFile: JSON overflow — aumente JSON_BUFFER_SIZE");
+        Serial.printf(
+            "❌ [DE] saveRulesToFile: JSON overflow cap=%u maxAlloc=%u usage=%u — "
+            "slim scripts / menos regras\n",
+            static_cast<unsigned>(cap), maxAlloc,
+            static_cast<unsigned>(doc.memoryUsage()));
         return false;
     }
     
@@ -264,7 +311,9 @@ bool DecisionEngine::saveRulesToFile(const String& filename) {
     serializeJson(doc, file);
     file.close();
     
-    Serial.println("✅ Regras salvas em: " + filename);
+    Serial.printf("✅ Regras salvas em: %s (cap=%u usage=%u)\n",
+                  filename.c_str(), static_cast<unsigned>(cap),
+                  static_cast<unsigned>(doc.memoryUsage()));
     return true;
 }
 
@@ -298,6 +347,7 @@ bool DecisionEngine::removeRule(const String& rule_id) {
         if (it->id == rule_id) {
             Serial.println("🗑️ Removendo regra: " + it->name);
             ScriptRunnerManager::instance().removeByRuleId(rule_id);
+            TankProcedureFsmManager::instance().removeByRuleId(rule_id);
             rules.erase(it);
             return true;
         }
@@ -307,19 +357,11 @@ bool DecisionEngine::removeRule(const String& rule_id) {
 }
 
 bool DecisionEngine::upsertRuleFromJson(const JsonObject& json_rule, bool persist) {
-    String peekId;
-    if (json_rule.containsKey("rule_id")) {
-        peekId = json_rule["rule_id"].as<String>();
-    } else if (json_rule.containsKey("id")) {
-        peekId = json_rule["id"].as<String>();
-    }
-    if (peekId.length() > 0) {
-        ScriptRunnerManager::instance().removeByRuleId(peekId);
-    }
-
+    // NÃO remover ScriptRunner antes do parse: se o JSON falhar/overflow,
+    // o script anterior (ex.: só-dreno) deve continuar vivo.
     DecisionRule rule;
     if (!parseRuleFromJSON(json_rule, rule)) {
-        Serial.println("❌ [DE] upsertRuleFromJson: parse falhou");
+        Serial.println("❌ [DE] upsertRuleFromJson: parse falhou (script anterior preservado)");
         return false;
     }
     String validation_error;
@@ -344,11 +386,15 @@ bool DecisionEngine::upsertRuleFromJson(const JsonObject& json_rule, bool persis
         rules.push_back(rule);
     }
 
-    Serial.printf("✅ [DE] Regra %s %s: %s\n",
+    Serial.printf("✅ [DE] Regra %s %s: %s has_script=%d\n",
                   replaced ? "atualizada" : "adicionada",
-                  rule.id.c_str(), rule.name.c_str());
+                  rule.id.c_str(), rule.name.c_str(), rule.has_script ? 1 : 0);
 
-    if (!rule.enabled) {
+    // Commit runners: parse ya cargó Script o Tank FSM.
+    if (!rule.enabled || !rule.has_script) {
+        ScriptRunnerManager::instance().removeByRuleId(rule.id);
+        TankProcedureFsmManager::instance().removeByRuleId(rule.id);
+    } else if (TankProcedureFsmManager::instance().hasRule(rule.id)) {
         ScriptRunnerManager::instance().removeByRuleId(rule.id);
     }
 
@@ -1137,7 +1183,8 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
 
     // rule_json pode ser objeto, string JSON, ou ausente.
     // NUNCA substituir rule_body por null se rule_json existir mas for inválido.
-    DynamicJsonDocument nestedRuleJson(4096);
+    // 4k truncaba Full recharge (2 while + MAC) → infer fallaba → ScriptRunner.
+    DynamicJsonDocument nestedRuleJson(24576);
     JsonObject rule_body = json_rule;
     if (json_rule.containsKey("rule_json")) {
         JsonVariant rj = json_rule["rule_json"];
@@ -1291,7 +1338,14 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
 
     rule.has_script = false;
     rule.script_json = "";
+    rule.fsm_json = "";
     rule.procedure_triggers_json = "";
+    JsonObject fsmPersist = rule_body["fsm"].as<JsonObject>();
+    if (!fsmPersist.isNull()) {
+        String fsmBlob;
+        serializeJson(fsmPersist, fsmBlob);
+        rule.fsm_json = fsmBlob;
+    }
     JsonObject scriptObj = rule_body["script"].as<JsonObject>();
     if (!scriptObj.isNull() && scriptObj.containsKey("instructions")) {
         JsonArray scriptInstr = scriptObj["instructions"].as<JsonArray>();
@@ -1320,8 +1374,76 @@ bool DecisionEngine::parseRuleFromJSON(const JsonObject& json_rule, DecisionRule
                 serializeJson(triggers, trigBlob);
                 rule.procedure_triggers_json = trigBlob;
             }
-            ScriptRunnerManager::instance().loadFromRuleJson(
-                rule.id, rule.priority, rule_body, triggers);
+            // Preferir Tank FSM (water_level while / fsm v2); si no, ScriptRunner legado.
+            bool tankOk = TankProcedureFsmManager::instance().loadFromRuleJson(
+                rule.id, rule.priority, rule.enabled, rule_body, triggers);
+            // Envelope MQTT legado: script a veces en raíz del rule
+            if (!tankOk && json_rule.containsKey("script")) {
+                Serial.println("[PROC] retry load desde envelope rule.script");
+                tankOk = TankProcedureFsmManager::instance().loadFromRuleJson(
+                    rule.id, rule.priority, rule.enabled, json_rule, triggers);
+            }
+            // Si rule_body tiene fsm pero load falló por script, reintentar solo no aplica —
+            // loadFromRuleJson ya prueba fsm antes que infer.
+            if (tankOk) {
+                ScriptRunnerManager::instance().removeByRuleId(rule.id);
+            } else {
+                TankProcedureFsmManager::instance().removeByRuleId(rule.id);
+                // Si parece tanque water_level, NO caer a ScriptRunner (auto-start + relé mal).
+                bool looksTank = !rule_body["fsm"].isNull();
+                JsonObject scr = rule_body["script"].as<JsonObject>();
+                if (scr.isNull()) {
+                    scr = json_rule["script"].as<JsonObject>();
+                }
+                if (!looksTank && !scr.isNull()) {
+                    JsonArray ia = scr["instructions"].as<JsonArray>();
+                    if (!ia.isNull()) {
+                        for (JsonObject ij : ia) {
+                            String t = ij["type"] | "";
+                            t.toLowerCase();
+                            if (t != "while") {
+                                continue;
+                            }
+                            JsonObject c = ij["condition"].as<JsonObject>();
+                            String s = c["sensor"] | "";
+                            s.toLowerCase();
+                            if (s == "water_level") {
+                                looksTank = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (looksTank) {
+                    Serial.println(
+                        "⚠️ [DE] Tank FSM infer falló — ScriptRunner NO cargado (evita auto-start)");
+                } else {
+                    ScriptRunnerManager::instance().loadFromRuleJson(
+                        rule.id, rule.priority, rule_body, triggers);
+                }
+            }
+        }
+    }
+
+    // FSM v2 sin script.instructions (solo bloque fsm)
+    if (!rule.has_script) {
+        JsonObject fsmOnly = rule_body["fsm"].as<JsonObject>();
+        if (!fsmOnly.isNull()) {
+            JsonVariant triggers;
+            if (json_rule.containsKey("procedure_triggers")) {
+                triggers = json_rule["procedure_triggers"];
+            } else if (rule_body.containsKey("procedure_triggers")) {
+                triggers = rule_body["procedure_triggers"];
+            } else if (rule_body.containsKey("triggers")) {
+                triggers = rule_body["triggers"];
+            }
+            if (TankProcedureFsmManager::instance().loadFromRuleJson(
+                    rule.id, rule.priority, rule.enabled, rule_body, triggers)) {
+                rule.has_script = true;
+                rule.condition.type = TIME_WINDOW;
+                rule.condition.sensor_name = "time_window";
+                ScriptRunnerManager::instance().removeByRuleId(rule.id);
+            }
         }
     }
 
@@ -1372,6 +1494,9 @@ void DecisionEngine::ruleToJSON(const DecisionRule& rule, JsonObject& out, JsonD
     if (rule.has_script && rule.script_json.length() > 0) {
         // serialized() injeta JSON cru como objeto (evita cópia frágil entre docs)
         out["script"] = serialized(rule.script_json.c_str());
+    }
+    if (rule.fsm_json.length() > 0) {
+        out["fsm"] = serialized(rule.fsm_json.c_str());
     }
     if (rule.procedure_triggers_json.length() > 0) {
         out["procedure_triggers"] = serialized(rule.procedure_triggers_json.c_str());

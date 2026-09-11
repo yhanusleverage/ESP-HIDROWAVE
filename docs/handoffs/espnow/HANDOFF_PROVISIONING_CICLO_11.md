@@ -4,8 +4,10 @@
 **Repos:** `ESP-HIDROWAVE-main` (Master) + `ESPNOW-SLAVE-TASK-main` (Slave)  
 **Fecha:** 2 sep 2026  
 
-> **Actualización 2026-09-09:** anti-re-burst / ACK-only y latch Master — ver  
-> [`HANDOFF_PROVISIONING_CREDS_STABLE.md`](./HANDOFF_PROVISIONING_CREDS_STABLE.md)
+> **2026-09-10 — VALIDADO EN CAMPO:** enlace estable. Contrato congelado  
+> (“así debe permanecer”) →  
+> [`HANDOFF_PROVISIONING_CREDS_STABLE.md`](./HANDOFF_PROVISIONING_CREDS_STABLE.md)  
+> No regresar a Slave+WiFi AP, sync en ch11, re-burst destructivo ni timer 3600 fantasma.
 
 ---
 
