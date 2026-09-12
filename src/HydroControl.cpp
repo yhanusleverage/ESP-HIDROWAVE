@@ -2454,6 +2454,103 @@ int HydroControl::getEcOperationRemainingSec() const {
     return computeEcOperationRemainingSec();
 }
 
+namespace {
+int estimatePulsedDoseSec(float remainingMl, float pulseMl, float pulseGapSec, float flowMlPerS) {
+    if (remainingMl <= 0.001f || flowMlPerS < 0.01f) {
+        return 0;
+    }
+    float chunk = pulseMl;
+    if (chunk < 0.05f) {
+        chunk = 0.05f;
+    }
+    const int pulses = (int)ceilf(remainingMl / chunk);
+    const float onSec = remainingMl / flowMlPerS;
+    const float gapSec = (pulses > 1) ? (float)(pulses - 1) * pulseGapSec : 0.0f;
+    return (int)ceilf(onSec + gapSec);
+}
+}  // namespace
+
+int HydroControl::computeEcOperationCycleRemainingSec() const {
+    // Diluição tem countdown de fase próprio — fora do ETA de dose.
+    if (dilutionState != DILUTION_IDLE) {
+        return 0;
+    }
+    if (currentState == IDLE) {
+        return 0;
+    }
+
+    const unsigned long now = millis();
+    const unsigned long elapsedMs = now - stateStartTime;
+    int total = 0;
+
+    if (currentState == RECIRCULATING) {
+        const long rem = (long)tempoRecirculacaoSeconds - (long)(elapsedMs / 1000UL);
+        return rem > 0 ? (int)rem : 0;
+    }
+
+    // Homogeneização completa ainda à frente.
+    total += (int)tempoRecirculacaoSeconds;
+
+    auto addNutrientFull = [&](int idx) {
+        if (idx < 0 || idx >= totalNutrients) {
+            return;
+        }
+        const SimpleNutrient& n = nutrients[idx];
+        total += estimatePulsedDoseSec(n.dosageML, ecPulseMl, ecPulseGapSec, n.flowRateMlPerS);
+    };
+
+    if (currentState == WAITING) {
+        long remWait = (long)intervalSeconds - (long)(elapsedMs / 1000UL);
+        if (remWait > 0) {
+            total += (int)remWait;
+        }
+        // currentNutrientIndex já aponta ao próximo nutriente.
+        for (int i = currentNutrientIndex; i < totalNutrients; i++) {
+            if (i > currentNutrientIndex) {
+                total += intervalSeconds;
+            }
+            addNutrientFull(i);
+        }
+        return total;
+    }
+
+    // DOSING ou PULSE_GAP — nutriente atual em curso.
+    if (currentNutrientIndex >= 0 && currentNutrientIndex < totalNutrients) {
+        const SimpleNutrient& n = nutrients[currentNutrientIndex];
+        float remMl = pulseRemainingMl;
+        if (currentState == DOSING) {
+            long remOn = (long)(pulseOnDurationMs - elapsedMs) / 1000L;
+            if (remOn > 0) {
+                total += (int)remOn;
+            }
+            remMl = pulseRemainingMl - pulseChunkMl;
+            if (remMl < 0.0f) {
+                remMl = 0.0f;
+            }
+            if (remMl > 0.001f && ecPulseGapSec > 0.0f) {
+                total += (int)ceilf(ecPulseGapSec);
+            }
+        } else if (currentState == PULSE_GAP) {
+            long remGap = (long)(ecPulseGapSec * 1000.0f - (float)elapsedMs) / 1000L;
+            if (remGap > 0) {
+                total += (int)remGap;
+            }
+        }
+        total += estimatePulsedDoseSec(remMl, ecPulseMl, ecPulseGapSec, n.flowRateMlPerS);
+    }
+
+    for (int i = currentNutrientIndex + 1; i < totalNutrients; i++) {
+        total += intervalSeconds;
+        addNutrientFull(i);
+    }
+
+    return total > 0 ? total : 0;
+}
+
+int HydroControl::getEcOperationCycleRemainingSec() const {
+    return computeEcOperationCycleRemainingSec();
+}
+
 int HydroControl::getEcNextCheckInSec() const {
     if (dilutionState != DILUTION_IDLE || currentState != IDLE) {
         return 0;
@@ -2915,6 +3012,56 @@ int HydroControl::computePhOperationRemainingSec() const {
 
 int HydroControl::getPhOperationRemainingSec() const {
     return computePhOperationRemainingSec();
+}
+
+int HydroControl::computePhOperationCycleRemainingSec() const {
+    if (phAutoState == PH_IDLE) {
+        return 0;
+    }
+
+    const unsigned long elapsedMs = millis() - phStateStartMs;
+    int total = 0;
+
+    if (phAutoState == PH_RECIRCULATING) {
+        const long rem = (long)phRecircSeconds - (long)(elapsedMs / 1000UL);
+        return rem > 0 ? (int)rem : 0;
+    }
+
+    total += (int)phRecircSeconds;
+
+    float flow = 1.0f;
+    if (phActivePath == PH_PATH_BASE) {
+        flow = flowRatePhUp > 0.01f ? flowRatePhUp : 1.0f;
+    } else {
+        flow = flowRatePhDown > 0.01f ? flowRatePhDown : 1.0f;
+    }
+
+    float remMl = phPulseRemainingMl;
+    if (phAutoState == PH_DOSING) {
+        long remOn = (long)(phPulseOnDurationMs - elapsedMs) / 1000L;
+        if (remOn > 0) {
+            total += (int)remOn;
+        }
+        remMl = phPulseRemainingMl - phPulseChunkMl;
+        if (remMl < 0.0f) {
+            remMl = 0.0f;
+        }
+        if (remMl > 0.001f && phPulseGapSec > 0.0f) {
+            total += (int)ceilf(phPulseGapSec);
+        }
+    } else if (phAutoState == PH_PULSE_GAP) {
+        long remGap = (long)(phPulseGapSec * 1000.0f - (float)elapsedMs) / 1000L;
+        if (remGap > 0) {
+            total += (int)remGap;
+        }
+    }
+
+    total += estimatePulsedDoseSec(remMl, phPulseMl, phPulseGapSec, flow);
+    return total > 0 ? total : 0;
+}
+
+int HydroControl::getPhOperationCycleRemainingSec() const {
+    return computePhOperationCycleRemainingSec();
 }
 
 int HydroControl::getPhNextCheckInSec() const {

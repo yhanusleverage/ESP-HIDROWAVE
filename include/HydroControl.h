@@ -260,6 +260,8 @@ public:
     /** Estado operacional Auto EC para UI (relay_master.ec_operation_*). */
     const char* getEcOperationStateName() const;
     int getEcOperationRemainingSec() const;
+    /** Resto do ciclo dose+homogeneização (não diluição). 0 se idle/diluindo. */
+    int getEcOperationCycleRemainingSec() const;
     int getEcNextCheckInSec() const;
     float getEcDilutionTargetL() const {
         // Em filling a UI não usa litros como stop — target só faz sentido no dreno.
@@ -334,6 +336,8 @@ public:
     void setPhOperationSyncCallback(PhOperationSyncCallback cb, void* userData);
     const char* getPhOperationStateName() const;
     int getPhOperationRemainingSec() const;
+    /** Resto do ciclo dose pH + homogeneização. 0 se idle. */
+    int getPhOperationCycleRemainingSec() const;
     int getPhNextCheckInSec() const;
     
     // ✅ TEMPO MORTO (recirculação)
@@ -644,7 +648,9 @@ private:
                                 PhCorrectionPath path, const PhDosePlan* plan,
                                 const String& sequenceId);
     int computeEcOperationRemainingSec() const;
+    int computeEcOperationCycleRemainingSec() const;
     int computePhOperationRemainingSec() const;
+    int computePhOperationCycleRemainingSec() const;
     
     // ✅ Persistência em NVS (privadas - carregamento automático)
     void loadECControllerConfig();  // Carregar configuração do Controller ao iniciar

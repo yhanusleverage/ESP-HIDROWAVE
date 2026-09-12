@@ -496,11 +496,17 @@ function validateEcOperation(deviceId, payload) {
 
   const remaining = Number(payload.ec_operation_remaining_sec);
   const nextCheck = Number(payload.ec_next_check_in_sec);
+  const cycleRaw = payload.ec_operation_cycle_remaining_sec;
+  const cycleRemaining =
+    cycleRaw == null || cycleRaw === '' ? 0 : Number(cycleRaw);
   if (!Number.isFinite(remaining) || remaining < 0) {
     return { ok: false, reason: 'ec_operation_remaining_sec must be >= 0' };
   }
   if (!Number.isFinite(nextCheck) || nextCheck < 0) {
     return { ok: false, reason: 'ec_next_check_in_sec must be >= 0' };
+  }
+  if (!Number.isFinite(cycleRemaining) || cycleRemaining < 0) {
+    return { ok: false, reason: 'ec_operation_cycle_remaining_sec must be >= 0' };
   }
 
   return {
@@ -509,6 +515,7 @@ function validateEcOperation(deviceId, payload) {
       device_id: deviceId,
       ec_operation_state: state,
       ec_operation_remaining_sec: Math.floor(remaining),
+      ec_operation_cycle_remaining_sec: Math.floor(cycleRemaining),
       ec_next_check_in_sec: Math.floor(nextCheck),
       ...(Number.isFinite(Number(payload.dilution_target_l))
         ? { ec_dilution_target_l: Number(payload.dilution_target_l) }
@@ -717,11 +724,17 @@ function validatePhOperation(deviceId, payload) {
 
   const remaining = Number(payload.ph_operation_remaining_sec);
   const nextCheck = Number(payload.ph_next_check_in_sec);
+  const cycleRaw = payload.ph_operation_cycle_remaining_sec;
+  const cycleRemaining =
+    cycleRaw == null || cycleRaw === '' ? 0 : Number(cycleRaw);
   if (!Number.isFinite(remaining) || remaining < 0) {
     return { ok: false, reason: 'ph_operation_remaining_sec must be >= 0' };
   }
   if (!Number.isFinite(nextCheck) || nextCheck < 0) {
     return { ok: false, reason: 'ph_next_check_in_sec must be >= 0' };
+  }
+  if (!Number.isFinite(cycleRemaining) || cycleRemaining < 0) {
+    return { ok: false, reason: 'ph_operation_cycle_remaining_sec must be >= 0' };
   }
 
   return {
@@ -730,6 +743,7 @@ function validatePhOperation(deviceId, payload) {
       device_id: deviceId,
       ph_operation_state: state,
       ph_operation_remaining_sec: Math.floor(remaining),
+      ph_operation_cycle_remaining_sec: Math.floor(cycleRemaining),
       ph_next_check_in_sec: Math.floor(nextCheck),
     },
   };
@@ -824,6 +838,11 @@ function shouldThrottleEcOperation(deviceId, row) {
   if (Math.abs(prev.remaining - row.ec_operation_remaining_sec) > 2) {
     return false;
   }
+  const prevCycle = Number(prev.cycleRemaining ?? 0);
+  const nextCycle = Number(row.ec_operation_cycle_remaining_sec ?? 0);
+  if (Math.abs(prevCycle - nextCycle) > 2) {
+    return false;
+  }
   // Volumen A→B: no ahogar progreso de dilución (litros de sesión).
   const prevProgress = Number(prev.progressL);
   const nextProgress = Number(row.ec_dilution_progress_l);
@@ -848,6 +867,7 @@ function rememberEcOperation(deviceId, row) {
   lastEcOperationSnapshotByDevice.set(deviceId, {
     state: row.ec_operation_state,
     remaining: row.ec_operation_remaining_sec,
+    cycleRemaining: row.ec_operation_cycle_remaining_sec,
     progressL: row.ec_dilution_progress_l,
     targetL: row.ec_dilution_target_l,
     at: Date.now(),
@@ -866,6 +886,11 @@ function shouldThrottlePhOperation(deviceId, row) {
   if (Math.abs(prev.remaining - row.ph_operation_remaining_sec) > 2) {
     return false;
   }
+  const prevCycle = Number(prev.cycleRemaining ?? 0);
+  const nextCycle = Number(row.ph_operation_cycle_remaining_sec ?? 0);
+  if (Math.abs(prevCycle - nextCycle) > 2) {
+    return false;
+  }
   return now - prev.at < phOperationThrottleMs;
 }
 
@@ -873,6 +898,7 @@ function rememberPhOperation(deviceId, row) {
   lastPhOperationSnapshotByDevice.set(deviceId, {
     state: row.ph_operation_state,
     remaining: row.ph_operation_remaining_sec,
+    cycleRemaining: row.ph_operation_cycle_remaining_sec,
     at: Date.now(),
   });
 }
@@ -1128,6 +1154,7 @@ async function patchEcOperation(row) {
   const patch = {
     ec_operation_state: row.ec_operation_state,
     ec_operation_remaining_sec: row.ec_operation_remaining_sec,
+    ec_operation_cycle_remaining_sec: row.ec_operation_cycle_remaining_sec ?? 0,
     ec_next_check_in_sec: row.ec_next_check_in_sec,
   };
   if (row.ec_dilution_target_l != null) {
@@ -1144,7 +1171,7 @@ async function patchEcOperation(row) {
   await insertFlowSessionReading(row);
 
   console.log(
-    `[bridge] PATCH relay_master ${row.device_id} ec_operation=${row.ec_operation_state} rem=${row.ec_operation_remaining_sec}s`
+    `[bridge] PATCH relay_master ${row.device_id} ec_operation=${row.ec_operation_state} rem=${row.ec_operation_remaining_sec}s cycle=${row.ec_operation_cycle_remaining_sec ?? 0}s`
   );
   return true;
 }
@@ -1153,6 +1180,7 @@ async function patchPhOperation(row) {
   const patch = {
     ph_operation_state: row.ph_operation_state,
     ph_operation_remaining_sec: row.ph_operation_remaining_sec,
+    ph_operation_cycle_remaining_sec: row.ph_operation_cycle_remaining_sec ?? 0,
     ph_next_check_in_sec: row.ph_next_check_in_sec,
   };
 
@@ -1160,7 +1188,7 @@ async function patchPhOperation(row) {
   if (!ok) return false;
 
   console.log(
-    `[bridge] PATCH relay_master ${row.device_id} ph_operation=${row.ph_operation_state} rem=${row.ph_operation_remaining_sec}s next=${row.ph_next_check_in_sec}s`
+    `[bridge] PATCH relay_master ${row.device_id} ph_operation=${row.ph_operation_state} rem=${row.ph_operation_remaining_sec}s cycle=${row.ph_operation_cycle_remaining_sec ?? 0}s next=${row.ph_next_check_in_sec}s`
   );
   return true;
 }

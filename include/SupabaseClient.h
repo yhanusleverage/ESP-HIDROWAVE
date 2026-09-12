@@ -239,11 +239,13 @@ public:
                                 int operationRemainingSec, int nextCheckInSec,
                                 float dilutionTargetL = -1.0f,
                                 float dilutionProgressL = -1.0f,
-                                bool operationInterrupted = false);
+                                bool operationInterrupted = false,
+                                int operationCycleRemainingSec = 0);
 
     bool updatePhOperationState(const String& deviceId, const String& state,
                                 int operationRemainingSec, int nextCheckInSec,
-                                bool operationInterrupted = false);
+                                bool operationInterrupted = false,
+                                int operationCycleRemainingSec = 0);
 
     bool patchBootInterrupted(const String& deviceId, bool interrupted);
 

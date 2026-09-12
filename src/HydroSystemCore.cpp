@@ -2247,12 +2247,14 @@ RelayOwner HydroSystemCore::resolveCommandOwner(const RelayCommand& cmd) {
 void HydroSystemCore::syncPhOperationStateToSupabase() {
     const char* stateName = hydroControl.getPhOperationStateName();
     const int remainingSec = hydroControl.getPhOperationRemainingSec();
+    const int cycleRemainingSec = hydroControl.getPhOperationCycleRemainingSec();
     const int nextCheckSec = hydroControl.getPhNextCheckInSec();
 
     if (mqttClient.isConnected()) {
         MqttPhOperationReading reading = {};
         reading.state = stateName;
         reading.operationRemainingSec = remainingSec;
+        reading.operationCycleRemainingSec = cycleRemainingSec;
         reading.nextCheckInSec = nextCheckSec;
         if (mqttClient.publishPhOperation(reading)) {
             return;
@@ -2274,7 +2276,8 @@ void HydroSystemCore::syncPhOperationStateToSupabase() {
         String(stateName),
         remainingSec,
         nextCheckSec,
-        bootOperationInterrupted
+        bootOperationInterrupted,
+        cycleRemainingSec
     );
 #endif
 }
@@ -2632,6 +2635,7 @@ void HydroSystemCore::handlePhMetricEvent(const PhControllerMetricEvent* event) 
 void HydroSystemCore::syncEcOperationStateToSupabase() {
     const char* stateName = hydroControl.getEcOperationStateName();
     const int remainingSec = hydroControl.getEcOperationRemainingSec();
+    const int cycleRemainingSec = hydroControl.getEcOperationCycleRemainingSec();
     const int nextCheckSec = hydroControl.getEcNextCheckInSec();
     const bool diluting = hydroControl.isDilutionActive();
     const float dilTarget = diluting ? hydroControl.getEcDilutionTargetL() : -1.0f;
@@ -2641,6 +2645,7 @@ void HydroSystemCore::syncEcOperationStateToSupabase() {
         MqttEcOperationReading reading = {};
         reading.state = stateName;
         reading.operationRemainingSec = remainingSec;
+        reading.operationCycleRemainingSec = cycleRemainingSec;
         reading.nextCheckInSec = nextCheckSec;
         if (diluting) {
             reading.hasDilutionProgress = true;
@@ -2672,7 +2677,8 @@ void HydroSystemCore::syncEcOperationStateToSupabase() {
         nextCheckSec,
         dilTarget,
         dilProgress,
-        bootOperationInterrupted
+        bootOperationInterrupted,
+        cycleRemainingSec
     );
 #endif
 }

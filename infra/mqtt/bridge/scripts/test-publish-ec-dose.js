@@ -18,6 +18,7 @@ const ecPayload = JSON.stringify({
   device_id: deviceId,
   ec_operation_state: 'recirculating',
   ec_operation_remaining_sec: 60,
+  ec_operation_cycle_remaining_sec: 60,
   ec_next_check_in_sec: 0,
 });
 

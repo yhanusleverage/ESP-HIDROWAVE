@@ -18,6 +18,7 @@ const phOpPayload = JSON.stringify({
   device_id: deviceId,
   ph_operation_state: 'recirculating',
   ph_operation_remaining_sec: 45,
+  ph_operation_cycle_remaining_sec: 45,
   ph_next_check_in_sec: 0,
 });
 

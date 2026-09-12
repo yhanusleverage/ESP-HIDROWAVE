@@ -432,11 +432,13 @@ bool MqttClientWrapper::publishEcOperation(const MqttEcOperationReading& reading
         return false;
     }
 
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<416> doc;
     doc["v"] = 1;
     doc["device_id"] = deviceId;
     doc["ec_operation_state"] = reading.state ? reading.state : "idle";
     doc["ec_operation_remaining_sec"] = reading.operationRemainingSec > 0 ? reading.operationRemainingSec : 0;
+    doc["ec_operation_cycle_remaining_sec"] =
+        reading.operationCycleRemainingSec > 0 ? reading.operationCycleRemainingSec : 0;
     doc["ec_next_check_in_sec"] = reading.nextCheckInSec > 0 ? reading.nextCheckInSec : 0;
     if (reading.hasDilutionProgress) {
         doc["dilution_target_l"] = round(reading.dilutionTargetL * 100.0) / 100.0;
@@ -446,7 +448,7 @@ bool MqttClientWrapper::publishEcOperation(const MqttEcOperationReading& reading
         }
     }
 
-    char payload[384];
+    char payload[416];
     size_t len = serializeJson(doc, payload, sizeof(payload));
     if (len == 0) {
         return false;
@@ -454,9 +456,10 @@ bool MqttClientWrapper::publishEcOperation(const MqttEcOperationReading& reading
 
     bool published = mqtt.publish(ecOperationTopic.c_str(), payload, false);
     if (published) {
-        Serial.printf("[MQTT] ec_operation %s rem=%ds next=%ds\n",
+        Serial.printf("[MQTT] ec_operation %s rem=%ds cycle=%ds next=%ds\n",
                       reading.state ? reading.state : "idle",
                       reading.operationRemainingSec,
+                      reading.operationCycleRemainingSec,
                       reading.nextCheckInSec);
     } else {
         Serial.println("[MQTT] ec_operation publish failed");
@@ -534,14 +537,16 @@ bool MqttClientWrapper::publishPhOperation(const MqttPhOperationReading& reading
         return false;
     }
 
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<320> doc;
     doc["v"] = 1;
     doc["device_id"] = deviceId;
     doc["ph_operation_state"] = reading.state ? reading.state : "idle";
     doc["ph_operation_remaining_sec"] = reading.operationRemainingSec > 0 ? reading.operationRemainingSec : 0;
+    doc["ph_operation_cycle_remaining_sec"] =
+        reading.operationCycleRemainingSec > 0 ? reading.operationCycleRemainingSec : 0;
     doc["ph_next_check_in_sec"] = reading.nextCheckInSec > 0 ? reading.nextCheckInSec : 0;
 
-    char payload[256];
+    char payload[320];
     size_t len = serializeJson(doc, payload, sizeof(payload));
     if (len == 0) {
         return false;
@@ -549,9 +554,10 @@ bool MqttClientWrapper::publishPhOperation(const MqttPhOperationReading& reading
 
     bool published = mqtt.publish(phOperationTopic.c_str(), payload, false);
     if (published) {
-        Serial.printf("[MQTT] ph_operation %s rem=%ds next=%ds\n",
+        Serial.printf("[MQTT] ph_operation %s rem=%ds cycle=%ds next=%ds\n",
                       reading.state ? reading.state : "idle",
                       reading.operationRemainingSec,
+                      reading.operationCycleRemainingSec,
                       reading.nextCheckInSec);
     } else {
         Serial.println("[MQTT] ph_operation publish failed");

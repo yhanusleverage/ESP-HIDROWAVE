@@ -373,7 +373,27 @@ bool DecisionEngine::upsertRuleFromJson(const JsonObject& json_rule, bool persis
     bool replaced = false;
     for (auto& existing : rules) {
         if (existing.id == rule.id) {
+            // Retained MQTT re-upsert de fn_recirc reseteava last_execution=0 →
+            // re-disparo imediato + ACK "OK recirculação" junto ao procedure_finished.
+            // Preservar runtime só se já estava enabled (não muda o centro da operação).
+            const bool preserveFnCircRuntime =
+                existing.enabled && rule.enabled &&
+                (rule.id == "fn_recirculacao_continua" || rule.id == "fn_circulation");
+            const unsigned long prevLast = existing.last_execution;
+            const unsigned long prevCount = existing.execution_count_hour;
+            const unsigned long prevHour = existing.hour_reset_time;
+            const bool prevActive = existing.currently_active;
+
             existing = rule;
+            if (preserveFnCircRuntime) {
+                existing.last_execution = prevLast;
+                existing.execution_count_hour = prevCount;
+                existing.hour_reset_time = prevHour;
+                existing.currently_active = prevActive;
+                Serial.printf(
+                    "[DE] fn_recirc upsert — runtime preserved rule=%s (no re-fire)\n",
+                    rule.id.c_str());
+            }
             replaced = true;
             break;
         }

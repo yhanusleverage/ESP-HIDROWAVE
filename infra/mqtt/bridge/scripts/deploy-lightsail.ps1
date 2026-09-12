@@ -1,92 +1,201 @@
-# Deploy bridge index.js a Lightsail (ubuntu@15.175.109.90)
-# Uso: .\scripts\deploy-lightsail.ps1 -PemPath "C:\path\LightsailDefaultKey-ca-central-1.pem"
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  Deploy del MQTT bridge a Lightsail (PowerShell).
+
+.DESCRIPTION
+  Fija QUE sube y QUE NO. Evita scp ad-hoc y el bug de $(date) en PowerShell
+  (el stamp de backup se calcula en bash remoto).
+
+  SIEMPRE (default):
+    index.js
+    schedule-evaluator.js
+    schedule-mqtt-publish.js
+    package.json
+
+  NUNCA:
+    .env / .env.local
+    node_modules/
+    frontend HIDROWAVE / Railway
+    firmware ESP
+    ACL Mosquitto (salvo -WithAcl)
+    scripts de test (salvo -WithTests)
+
+.EXAMPLE
+  cd ESP-HIDROWAVE-main\infra\mqtt\bridge
+  .\scripts\deploy-lightsail.ps1
+
+.EXAMPLE
+  .\scripts\deploy-lightsail.ps1 -DryRun
+  .\scripts\deploy-lightsail.ps1 -WithTests
+  .\scripts\deploy-lightsail.ps1 -WithAcl
+#>
 
 param(
   [string]$PemPath = "$env:USERPROFILE\Documents\Projects\LightsailDefaultKey-ca-central-1.pem",
-  [string]$SshHost = "ubuntu@15.175.109.90"
+  [string]$SshHost = "ubuntu@15.175.109.90",
+  [string]$RemoteDir = "/opt/hidrowave-bridge",
+  [switch]$WithTests,
+  [switch]$WithAcl,
+  [switch]$NpmInstall,
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+
 $BridgeDir = Split-Path $PSScriptRoot -Parent
-$IndexJs = Join-Path $BridgeDir "index.js"
-$PhTestJs = Join-Path $BridgeDir "scripts\test-publish-ph-dose.js"
-$EcTestJs = Join-Path $BridgeDir "scripts\test-publish-ec-dose.js"
-$EcMetricJs = Join-Path $BridgeDir "scripts\test-publish-ec-metric.js"
-$PhMetricJs = Join-Path $BridgeDir "scripts\test-publish-ph-metric.js"
-$PackageJson = Join-Path $BridgeDir "package.json"
-$AclDosePatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-dose-topics.sh"
-$AclMetricPatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-metric-topics.sh"
-$AclHidrowavePatch = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\patch-acl-hidrowave-publish.sh"
-$AlignBrokerSh = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\align-broker-production.sh"
-$ClearRetainSh = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto\clear-retained-presence.sh"
-$SlaveCmdJs = Join-Path $BridgeDir "scripts\test-publish-slave-command.js"
-$CheckRelayRowJs = Join-Path $BridgeDir "scripts\check-relay-slave-row.js"
+$MosquittoDir = Join-Path (Split-Path $BridgeDir -Parent) "mosquitto"
 
 if (-not (Test-Path $PemPath)) {
   Write-Error "PEM no encontrado: $PemPath"
 }
-if (-not (Test-Path $IndexJs)) {
-  Write-Error "index.js no encontrado: $IndexJs"
+
+# Nunca usar $host (reservado en PowerShell) — solo $SshHost
+$sshOpts = @("-i", $PemPath, "-o", "StrictHostKeyChecking=accept-new")
+
+function Write-Section([string]$msg) {
+  Write-Host ""
+  Write-Host "=== $msg ===" -ForegroundColor Cyan
 }
 
-Write-Host ">> SCP bridge files -> ${SshHost}:/tmp/"
-scp -i $PemPath -o StrictHostKeyChecking=accept-new $IndexJs "${SshHost}:/tmp/hidrowave-index.js"
-$ScheduleEval = Join-Path $BridgeDir "schedule-evaluator.js"
-if (Test-Path $ScheduleEval) {
-  scp -i $PemPath -o StrictHostKeyChecking=accept-new $ScheduleEval "${SshHost}:/tmp/schedule-evaluator.js"
+function Invoke-ScpLocal([string]$LocalPath, [string]$RemoteTmpName) {
+  if (-not (Test-Path $LocalPath)) {
+    Write-Warning "Omitido (no existe): $LocalPath"
+    return $false
+  }
+  $dest = "${SshHost}:/tmp/$RemoteTmpName"
+  if ($DryRun) {
+    Write-Host "[dry-run] scp $LocalPath -> $dest"
+    return $true
+  }
+  Write-Host "SCP $RemoteTmpName"
+  & scp @sshOpts $LocalPath $dest
+  if ($LASTEXITCODE -ne 0) { throw "scp failed: $LocalPath" }
+  return $true
 }
-scp -i $PemPath -o StrictHostKeyChecking=accept-new $PhTestJs "${SshHost}:/tmp/test-publish-ph-dose.js"
-scp -i $PemPath -o StrictHostKeyChecking=accept-new $EcTestJs "${SshHost}:/tmp/test-publish-ec-dose.js"
-scp -i $PemPath -o StrictHostKeyChecking=accept-new $EcMetricJs "${SshHost}:/tmp/test-publish-ec-metric.js"
-scp -i $PemPath -o StrictHostKeyChecking=accept-new $PhMetricJs "${SshHost}:/tmp/test-publish-ph-metric.js"
-if (Test-Path $AclDosePatch) {
-  scp -i $PemPath -o StrictHostKeyChecking=accept-new $AclDosePatch "${SshHost}:/tmp/patch-acl-dose-topics.sh"
-}
-if (Test-Path $AclMetricPatch) {
-  scp -i $PemPath -o StrictHostKeyChecking=accept-new $AclMetricPatch "${SshHost}:/tmp/patch-acl-metric-topics.sh"
-}
-if (Test-Path $AclHidrowavePatch) {
-  scp -i $PemPath -o StrictHostKeyChecking=accept-new $AclHidrowavePatch "${SshHost}:/tmp/patch-acl-hidrowave-publish.sh"
-}
-if (Test-Path $SlaveCmdJs) {
-  scp -i $PemPath -o StrictHostKeyChecking=accept-new $SlaveCmdJs "${SshHost}:/tmp/test-publish-slave-command.js"
-}
-if (Test-Path $CheckRelayRowJs) {
-  scp -i $PemPath -o StrictHostKeyChecking=accept-new $CheckRelayRowJs "${SshHost}:/tmp/check-relay-slave-row.js"
-}
-if (Test-Path $ClearRetainSh) {
-  scp -i $PemPath -o StrictHostKeyChecking=accept-new $ClearRetainSh "${SshHost}:/tmp/clear-retained-presence.sh"
-}
-scp -i $PemPath -o StrictHostKeyChecking=accept-new $PackageJson "${SshHost}:/tmp/hidrowave-package.json"
 
-Write-Host ">> Instalar y reiniciar hidrowave-bridge"
-$remoteCmd = @"
-sudo cp /tmp/hidrowave-index.js /opt/hidrowave-bridge/index.js &&
-if [ -f /tmp/schedule-evaluator.js ]; then sudo cp /tmp/schedule-evaluator.js /opt/hidrowave-bridge/schedule-evaluator.js && sudo chown hidrowave:hidrowave /opt/hidrowave-bridge/schedule-evaluator.js; fi &&
-sudo mkdir -p /opt/hidrowave-bridge/scripts &&
-sudo cp /tmp/test-publish-ph-dose.js /opt/hidrowave-bridge/scripts/test-publish-ph-dose.js &&
-sudo cp /tmp/test-publish-ec-dose.js /opt/hidrowave-bridge/scripts/test-publish-ec-dose.js &&
-sudo cp /tmp/test-publish-ec-metric.js /opt/hidrowave-bridge/scripts/test-publish-ec-metric.js &&
-sudo cp /tmp/test-publish-ph-metric.js /opt/hidrowave-bridge/scripts/test-publish-ph-metric.js &&
-if [ -f /tmp/test-publish-slave-command.js ]; then sudo cp /tmp/test-publish-slave-command.js /opt/hidrowave-bridge/scripts/test-publish-slave-command.js; fi &&
-if [ -f /tmp/check-relay-slave-row.js ]; then sudo cp /tmp/check-relay-slave-row.js /opt/hidrowave-bridge/scripts/check-relay-slave-row.js; fi &&
-if [ -f /tmp/clear-retained-presence.sh ]; then sudo cp /tmp/clear-retained-presence.sh /opt/hidrowave-bridge/scripts/clear-retained-presence.sh && sudo chmod 755 /opt/hidrowave-bridge/scripts/clear-retained-presence.sh; fi &&
-sudo cp /tmp/hidrowave-package.json /opt/hidrowave-bridge/package.json &&
-sudo chmod 755 /opt/hidrowave-bridge/scripts &&
-if [ -f /tmp/patch-acl-dose-topics.sh ]; then sudo bash /tmp/patch-acl-dose-topics.sh; fi &&
-if [ -f /tmp/patch-acl-metric-topics.sh ]; then sudo bash /tmp/patch-acl-metric-topics.sh; fi &&
-if [ -f /tmp/patch-acl-hidrowave-publish.sh ]; then sudo bash /tmp/patch-acl-hidrowave-publish.sh; fi &&
-sudo chown hidrowave:hidrowave /opt/hidrowave-bridge/scripts/*.js &&
-sudo systemctl restart hidrowave-bridge &&
-sleep 3 &&
-sudo journalctl -u hidrowave-bridge -n 40 --no-pager | grep -E 'Subscribed|retain-grace|ignore retained|is_online=false|PATCH device_status|heartbeat' || true
-"@
-ssh -i $PemPath -o StrictHostKeyChecking=accept-new $SshHost $remoteCmd
+$coreFiles = @(
+  @{ Local = (Join-Path $BridgeDir "index.js");                 RemoteTmp = "hw-bridge-index.js";                 RemoteName = "index.js" }
+  @{ Local = (Join-Path $BridgeDir "schedule-evaluator.js");    RemoteTmp = "hw-bridge-schedule-evaluator.js";    RemoteName = "schedule-evaluator.js" }
+  @{ Local = (Join-Path $BridgeDir "schedule-mqtt-publish.js"); RemoteTmp = "hw-bridge-schedule-mqtt-publish.js"; RemoteName = "schedule-mqtt-publish.js" }
+  @{ Local = (Join-Path $BridgeDir "package.json");             RemoteTmp = "hw-bridge-package.json";             RemoteName = "package.json" }
+)
 
-Write-Host ">> Deploy completado"
-Write-Host ">> Gates pos-deploy (en servidor /opt/hidrowave-bridge):"
-Write-Host "   npm run test:pub:ec-dose    # R1 regresion"
-Write-Host "   npm run test:pub:ph-dose    # R2 regresion"
-Write-Host "   npm run test:pub:ec-metric  # V3"
-Write-Host "   npm run test:pub:ph-metric  # V4"
-Write-Host "   npm run test:pub:slave-command  # slave ESP-NOW (Fase 3)"
+Write-Section "Que SUBE a Lightsail (este run)"
+$coreFiles | ForEach-Object { Write-Host ("  YES  {0}" -f $_.RemoteName) }
+if ($WithTests) { Write-Host "  YES  scripts/test-publish-*.js" }
+if ($WithAcl) { Write-Host "  YES  mosquitto ACL patches (CUIDADO)" }
+if ($NpmInstall) { Write-Host "  YES  npm install --omit=dev remoto" }
+
+Write-Section "Que NO sube (nunca)"
+@(
+  ".env / secretos (solo en $RemoteDir/.env del server)",
+  "node_modules/",
+  "HIDROWAVE frontend / Railway",
+  "firmware ESP",
+  "docs / agent transcripts"
+) | ForEach-Object { Write-Host "  NO   $_" }
+
+Write-Section "Upload core"
+$uploaded = @()
+foreach ($f in $coreFiles) {
+  if (Invoke-ScpLocal $f.Local $f.RemoteTmp) {
+    $uploaded += $f
+  }
+}
+
+if ($uploaded.Count -eq 0) {
+  Write-Error "Nada que subir."
+}
+
+$testUploads = @()
+if ($WithTests) {
+  Write-Section "Upload tests"
+  $testNames = @(
+    "test-publish-ph-dose.js",
+    "test-publish-ec-dose.js",
+    "test-publish-ec-metric.js",
+    "test-publish-ph-metric.js",
+    "test-publish-slave-command.js",
+    "test-publish-procedure-cmd.js",
+    "check-relay-slave-row.js"
+  )
+  foreach ($n in $testNames) {
+    $p = Join-Path $BridgeDir "scripts\$n"
+    if (Invoke-ScpLocal $p "hw-bridge-$n") {
+      $testUploads += $n
+    }
+  }
+}
+
+$aclUploads = @()
+if ($WithAcl) {
+  Write-Section "Upload ACL (opt-in)"
+  $aclNames = @(
+    "patch-acl-dose-topics.sh",
+    "patch-acl-metric-topics.sh",
+    "patch-acl-hidrowave-publish.sh",
+    "align-broker-production.sh"
+  )
+  foreach ($n in $aclNames) {
+    $p = Join-Path $MosquittoDir $n
+    if (Invoke-ScpLocal $p "hw-acl-$n") {
+      $aclUploads += $n
+    }
+  }
+}
+
+if ($DryRun) {
+  Write-Host ""
+  Write-Host "[dry-run] No se reinicia servicio." -ForegroundColor Yellow
+  exit 0
+}
+
+Write-Section "Install + restart hidrowave-bridge"
+
+# Script remoto: STAMP con date de bash (NO PowerShell Get-Date / $(date))
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.AppendLine("set -e")
+[void]$sb.AppendLine('STAMP=$(date +%Y%m%d%H%M%S)')
+[void]$sb.AppendLine("sudo mkdir -p $RemoteDir $RemoteDir/bak $RemoteDir/scripts")
+
+foreach ($f in $uploaded) {
+  [void]$sb.AppendLine("if [ -f $RemoteDir/$($f.RemoteName) ]; then sudo cp `"$RemoteDir/$($f.RemoteName)`" `"$RemoteDir/bak/$($f.RemoteName).`$STAMP`"; fi")
+  [void]$sb.AppendLine("sudo cp /tmp/$($f.RemoteTmp) $RemoteDir/$($f.RemoteName)")
+}
+
+[void]$sb.AppendLine("sudo chown hidrowave:hidrowave $RemoteDir/index.js $RemoteDir/schedule-evaluator.js $RemoteDir/schedule-mqtt-publish.js $RemoteDir/package.json 2>/dev/null || true")
+
+foreach ($n in $testUploads) {
+  [void]$sb.AppendLine("sudo cp /tmp/hw-bridge-$n $RemoteDir/scripts/$n")
+}
+if ($testUploads.Count -gt 0) {
+  [void]$sb.AppendLine("sudo chown -R hidrowave:hidrowave $RemoteDir/scripts")
+}
+
+foreach ($n in $aclUploads) {
+  [void]$sb.AppendLine("sudo bash /tmp/hw-acl-$n || true")
+}
+
+if ($NpmInstall) {
+  [void]$sb.AppendLine("cd $RemoteDir && sudo -u hidrowave npm install --omit=dev")
+}
+
+[void]$sb.AppendLine("sudo systemctl restart hidrowave-bridge")
+[void]$sb.AppendLine("sleep 2")
+[void]$sb.AppendLine("systemctl is-active hidrowave-bridge")
+[void]$sb.AppendLine("ls -la $RemoteDir/index.js $RemoteDir/schedule-evaluator.js $RemoteDir/schedule-mqtt-publish.js")
+[void]$sb.AppendLine("sudo journalctl -u hidrowave-bridge -n 25 --no-pager | tail -n 25")
+
+$remoteScript = $sb.ToString()
+# Evitar que PowerShell expanda $STAMP: el heredoc remoto usa bash -s
+$remoteScript | & ssh @sshOpts $SshHost "bash -s"
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "Remote install/restart failed (exit $LASTEXITCODE)."
+}
+
+Write-Section "OK"
+Write-Host "Runtime en $RemoteDir"
+Write-Host "  .\scripts\deploy-lightsail.ps1"
+Write-Host "  .\scripts\deploy-lightsail.ps1 -DryRun"
+Write-Host "  .\scripts\deploy-lightsail.ps1 -WithTests"

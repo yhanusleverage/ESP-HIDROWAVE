@@ -38,6 +38,7 @@ struct MqttHeartbeatReading {
 struct MqttEcOperationReading {
     const char* state;
     int operationRemainingSec;
+    int operationCycleRemainingSec;
     int nextCheckInSec;
     float dilutionTargetL;
     float dilutionProgressL;
@@ -70,6 +71,7 @@ struct MqttDoseReading {
 struct MqttPhOperationReading {
     const char* state;
     int operationRemainingSec;
+    int operationCycleRemainingSec;
     int nextCheckInSec;
 };
 

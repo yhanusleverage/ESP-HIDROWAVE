@@ -4038,7 +4038,8 @@ bool SupabaseClient::insertEcDilutionEvent(const String& deviceId, const String&
 bool SupabaseClient::updateEcOperationState(const String& deviceId, const String& state,
                                             int operationRemainingSec, int nextCheckInSec,
                                             float dilutionTargetL, float dilutionProgressL,
-                                            bool operationInterrupted) {
+                                            bool operationInterrupted,
+                                            int operationCycleRemainingSec) {
     if (!isReady()) {
         return false;
     }
@@ -4049,9 +4050,11 @@ bool SupabaseClient::updateEcOperationState(const String& deviceId, const String
         }
     }
 
-    DynamicJsonDocument doc(256);
+    DynamicJsonDocument doc(320);
     doc["ec_operation_state"] = state;
     doc["ec_operation_remaining_sec"] = operationRemainingSec > 0 ? operationRemainingSec : 0;
+    doc["ec_operation_cycle_remaining_sec"] =
+        operationCycleRemainingSec > 0 ? operationCycleRemainingSec : 0;
     doc["ec_next_check_in_sec"] = nextCheckInSec > 0 ? nextCheckInSec : 0;
     if (dilutionTargetL >= 0.0f) {
         doc["ec_dilution_target_l"] = round(dilutionTargetL * 100.0) / 100.0;
@@ -4091,16 +4094,19 @@ bool SupabaseClient::updateEcOperationState(const String& deviceId, const String
 
 bool SupabaseClient::updatePhOperationState(const String& deviceId, const String& state,
                                             int operationRemainingSec, int nextCheckInSec,
-                                            bool operationInterrupted) {
+                                            bool operationInterrupted,
+                                            int operationCycleRemainingSec) {
     if (!isReady()) return false;
 
     if (requestMutex != nullptr) {
         if (xSemaphoreTake(requestMutex, pdMS_TO_TICKS(3000)) != pdTRUE) return false;
     }
 
-    DynamicJsonDocument doc(256);
+    DynamicJsonDocument doc(320);
     doc["ph_operation_state"] = state;
     doc["ph_operation_remaining_sec"] = operationRemainingSec > 0 ? operationRemainingSec : 0;
+    doc["ph_operation_cycle_remaining_sec"] =
+        operationCycleRemainingSec > 0 ? operationCycleRemainingSec : 0;
     doc["ph_next_check_in_sec"] = nextCheckInSec > 0 ? nextCheckInSec : 0;
     if (operationInterrupted) {
         doc["last_operation_interrupted"] = true;
