@@ -271,6 +271,10 @@ private:
     static void onRuleExecutedMirrorStatic(const RuleExecutedMirrorEvent& event, void* userData);
     void mirrorRuleExecuted(const RuleExecutedMirrorEvent& event);
     void mirrorProcedureFinished(const ProcedureFinishedEvent& event);
+    /** Tras Complete: rechazar retained upsert enabled=1 por unos segundos. */
+    static const unsigned long PROC_AUTO_DISABLE_COOLDOWN_MS = 45000;
+    String lastProcAutoDisabledRuleId_;
+    unsigned long lastProcAutoDisabledAtMs_ = 0;
     bool tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
                                    const uint8_t* slaveMac, int relayNumber, bool currentState,
                                    const char* status = "completed");

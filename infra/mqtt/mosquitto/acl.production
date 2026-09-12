@@ -18,6 +18,8 @@ topic read hidrowave/+/ec_gain
 topic read hidrowave/+/ph_gain
 topic read hidrowave/+/ec_dilution
 topic read hidrowave/+/command_ack
+topic read hidrowave/+/rule_executed
+topic read hidrowave/+/procedure_finished
 topic read hidrowave/+/relay/state
 
 # --- Railway / UI publish (comandos — qualquer master) ---
@@ -27,6 +29,7 @@ topic write hidrowave/+/ec/config
 topic write hidrowave/+/ph/config
 topic write hidrowave/+/circ/config
 topic write hidrowave/+/rules/#
+topic write hidrowave/+/procedure/cmd
 topic read hidrowave/+/#
 
 # --- Master ESP (bloco injetado por align-broker-production.sh) ---

@@ -677,11 +677,29 @@ void HydroSystemCore::mirrorRuleExecuted(const RuleExecutedMirrorEvent& event) {
 }
 
 void HydroSystemCore::mirrorProcedureFinished(const ProcedureFinishedEvent& event) {
-    if (!mqttClient.isConnected()) {
-        Serial.println("[MQTT] procedure_finished skipped (offline)");
+    if (event.rule_id.length() == 0 || event.status.length() == 0) {
         return;
     }
-    if (event.rule_id.length() == 0 || event.status.length() == 0) {
+
+    // Complete (no abort): desactivar localmente + cooldown contra retained upsert enabled=1.
+    // fn_* (recirculación) nunca auto-disable.
+    const bool completed = event.status.equalsIgnoreCase("completed");
+    const bool skipFn = event.rule_id.startsWith("fn_") || event.rule_id.startsWith("FN_");
+    if (completed && !skipFn) {
+        DecisionRule* existing = decisionEngine.getRule(event.rule_id);
+        if (existing && existing->enabled) {
+            releaseDecisionRuleActuators(*existing);
+            existing->enabled = false;
+            decisionEngine.saveRulesToFile();
+            Serial.printf("[PROC] local enabled=false rule=%s (post-complete)\n",
+                          event.rule_id.c_str());
+        }
+        lastProcAutoDisabledRuleId_ = event.rule_id;
+        lastProcAutoDisabledAtMs_ = millis();
+    }
+
+    if (!mqttClient.isConnected()) {
+        Serial.println("[MQTT] procedure_finished skipped (offline)");
         return;
     }
 
@@ -4761,7 +4779,25 @@ bool HydroSystemCore::applyRuleUpsertMqtt(const char* payload, size_t length) {
             ok = decisionEngine.upsertRuleFromJson(ruleObj, false);
             DecisionRule* after =
                 ruleIdStr.length() > 0 ? decisionEngine.getRule(ruleIdStr) : nullptr;
-            const bool nowEnabled = after && after->enabled;
+            bool nowEnabled = after && after->enabled;
+            // Solo en ventana post-reconnect (retained flood): no re-armar tras Complete.
+            // Ativar con MQTT estable sigue funcionando (incluso <45s).
+            const bool retainFloodWindow =
+                mqttConnectedSinceMs > 0 &&
+                (millis() - mqttConnectedSinceMs) < 5000UL;
+            if (ok && after && nowEnabled && retainFloodWindow && ruleIdStr.length() > 0 &&
+                ruleIdStr == lastProcAutoDisabledRuleId_ &&
+                lastProcAutoDisabledAtMs_ != 0 &&
+                (millis() - lastProcAutoDisabledAtMs_) < PROC_AUTO_DISABLE_COOLDOWN_MS) {
+                releaseDecisionRuleActuators(*after);
+                after->enabled = false;
+                ScriptRunnerManager::instance().removeByRuleId(ruleIdStr);
+                TankProcedureFsmManager::instance().removeByRuleId(ruleIdStr);
+                nowEnabled = false;
+                Serial.printf(
+                    "[MQTT] rules upsert %s → force enabled=0 (post-complete retain flood)\n",
+                    ruleIdStr.c_str());
+            }
             if (ok && after && wasEnabled && !nowEnabled) {
                 releaseAfterDisable = true;
             }
@@ -4859,6 +4895,13 @@ bool HydroSystemCore::applyProcedureCmdMqtt(const char* payload, size_t length) 
     if (!ruleId[0] || !op[0]) {
         Serial.println("[MQTT] procedure/cmd missing rule_id/op");
         return false;
+    }
+    // Ativar/rearm explícito: limpia cooldown anti-retain
+    if (strcasecmp(op, "start") == 0 || strcasecmp(op, "rearm") == 0) {
+        if (lastProcAutoDisabledRuleId_ == ruleId) {
+            lastProcAutoDisabledRuleId_ = "";
+            lastProcAutoDisabledAtMs_ = 0;
+        }
     }
     const bool ok = TankProcedureFsmManager::instance().handleCmd(String(ruleId), String(op));
     Serial.printf("[MQTT] procedure/cmd rule=%s op=%s → %s\n", ruleId, op, ok ? "ok" : "ignored");

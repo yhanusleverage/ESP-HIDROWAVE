@@ -21,6 +21,7 @@
 import 'dotenv/config';
 import mqtt from 'mqtt';
 import ws from 'ws';
+import { createHash } from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 import { evaluateSchedules } from './schedule-evaluator.js';
 
@@ -113,6 +114,10 @@ const PROCEDURE_FINISHED_DEDUP_MS = parseInt(
   process.env.PROCEDURE_FINISHED_DEDUP_MS || '60000',
   10
 );
+/** No auto-desactivar FNs (p.ej. fn_recirculacao_continua). */
+const PROCEDURE_AUTO_DISABLE = process.env.PROCEDURE_AUTO_DISABLE !== '0';
+const PROCEDURE_AUTO_DISABLE_SKIP_PREFIX = 'fn_';
+const BRIDGE_AUTO_DISABLE_BY = 'bridge:procedure_finished';
 
 // Alinhado com CHECK Supabase: environment_data_temperature_check / environment_data_humidity_check
 const ENV_TEMP_MIN = 0;
@@ -2048,6 +2053,19 @@ async function insertProcedureFinished(row) {
     return true;
   }
 
+  let ruleName = null;
+  {
+    const { data: ruleRow } = await supabase
+      .from('decision_rules')
+      .select('rule_name')
+      .eq('device_id', row.deviceId)
+      .eq('rule_id', row.ruleId)
+      .maybeSingle();
+    if (ruleRow?.rule_name) {
+      ruleName = String(ruleRow.rule_name).trim() || null;
+    }
+  }
+
   const insertRow = {
     device_id: row.deviceId,
     event_id: row.eventId,
@@ -2057,8 +2075,16 @@ async function insertProcedureFinished(row) {
     kind: row.kind,
     created_at: new Date().toISOString(),
   };
+  if (ruleName) {
+    insertRow.rule_name = ruleName;
+  }
 
-  const { error } = await supabase.from('procedure_events').insert(insertRow);
+  let { error } = await supabase.from('procedure_events').insert(insertRow);
+  // Columna rule_name aún no migrada — reintentar sin ella
+  if (error && ruleName && /rule_name/i.test(error.message || '')) {
+    delete insertRow.rule_name;
+    ({ error } = await supabase.from('procedure_events').insert(insertRow));
+  }
   if (error) {
     if (error.code === '23505') {
       procedureFinishedEventIds.set(dedupeKey, Date.now());
@@ -2074,9 +2100,211 @@ async function insertProcedureFinished(row) {
 
   procedureFinishedEventIds.set(dedupeKey, Date.now());
   console.log(
-    `[bridge] procedure_finished INSERT rule=${row.ruleId} status=${row.status}`
+    `[bridge] procedure_finished INSERT rule=${row.ruleId} status=${row.status}` +
+      (ruleName ? ` name=${ruleName}` : '')
   );
   return true;
+}
+
+function safeMqttRuleId(ruleId) {
+  return String(ruleId).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 96);
+}
+
+function hashRuleBody(ruleBody) {
+  return createHash('sha256').update(JSON.stringify(ruleBody)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Publica retained rules/{id} con op=disable (payload mínimo — path firmware "rules disable").
+ * Usa MQTT_PUBLISH_USER/PASS (hidrowave) si existen; si no, el client del bridge.
+ */
+function publishRuleDisableMqtt(deviceId, ruleRow) {
+  const publishUser = process.env.MQTT_PUBLISH_USER || process.env.MQTT_USER;
+  const publishPass = process.env.MQTT_PUBLISH_PASS || process.env.MQTT_PASS;
+  if (!publishUser || !publishPass) {
+    console.warn('[bridge] auto-disable MQTT skip — sin MQTT_PUBLISH_* / MQTT_USER');
+    return Promise.resolve({ ok: false, skipped: true });
+  }
+
+  // Payload mínimo: el firmware solo mira op=disable + rule_id (evita upsert enorme retained).
+  const topic = `hidrowave/${deviceId}/rules/${safeMqttRuleId(ruleRow.rule_id)}`;
+  const payload = JSON.stringify({
+    v: 1,
+    op: 'disable',
+    device_id: deviceId,
+    rule_id: ruleRow.rule_id,
+    rule: {
+      rule_id: ruleRow.rule_id,
+      rule_name: ruleRow.rule_name ?? ruleRow.rule_id,
+      enabled: false,
+      priority: ruleRow.priority ?? 50,
+    },
+  });
+
+  const publishOnce = (mqttClient) =>
+    new Promise((resolve) => {
+      mqttClient.publish(topic, payload, { qos: 1, retain: true }, (err) => {
+        if (err) {
+          console.error(`[bridge] auto-disable MQTT publish failed:`, err.message);
+          resolve({ ok: false, error: err.message });
+        } else {
+          console.log(
+            `[bridge] auto-disable MQTT published → ${topic} op=disable retained`
+          );
+          resolve({ ok: true });
+        }
+      });
+    });
+
+  /** Tres pasadas: inmediato, ~0.8s, ~3s (ventana típica de reconnect ESP). */
+  const publishBurst = async (mqttClient) => {
+    const r1 = await publishOnce(mqttClient);
+    await new Promise((r) => setTimeout(r, 800));
+    const r2 = await publishOnce(mqttClient);
+    await new Promise((r) => setTimeout(r, 2200));
+    const r3 = await publishOnce(mqttClient);
+    return r1.ok || r2.ok || r3.ok ? { ok: true } : r3;
+  };
+
+  const useSeparateClient =
+    Boolean(process.env.MQTT_PUBLISH_USER) &&
+    process.env.MQTT_PUBLISH_USER !== process.env.MQTT_USER;
+
+  const run = async () => {
+    if (!useSeparateClient && client?.connected) {
+      return publishBurst(client);
+    }
+
+    return new Promise((resolve) => {
+      const pub = mqtt.connect(mqttUrl, {
+        username: publishUser,
+        password: publishPass,
+        connectTimeout: 5000,
+      });
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        setTimeout(() => {
+          try {
+            pub.end(true);
+          } catch {
+            /* ignore */
+          }
+        }, 300);
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish({ ok: false, error: 'timeout' }), 20000);
+      pub.on('connect', async () => {
+        try {
+          const result = await publishBurst(pub);
+          clearTimeout(timer);
+          finish(result);
+        } catch (e) {
+          clearTimeout(timer);
+          finish({ ok: false, error: e instanceof Error ? e.message : String(e) });
+        }
+      });
+      pub.on('error', (err) => {
+        clearTimeout(timer);
+        console.error(`[bridge] auto-disable MQTT connect:`, err.message);
+        finish({ ok: false, error: err.message });
+      });
+    });
+  };
+
+  return run();
+}
+
+/**
+ * Tras procedure_finished status=completed: enabled=false en DB + MQTT disable + historial.
+ * Excluye reglas fn_* (recirculación continua, etc.).
+ */
+async function autoDisableRuleAfterProcedure(row) {
+  if (!PROCEDURE_AUTO_DISABLE) return;
+  if (row.status !== 'completed') return;
+  const ruleId = String(row.ruleId || '').trim();
+  if (!ruleId || ruleId.toLowerCase().startsWith(PROCEDURE_AUTO_DISABLE_SKIP_PREFIX)) {
+    if (ruleId) {
+      console.log(`[bridge] auto-disable skip FN rule=${ruleId}`);
+    }
+    return;
+  }
+
+  const { data: existing, error: fetchErr } = await supabase
+    .from('decision_rules')
+    .select('rule_id, rule_name, rule_description, rule_json, priority, enabled')
+    .eq('device_id', row.deviceId)
+    .eq('rule_id', ruleId)
+    .maybeSingle();
+
+  if (fetchErr) {
+    console.error(`[bridge] auto-disable fetch decision_rules:`, fetchErr.message);
+    return;
+  }
+  if (!existing) {
+    console.warn(`[bridge] auto-disable: rule not in DB rule=${ruleId}`);
+    return;
+  }
+  // Siempre publicar MQTT disable (incluso si DB ya está false): el retained
+  // upsert enabled=1 debe sobrescribirse; un early-return dejaba al ESP re-armado.
+  if (existing.enabled !== false) {
+    const { error: updErr } = await supabase
+      .from('decision_rules')
+      .update({ enabled: false, updated_at: new Date().toISOString() })
+      .eq('device_id', row.deviceId)
+      .eq('rule_id', ruleId);
+
+    if (updErr) {
+      console.error(`[bridge] auto-disable UPDATE failed rule=${ruleId}:`, updErr.message);
+      // Aun así intentar MQTT — el retained enable es peor que DB desfasada
+    } else {
+      console.log(`[bridge] auto-disable DB enabled=false rule=${ruleId}`);
+    }
+
+    const { error: histErr } = await supabase.from('rule_config_events').insert({
+      device_id: row.deviceId,
+      rule_id: ruleId,
+      rule_name: existing.rule_name ?? null,
+      event_type: 'disabled',
+      created_by: BRIDGE_AUTO_DISABLE_BY,
+      created_at: new Date().toISOString(),
+    });
+    if (histErr) {
+      console.warn(
+        `[bridge] auto-disable rule_config_events skip:`,
+        histErr.message
+      );
+    }
+  } else {
+    console.log(
+      `[bridge] auto-disable DB already off — aún así MQTT disable retained rule=${ruleId}`
+    );
+  }
+
+  await publishRuleDisableMqtt(row.deviceId, existing);
+}
+
+async function handleProcedureFinished(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'procedure_finished');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateProcedureFinished(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await insertProcedureFinished(validated.row);
+  await autoDisableRuleAfterProcedure(validated.row);
 }
 
 function validateRelayState(deviceId, payload) {
@@ -2299,27 +2527,6 @@ async function handleRuleExecuted(topic, message) {
   }
 
   await insertRuleExecutedMirror(validated.row);
-}
-
-async function handleProcedureFinished(topic, message) {
-  const deviceId = parseDeviceIdFromTopic(topic, 'procedure_finished');
-  if (!deviceId) return;
-
-  let payload;
-  try {
-    payload = JSON.parse(message.toString());
-  } catch {
-    console.warn(`[bridge] Invalid JSON on ${topic}`);
-    return;
-  }
-
-  const validated = validateProcedureFinished(deviceId, payload);
-  if (!validated.ok) {
-    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
-    return;
-  }
-
-  await insertProcedureFinished(validated.row);
 }
 
 async function handleRelayState(topic, message) {
