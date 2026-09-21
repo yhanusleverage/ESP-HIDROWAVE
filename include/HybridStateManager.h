@@ -8,6 +8,10 @@
 #include "HydroSupaManager.h"
 #include "HydroSystemCore.h"
 #include "AdminWebSocketServer.h"
+#include "DeviceID.h"
+#if ENABLE_HMI_UART
+#include "HmiUartBridge.h"
+#endif
 
 // Forward declarations
 class WebServerTask;
@@ -49,6 +53,12 @@ private:
     unsigned long wifiReconnectStartedMs;
     unsigned long wifiLastAttemptMs;
     uint8_t wifiReconnectAttempts;
+
+#if ENABLE_HMI_UART
+    /* SoftAP: HydroSystemCore no corre — bridge liviano para wifi_config / link. */
+    HmiUartBridge hmiConfigBridge;
+    bool hmiConfigBridgeActive;
+#endif
     
     // Timeouts
     static const unsigned long WIFI_CONFIG_TIMEOUT = 600000;  // 10 min (mais tempo para configurar)
@@ -103,6 +113,11 @@ private:
     void armWifiStation(const String& ssid, const String& password);
     static const char* wifiStatusString(wl_status_t status);
     String getDeviceID();
+#if ENABLE_HMI_UART
+    void startHmiConfigBridge();
+    void stopHmiConfigBridge();
+    static String hmiConfigDeviceIdStatic();
+#endif
 };
 
 #endif // HYDRO_STATE_MANAGER_H 

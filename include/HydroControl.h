@@ -223,6 +223,10 @@ public:
     bool isPhValidForTelemetry() const;
     bool isEcValidForTelemetry() const;
     bool isTempValidForTelemetry() const;
+    /** ms desde última lectura válida; ULONG_MAX si nunca hubo. */
+    unsigned long getEcValidAgeMs() const;
+    unsigned long getPhValidAgeMs() const;
+    unsigned long getTempValidAgeMs() const;
     String getTankStatus();
     float getWaterTemp();
     

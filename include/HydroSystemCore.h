@@ -397,9 +397,11 @@ public:
     void printSensorReadings();
     void testSupabaseConnection();
 
-#if ENABLE_HMI_UART && UART_BRINGUP
+#if ENABLE_HMI_UART
     void dumpHmiUartLinkStatus(Stream& out) const;
+    void dumpHmiLastTelemetry(Stream& out) const;
     static void dumpHmiUartLinkStatusStatic(Stream& out);
+    static void dumpHmiLastTelemetryStatic(Stream& out);
 #endif
     
 private:

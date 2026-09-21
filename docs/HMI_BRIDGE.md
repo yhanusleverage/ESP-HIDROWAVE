@@ -24,13 +24,21 @@ Baud **115200**, 8N1. UART del Master: **Serial1** (`HmiUartBridge.cpp`).
 
 ## Master → HMI
 
-| Tipo | Cuándo |
-|------|--------|
-| `telemetry` | Cada ~2 s (ph, ec, temp_agua) |
-| `cmd_ack` | Tras cada comando de proceso |
-| `sys_info` | Respuesta a `sys_info_req` |
-| `slaves` | Respuesta a `slaves_req` |
-| `wifi_config_ack` | Stub v1 (ok=false; usar SoftAP Master) |
+| Tipo | Cuándo | Campos |
+|------|--------|--------|
+| `telemetry` | Cada ~2 s | `ph`, `ec`, `temp_agua` (solo si lectura válida/fresca); **siempre** `ph_valid`, `ec_valid`, `temp_valid` (bool) |
+| `cmd_ack` | Tras cada comando de proceso | `action`, `ok`, `commandId` |
+| `sys_info` | Respuesta a `sys_info_req` | `device_id`, `cloud_ok`, `process_bridge`, snapshot provisión (`has_wifi`, `wifi_connected`, `ssid`, `password`, `email`, `device_name`, `location`) |
+| `slaves` | Respuesta a `slaves_req` | array `slaves[]` |
+| `wifi_config_ack` | Tras `wifi_config` | `ok` + `device_id` |
+
+**Nota EC congelada en HMI:** si `ec_valid=false`, el Master **omite** el campo `ec`. La HMI debe tratar `ec_valid==false` como dato no usable (mostrar `--` / stale) y **no** conservar el valor anterior marcándolo LIVE. Implementación HMI: `MasterLink` + `DataStore` (2026-09-20). Auditoría: [`UART_AUDIT_MATRIX.md`](UART_AUDIT_MATRIX.md) · paridad MVP: [`handoffs/HANDOFF_MVP_WEB_HMI_PARITY.md`](handoffs/HANDOFF_MVP_WEB_HMI_PARITY.md).
+
+**WiFi bidireccional:** SoftAP escribe NVS `hydro_system`. HMI pide `sys_info` y precarga wizard. HMI → `wifi_config` escribe el **mismo** NVS + `wifi_config_ack` + **reboot ~2.5 s** (paridad SoftAP: sale de WIFI_CONFIG_MODE y conecta STA). SoftAP `ESP32_Hidropônico` / `hidrosetup` = vía A.
+
+**Atlas rule-lock:** respuesta `slaves` puede incluir por relé `locked` / `lock_reason` / `lock_label`. Manual `relay_slave` sobre relé lastreado → `cmd_ack ok=false`.
+
+Buffer JSON RX Master: **1536 B** (`kJsonCapacity`). Si un `loop_control` / `nutrient_proportions` no cabe → log `[HMI UART] BUFFER LLENO`.
 
 ## HMI → Master (implementado v1)
 
@@ -43,7 +51,9 @@ Baud **115200**, 8N1. UART del Master: **Serial1** (`HmiUartBridge.cpp`).
 | `setpoint` | EC / pH setpoint |
 | `relay_local` / `relay_slave` | Actuación local / ESP-NOW |
 | `calib` | Ack stub |
-| `wifi_config` | Stub (SoftAP `ESP32_Hidropônico` / `hidrosetup`) |
+| `wifi_config` | Mismo NVS SoftAP (`hydro_system`) + `wifi_config_ack` + reboot ~2.5 s |
+| `master_reboot` | `cmd_ack` + `ESP.restart()` (~400 ms) — no borra NVS |
+| `factory_reset` | Limpia `hydro_system` + `wifi_creds`, `cmd_ack`, reinicio (~500 ms) — **no** erase flash |
 | `sys_info_req` / `slaves_req` | Respuesta inmediata |
 
 ## Deadband
@@ -58,13 +68,14 @@ No se usa deadband fijo de 50 µS.
 
 ## Prueba en bancada
 
-1. Flashear **envs bring-up**: Master `esp32dev-bringup`, HMI `esp32-s3-hmi-bringup` (`DATA_SOURCE_SIM=0` en prod HMI).
-2. Monitor Master (COM5) → `[HMI UART] RX=17 TX=18`; cada ~2 s `[HMI UART TX] telemetry`.
-3. Monitor HMI (COM4) → al boot `[UART TX] loop_control`; tras cable OK → `[UART RX] telemetry ec=…`.
-4. En **cada** monitor escribir `uart_status` → debe listar pines y `rx_bytes` acumulados.
-5. DoD: `rx_bytes > 0` bidireccional; Master recibe `loop_control`; HMI recibe EC real.
+1. Flashear Master `esp32dev` o `esp32dev-bringup`; HMI `esp32-s3-hmi-bringup` / `uart-bench` (`DATA_SOURCE_SIM=0`).
+2. Monitor Master → `[HMI UART] RX=17 TX=18`; cada ~2 s `[HMI UART TX] telemetry` (con `ec_valid`/`ph_valid`/`temp_valid`).
+3. Monitor HMI → al boot `[UART TX] loop_control`; tras cable OK → `[UART RX] telemetry ec=…`.
+4. En Master USB: `uart_status` (pines/ready) y `hmi_last` (último JSON TX + EC interna / age_ms).
+5. DoD: enlace bidireccional; Master recibe `loop_control` sin `BUFFER LLENO`; HMI recibe EC real cuando `ec_valid=true`.
 
-Guía extendida: [`UART_BRINGUP.md`](UART_BRINGUP.md).
+Checklist completo: [`UART_AUDIT_MATRIX.md`](UART_AUDIT_MATRIX.md).  
+Guía física: [`UART_BRINGUP.md`](UART_BRINGUP.md).
 
 ## Troubleshooting
 
@@ -79,6 +90,7 @@ Guía extendida: [`UART_BRINGUP.md`](UART_BRINGUP.md).
 
 ## Archivos
 
-- `include/HmiUartBridge.h`
-- `src/HmiUartBridge.cpp`
+- `include/HmiUartBridge.h` / `src/HmiUartBridge.cpp`
 - Integración: `HydroSystemCore::begin()` / `loop()`
+- Auditoría: [`UART_AUDIT_MATRIX.md`](UART_AUDIT_MATRIX.md)
+- Consola USB: `uart_status`, `hmi_last` (requiere `ENABLE_HMI_UART=1`)

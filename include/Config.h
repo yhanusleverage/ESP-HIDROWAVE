@@ -299,7 +299,7 @@
 #define TDS_PIN 33                     // EC analógico (GPIO 33 — validado ESP-SENSORS)
 #define EC_SENSOR_ANALOG_PIN TDS_PIN
 #define PH_RS485_RX_PIN 34             // RO del módulo TTL-RS485
-#define PH_RS485_TX_PIN 23             // DI del módulo TTL-RS485
+#define PH_RS485_TX_PIN 26             // DI del módulo TTL-RS485 (era 23)
 #define PH_RS485_DE_RE_PIN 32          // DE+RE unidos (LOW = escuchar)
 #define PH_MODBUS_BAUD 9600
 #define PH_MODBUS_ADDR 1

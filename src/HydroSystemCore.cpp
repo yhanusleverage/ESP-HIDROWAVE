@@ -165,19 +165,38 @@ String HydroSystemCore::hmiDeviceIdStatic() {
     return getDeviceID();
 }
 
-#if UART_BRINGUP
 void HydroSystemCore::dumpHmiUartLinkStatus(Stream& out) const {
     hmiUartBridge.dumpLinkStatus(out);
+}
+
+void HydroSystemCore::dumpHmiLastTelemetry(Stream& out) const {
+    hmiUartBridge.dumpLastTelemetry(out);
 }
 
 void HydroSystemCore::dumpHmiUartLinkStatusStatic(Stream& out) {
     if (hmiBridgeInstance) {
         hmiBridgeInstance->dumpHmiUartLinkStatus(out);
-    } else {
-        out.println("[HMI UART STATUS] bridge no init (esperar HYDRO_ACTIVE)");
+        return;
     }
+    if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
+        bridge->dumpLinkStatus(out);
+        out.println("[HMI UART STATUS] mode=WIFI_CONFIG (sin HydroSystemCore)");
+        return;
+    }
+    out.println("[HMI UART STATUS] bridge no init");
 }
-#endif
+
+void HydroSystemCore::dumpHmiLastTelemetryStatic(Stream& out) {
+    if (hmiBridgeInstance) {
+        hmiBridgeInstance->dumpHmiLastTelemetry(out);
+        return;
+    }
+    if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
+        bridge->dumpLastTelemetry(out);
+        return;
+    }
+    out.println("[HMI UART LAST] bridge no init");
+}
 #endif
 
 // ===== CONSTRUTOR E DESTRUTOR =====
@@ -559,6 +578,7 @@ bool HydroSystemCore::begin() {
         hmiCtx.coordinator = &relayCoordinator;
         hmiCtx.masterManager = masterManager;
         hmiCtx.supabase = &supabase;
+        hmiCtx.decisionEngine = &decisionEngine;
         hmiCtx.cloudOkFn = &HydroSystemCore::hmiCloudOkStatic;
         hmiCtx.deviceIdFn = &HydroSystemCore::hmiDeviceIdStatic;
         hmiUartBridge.attach(hmiCtx);
@@ -1235,6 +1255,11 @@ void HydroSystemCore::end() {
     if (!systemReady) return;
     
     Serial.println("🛑 Parando HydroSystemCore...");
+
+#if ENABLE_HMI_UART
+    hmiUartBridge.end();
+    hmiBridgeInstance = nullptr;
+#endif
     
     systemReady = false;
     supabaseConnected = false;

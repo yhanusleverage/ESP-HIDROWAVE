@@ -4,6 +4,7 @@
 #include "SensorSanitize.h"
 #include <Preferences.h>
 #include <cmath>
+#include <climits>
 #include <cstring>
 
 HydroControl::HydroControl()
@@ -258,7 +259,7 @@ bool HydroControl::begin() {
                                         PH_MODBUS_REG,
                                         PH_MODBUS_SCALE);
     phModbusSensor->begin();
-    Serial.println("[pH] Modbus RS485 iniciado (RO=34 DI=23 DE/RE=32)");
+    Serial.println("[pH] Modbus RS485 iniciado (RO=34 DI=26 DE/RE=32)");
 #else
     pHSensor = new phSensor();
     pHSensor->calibrate(2.56, 3.3, 2.05, false);
@@ -592,6 +593,27 @@ bool HydroControl::isTempValidForTelemetry() const {
         return false;
     }
     return (millis() - lastTempValidMs) <= SENSOR_READING_STALE_MS;
+}
+
+unsigned long HydroControl::getEcValidAgeMs() const {
+    if (lastEcValidMs == 0) {
+        return ULONG_MAX;
+    }
+    return millis() - lastEcValidMs;
+}
+
+unsigned long HydroControl::getPhValidAgeMs() const {
+    if (lastPhValidMs == 0) {
+        return ULONG_MAX;
+    }
+    return millis() - lastPhValidMs;
+}
+
+unsigned long HydroControl::getTempValidAgeMs() const {
+    if (lastTempValidMs == 0) {
+        return ULONG_MAX;
+    }
+    return millis() - lastTempValidMs;
 }
 
 void HydroControl::updateSensors() {

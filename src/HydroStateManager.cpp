@@ -3,6 +3,7 @@
 #include <SPIFFS.h>
 #include <esp_task_wdt.h>  // ✅ CRÍTICO: Para esp_task_wdt_reset()
 #include "DeviceRegistration.h" // ✅ NOVO: Sistema de registro por email
+#include "DeviceID.h"
 // ✅ ESPNowBridge eliminado - usar MasterSlaveManager y ESPNowController
 #ifdef MASTER_MODE
     #include "MasterSlaveManager.h"
@@ -22,8 +23,11 @@ HydroStateManager::HydroStateManager() :
     wifiReconnectPhase(WIFI_RECONNECT_IDLE),
     wifiReconnectStartedMs(0),
     wifiLastAttemptMs(0),
-    wifiReconnectAttempts(0) {
-    
+    wifiReconnectAttempts(0)
+#if ENABLE_HMI_UART
+    , hmiConfigBridgeActive(false)
+#endif
+{
     deviceID = "ESP32_HIDRO_" + String((uint32_t)ESP.getEfuseMac(), HEX);
     Serial.println("🏗️ HydroStateManager inicializado");
 }
@@ -197,6 +201,12 @@ void HydroStateManager::loop() {
             if (wifiServer && wifiServer->isActive()) {
                 wifiServer->loop();
             }
+#if ENABLE_HMI_UART
+            if (hmiConfigBridgeActive) {
+                hmiConfigBridge.loop();
+                hmiConfigBridge.maybePublishTelemetry(now);
+            }
+#endif
             break;
             
         case HYDRO_ACTIVE_MODE:
@@ -256,6 +266,10 @@ void HydroStateManager::switchToWiFiConfig() {
     } else {
         Serial.println("❌ Erro ao iniciar WiFi Config Server");
     }
+
+#if ENABLE_HMI_UART
+    startHmiConfigBridge();
+#endif
 }
 
 void HydroStateManager::switchToHydroActive() {
@@ -409,6 +423,10 @@ void HydroStateManager::handleSerialCommand(const String& command) {
 // ===== MÉTODOS PRIVADOS =====
 void HydroStateManager::cleanup() {
     Serial.println("🧹 Limpando estado anterior...");
+
+#if ENABLE_HMI_UART
+    stopHmiConfigBridge();
+#endif
     
     // Liberar recursos do estado anterior
     if (wifiServer) {
@@ -669,4 +687,31 @@ void HydroStateManager::dumpWifiReconnectStatus(Stream& out) const {
 
 String HydroStateManager::getDeviceID() {
     return deviceID;
-} 
+}
+
+#if ENABLE_HMI_UART
+String HydroStateManager::hmiConfigDeviceIdStatic() {
+    return ::getDeviceID();
+}
+
+void HydroStateManager::startHmiConfigBridge() {
+    if (hmiConfigBridgeActive) {
+        return;
+    }
+    HmiUartBridge::Context ctx;
+    ctx.deviceIdFn = &HydroStateManager::hmiConfigDeviceIdStatic;
+    hmiConfigBridge.attach(ctx);
+    hmiConfigBridge.begin();
+    hmiConfigBridgeActive = true;
+    Serial.println("[HMI UART] bridge activo en WIFI_CONFIG_MODE (wifi_config / heartbeat)");
+}
+
+void HydroStateManager::stopHmiConfigBridge() {
+    if (!hmiConfigBridgeActive) {
+        return;
+    }
+    hmiConfigBridge.end();
+    hmiConfigBridgeActive = false;
+    Serial.println("[HMI UART] bridge WIFI_CONFIG detenido");
+}
+#endif

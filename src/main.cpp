@@ -1912,10 +1912,13 @@ void handleGlobalSerialCommands() {
         Serial.println("   auto_reconnect   - Reconexão automática");
         Serial.println("   discovery_stats  - Estatísticas de descoberta");
         Serial.println("   connection_health - Saúde da conexão");
-#if ENABLE_HMI_UART && UART_BRINGUP
-        Serial.println("\n🔌 UART BRINGUP:");
+#if ENABLE_HMI_UART
+        Serial.println("\n🔌 UART HMI:");
         Serial.println("   uart_status      - Contadores RX + pines HMI link");
+        Serial.println("   hmi_last         - Último telemetry TX + EC/pH internos (careo)");
+#if UART_BRINGUP
         Serial.println("   wifi_status      - Fase reconnect WiFi + WL status");
+#endif
 #endif
         Serial.println("   help             - Esta ajuda");
         Serial.println("===============================\n");
@@ -1943,13 +1946,18 @@ void handleGlobalSerialCommands() {
         Serial.println("⬇️ Mínimo: " + String(minHeapSeen) + " bytes");
         Serial.println("============================\n");
     }
-#if ENABLE_HMI_UART && UART_BRINGUP
+#if ENABLE_HMI_UART
     else if (command == "uart_status") {
         HydroSystemCore::dumpHmiUartLinkStatusStatic(Serial);
     }
+    else if (command == "hmi_last") {
+        HydroSystemCore::dumpHmiLastTelemetryStatic(Serial);
+    }
+#if UART_BRINGUP
     else if (command == "wifi_status") {
         stateManager.dumpWifiReconnectStatus(Serial);
     }
+#endif
 #endif
     else if (command == "reset") {
         Serial.println("🔄 REINICIANDO ESP32...");

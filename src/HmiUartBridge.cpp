@@ -8,12 +8,22 @@
 #include "SupabaseClient.h"
 #include "ESPNowController.h"
 #include "Controller.h"
+#include "DecisionEngine.h"
+#include "WiFiCredentialsManager.h"
 #include <WiFi.h>
+#include <Preferences.h>
 #include <HardwareSerial.h>
 #include <cstring>
+#include <climits>
 #include <math.h>
 
 static HardwareSerial HmiSerial(1);
+
+HmiUartBridge* HmiUartBridge::s_active_ = nullptr;
+
+HmiUartBridge* HmiUartBridge::activeInstance() {
+    return s_active_;
+}
 
 #if UART_LINK_DEBUG
 static uint32_t hmiRxByteCount = 0;
@@ -64,6 +74,37 @@ void HmiUartBridge::dumpLinkStatus(Stream& out) const {
 #endif
 }
 
+void HmiUartBridge::dumpLastTelemetry(Stream& out) const {
+    out.println("[HMI UART LAST] --- careo Serial vs HMI ---");
+    if (lastTelemetryValid_) {
+        out.printf("[HMI UART LAST] tx_json=%s\n", lastTelemetryJson_);
+    } else {
+        out.println("[HMI UART LAST] tx_json=(ninguno aún)");
+    }
+    if (!ctx_.hydro) {
+        out.println("[HMI UART LAST] hydro=null");
+        return;
+    }
+    HydroControl& hydro = *ctx_.hydro;
+    const unsigned long ecAge = hydro.getEcValidAgeMs();
+    const unsigned long phAge = hydro.getPhValidAgeMs();
+    const unsigned long tempAge = hydro.getTempValidAgeMs();
+    out.printf("[HMI UART LAST] ec=%.1f valid=%d age_ms=%lu stale_limit=%lu\n",
+               hydro.getEC(), hydro.isEcValidForTelemetry() ? 1 : 0,
+               ecAge == ULONG_MAX ? 0UL : ecAge, SENSOR_READING_STALE_MS);
+    out.printf("[HMI UART LAST] ph=%.2f valid=%d age_ms=%lu\n",
+               hydro.getpH(), hydro.isPhValidForTelemetry() ? 1 : 0,
+               phAge == ULONG_MAX ? 0UL : phAge);
+    out.printf("[HMI UART LAST] temp=%.1f valid=%d age_ms=%lu\n",
+               hydro.getTemperature(), hydro.isTempValidForTelemetry() ? 1 : 0,
+               tempAge == ULONG_MAX ? 0UL : tempAge);
+    if (ecAge == ULONG_MAX) {
+        out.println("[HMI UART LAST] EC: nunca hubo lectura válida");
+    } else if (!hydro.isEcValidForTelemetry()) {
+        out.println("[HMI UART LAST] EC: STALE — telemetry omite campo ec; HMI puede congelar valor viejo");
+    }
+}
+
 void HmiUartBridge::attach(const Context& ctx) {
     ctx_ = ctx;
 }
@@ -73,12 +114,29 @@ void HmiUartBridge::begin() {
     lineLen_ = 0;
     ready_ = true;
     lastTelemetryMs_ = 0;
+    lastTelemetryValid_ = false;
+    lastTelemetryJson_[0] = '\0';
+    pendingRestart_ = false;
+    s_active_ = this;
     Serial.printf("[HMI UART] RX=%d TX=%d baud=%d\n",
                   HMI_UART_RX_PIN, HMI_UART_TX_PIN, HMI_UART_BAUD);
 #if UART_LINK_DEBUG
     Serial.println("[HMI UART DBG] cable: HMI TX(17)->Master RX(17), Master TX(18)->HMI RX(18), GND");
     Serial.println("[HMI UART DBG] NOTA: IO17=RX firmware (no UART2 TX del pinout)");
 #endif
+    if (!ctx_.hydro) {
+        /* SoftAP: avisar ya has_wifi / perfil para wizard HMI. */
+        sendSysInfo();
+    }
+}
+
+void HmiUartBridge::end() {
+    if (s_active_ == this) {
+        s_active_ = nullptr;
+    }
+    ready_ = false;
+    lineLen_ = 0;
+    pendingRestart_ = false;
 }
 
 void HmiUartBridge::emitJson(const JsonDocument& doc) {
@@ -99,6 +157,24 @@ void HmiUartBridge::sendCmdAck(const char* action, bool ok) {
 }
 
 void HmiUartBridge::sendSysInfo() {
+    /* Snapshot de provisión SoftAP/NVS — HMI precarga wizard si Master ya tiene WiFi/perfil. */
+    String ssid;
+    String password;
+    String email;
+    String deviceName;
+    String location;
+    bool hasWifi = false;
+    Preferences prefs;
+    if (prefs.begin("hydro_system", true)) {
+        ssid = prefs.getString("ssid", "");
+        password = prefs.getString("password", "");
+        email = prefs.getString("user_email", "");
+        deviceName = prefs.getString("device_name", "");
+        location = prefs.getString("location", "");
+        prefs.end();
+        hasWifi = ssid.length() > 0;
+    }
+
     StaticJsonDocument<kJsonCapacity> doc;
     doc["t"] = "sys_info";
     if (ctx_.deviceIdFn) {
@@ -109,7 +185,42 @@ void HmiUartBridge::sendSysInfo() {
     const bool cloudOk = ctx_.cloudOkFn ? ctx_.cloudOkFn() : false;
     doc["cloud_ok"] = cloudOk;
     doc["process_bridge"] = true;
-    emitJson(doc);
+    doc["has_wifi"] = hasWifi;
+    doc["wifi_connected"] = (WiFi.status() == WL_CONNECTED);
+    if (hasWifi) {
+        doc["ssid"] = ssid;
+        doc["password"] = password;
+    }
+    if (email.length() > 0) {
+        doc["email"] = email;
+    }
+    if (deviceName.length() > 0) {
+        doc["device_name"] = deviceName;
+    }
+    if (location.length() > 0) {
+        doc["location"] = location;
+    }
+
+    serializeJson(doc, HmiSerial);
+    HmiSerial.print('\n');
+    /* USB: no volcar password. */
+    Serial.print("[HMI UART TX] ");
+    Serial.printf(
+        "{\"t\":\"sys_info\",\"device_id\":\"%s\",\"cloud_ok\":%s,\"has_wifi\":%s,"
+        "\"wifi_connected\":%s,\"ssid\":\"%s\",\"password\":\"%s\"",
+        ctx_.deviceIdFn ? ctx_.deviceIdFn().c_str() : "", cloudOk ? "true" : "false",
+        hasWifi ? "true" : "false", (WiFi.status() == WL_CONNECTED) ? "true" : "false",
+        ssid.c_str(), hasWifi ? "***" : "");
+    if (email.length() > 0) {
+        Serial.printf(",\"email\":\"%s\"", email.c_str());
+    }
+    if (deviceName.length() > 0) {
+        Serial.printf(",\"device_name\":\"%s\"", deviceName.c_str());
+    }
+    if (location.length() > 0) {
+        Serial.printf(",\"location\":\"%s\"", location.c_str());
+    }
+    Serial.println(",\"process_bridge\":true}");
 }
 
 void HmiUartBridge::sendSlavesList() {
@@ -117,24 +228,138 @@ void HmiUartBridge::sendSlavesList() {
     doc["t"] = "slaves";
     JsonArray arr = doc.createNestedArray("slaves");
 
+    auto fillRelayLocks = [&](JsonObject o, const char* macStr, int numRelays, bool isLocal) {
+        JsonArray relays = o.createNestedArray("relays");
+        for (int i = 0; i < numRelays; ++i) {
+            JsonObject r = relays.createNestedObject();
+            r["on"] = 0;
+            char reason[16] = {};
+            char label[24] = {};
+            const bool locked =
+                !isLocal && isSlaveRelayAutomationLocked(macStr, i, reason, sizeof(reason),
+                                                         label, sizeof(label));
+            r["locked"] = locked;
+            if (locked) {
+                if (reason[0]) {
+                    r["lock_reason"] = reason;
+                }
+                if (label[0]) {
+                    r["lock_label"] = label;
+                }
+            }
+        }
+    };
+
     JsonObject local = arr.createNestedObject();
     local["mac"] = "local";
     local["name"] = "Master";
     local["local"] = true;
     local["online"] = true;
     local["numRelays"] = 8;
+    fillRelayLocks(local, "local", 8, true);
 
     if (ctx_.masterManager) {
         ctx_.masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
             JsonObject o = arr.createNestedObject();
-            o["mac"] = ESPNowController::macToString(slave.macAddress);
+            const String mac = ESPNowController::macToString(slave.macAddress);
+            o["mac"] = mac;
             o["name"] = slave.deviceName;
             o["local"] = false;
             o["online"] = ctx_.masterManager->isSlaveReachable(slave);
-            o["numRelays"] = slave.numRelays > 0 ? slave.numRelays : 8;
+            const int nr = slave.numRelays > 0 ? slave.numRelays : 8;
+            o["numRelays"] = nr;
+            fillRelayLocks(o, mac.c_str(), nr, false);
         });
     }
     emitJson(doc);
+}
+
+bool HmiUartBridge::isSlaveRelayAutomationLocked(const char* macStr, int relay,
+                                                 char* reasonOut, size_t reasonLen,
+                                                 char* labelOut, size_t labelLen) const {
+    if (reasonOut && reasonLen) {
+        reasonOut[0] = '\0';
+    }
+    if (labelOut && labelLen) {
+        labelOut[0] = '\0';
+    }
+    if (!macStr || !macStr[0] || relay < 0 || relay >= 8) {
+        return false;
+    }
+    if (strcmp(macStr, "local") == 0) {
+        return false;
+    }
+
+    auto setOut = [&](const char* reason, const char* label) {
+        if (reasonOut && reasonLen && reason) {
+            strncpy(reasonOut, reason, reasonLen - 1);
+            reasonOut[reasonLen - 1] = '\0';
+        }
+        if (labelOut && labelLen && label) {
+            strncpy(labelOut, label, labelLen - 1);
+            labelOut[labelLen - 1] = '\0';
+        }
+    };
+
+    auto macMatch = [&](const String& deviceId) -> bool {
+        if (deviceId.length() == 0) {
+            return false;
+        }
+        String a = deviceId;
+        a.toUpperCase();
+        String b = String(macStr);
+        b.toUpperCase();
+        a.replace("-", ":");
+        b.replace("-", ":");
+        return a == b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+    };
+
+    if (ctx_.decisionEngine) {
+        for (const DecisionRule& rule : ctx_.decisionEngine->getAllRules()) {
+            if (!rule.enabled) {
+                continue;
+            }
+            for (const RuleAction& act : rule.actions) {
+                if (act.target_relay != relay) {
+                    continue;
+                }
+                if (!macMatch(act.target_device_id)) {
+                    continue;
+                }
+                setOut("rule", rule.name.length() ? rule.name.c_str() : rule.id.c_str());
+                return true;
+            }
+        }
+    }
+
+    /* Ciclo Auto EC/pH activo: bloquear tipagem circ si la regra fn_* apunta a este MAC+relay. */
+    if (ctx_.hydro && ctx_.decisionEngine) {
+        const char* ecSt = ctx_.hydro->getEcOperationStateName();
+        const char* phSt = ctx_.hydro->getPhOperationStateName();
+        const bool ecBusy = ecSt && (strcmp(ecSt, "dosing") == 0 || strcmp(ecSt, "recirculating") == 0 ||
+                                     strncmp(ecSt, "diluting", 8) == 0);
+        const bool phBusy = phSt && (strcmp(phSt, "dosing") == 0 || strcmp(phSt, "recirculating") == 0 ||
+                                     strncmp(phSt, "diluting", 8) == 0);
+        if (ecBusy || phBusy) {
+            for (const DecisionRule& rule : ctx_.decisionEngine->getAllRules()) {
+                if (!rule.enabled) {
+                    continue;
+                }
+                if (rule.id.indexOf("recirc") < 0 && rule.id.indexOf("fn_") < 0 &&
+                    rule.id.indexOf("circ") < 0) {
+                    continue;
+                }
+                for (const RuleAction& act : rule.actions) {
+                    if (act.target_relay == relay && macMatch(act.target_device_id)) {
+                        setOut(ecBusy ? "auto_ec" : "auto_ph",
+                               ecBusy ? "Auto EC" : "Auto pH");
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
 }
 
 void HmiUartBridge::publishTelemetryNow() {
@@ -142,29 +367,62 @@ void HmiUartBridge::publishTelemetryNow() {
         return;
     }
     HydroControl& hydro = *ctx_.hydro;
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<kTelemetryJsonCapacity> doc;
     doc["t"] = "telemetry";
-    if (hydro.isPhValidForTelemetry()) {
+    const bool phOk = hydro.isPhValidForTelemetry();
+    const bool ecOk = hydro.isEcValidForTelemetry();
+    const bool tempOk = hydro.isTempValidForTelemetry();
+    doc["ph_valid"] = phOk;
+    doc["ec_valid"] = ecOk;
+    doc["temp_valid"] = tempOk;
+    if (phOk) {
         doc["ph"] = hydro.getpH();
     }
-    if (hydro.isEcValidForTelemetry()) {
+    if (ecOk) {
         doc["ec"] = hydro.getEC();
     }
     const float temp = hydro.getWaterTemp();
     if (isfinite(temp)) {
         doc["temp_agua"] = temp;
-    } else if (hydro.isTempValidForTelemetry()) {
+    } else if (tempOk) {
         doc["temp_agua"] = hydro.getTemperature();
+    }
+    const size_t n = serializeJson(doc, lastTelemetryJson_, sizeof(lastTelemetryJson_));
+    lastTelemetryValid_ = (n > 0 && n < sizeof(lastTelemetryJson_));
+    if (!lastTelemetryValid_) {
+        lastTelemetryJson_[0] = '\0';
     }
     emitJson(doc);
 }
 
+void HmiUartBridge::publishConfigHeartbeat() {
+    StaticJsonDocument<kTelemetryJsonCapacity> doc;
+    doc["t"] = "telemetry";
+    doc["ph_valid"] = false;
+    doc["ec_valid"] = false;
+    doc["temp_valid"] = false;
+    const size_t n = serializeJson(doc, lastTelemetryJson_, sizeof(lastTelemetryJson_));
+    lastTelemetryValid_ = (n > 0 && n < sizeof(lastTelemetryJson_));
+    if (!lastTelemetryValid_) {
+        lastTelemetryJson_[0] = '\0';
+        return;
+    }
+    /* Solo HMI UART — no spamear USB Serial cada 2s en SoftAP. */
+    HmiSerial.print(lastTelemetryJson_);
+    HmiSerial.print('\n');
+}
+
 void HmiUartBridge::maybePublishTelemetry(unsigned long nowMs) {
-    if (!ready_ || !ctx_.hydro) {
+    if (!ready_) {
         return;
     }
     if (nowMs - lastTelemetryMs_ >= HMI_TELEMETRY_INTERVAL_MS) {
-        publishTelemetryNow();
+        if (ctx_.hydro) {
+            publishTelemetryNow();
+        } else {
+            /* WIFI_CONFIG_MODE: sin sensores — heartbeat para MasterLink. */
+            publishConfigHeartbeat();
+        }
         lastTelemetryMs_ = nowMs;
     }
 }
@@ -403,6 +661,13 @@ bool HmiUartBridge::handleRelaySlave(JsonDocument& doc) {
     if (relay < 0 || relay >= 8) {
         return false;
     }
+    char reason[16] = {};
+    char label[24] = {};
+    if (isSlaveRelayAutomationLocked(macStr, relay, reason, sizeof(reason), label, sizeof(label))) {
+        Serial.printf("[HMI UART] relay_slave DENY locked mac=%s R%d reason=%s label=%s\n",
+                      macStr, relay, reason, label);
+        return false;
+    }
     const uint32_t cmdId = ctx_.coordinator->actuateSlave(
         RelayOwner::Manual, mac, relay, state, duration, 0, 0, "");
     return cmdId != 0;
@@ -464,16 +729,93 @@ void HmiUartBridge::syncPumpFlowToCloud(int target) {
 }
 
 bool HmiUartBridge::handleWifiConfig(JsonDocument& doc) {
+    /* Mismo NVS que SoftAP (hydro_system) — vía B = vía A. */
     const char* ssid = doc["ssid"] | "";
-    Serial.printf("[HMI UART] wifi_config stub ssid=%s (use SoftAP Master)\n", ssid);
+    const char* password = doc["password"] | "";
+    const char* deviceName = doc["device_name"] | "";
+    const char* email = doc["email"] | "";
+    const char* location = doc["location"] | "";
+
     StaticJsonDocument<256> ack;
     ack["t"] = "wifi_config_ack";
-    ack["ok"] = false;
     if (ctx_.deviceIdFn) {
         ack["device_id"] = ctx_.deviceIdFn();
     }
+
+    if (!ssid[0]) {
+        Serial.println("[HMI UART] wifi_config inválido — ssid vacío");
+        ack["ok"] = false;
+        emitJson(ack);
+        return false;
+    }
+
+    Preferences prefs;
+    if (!prefs.begin("hydro_system", false)) {
+        Serial.println("[HMI UART] wifi_config — no se pudo abrir NVS hydro_system");
+        ack["ok"] = false;
+        emitJson(ack);
+        return false;
+    }
+    const size_t ssidBytes = prefs.putString("ssid", ssid);
+    prefs.putString("password", password ? password : "");
+    if (deviceName[0]) {
+        prefs.putString("device_name", deviceName);
+    }
+    if (email[0]) {
+        prefs.putString("user_email", email);
+    }
+    if (location[0]) {
+        prefs.putString("location", location);
+    }
+    prefs.end();
+
+    if (ssidBytes == 0) {
+        Serial.println("[HMI UART] wifi_config — fallo al guardar ssid");
+        ack["ok"] = false;
+        emitJson(ack);
+        return false;
+    }
+
+    /* Mirror wifi_creds (ESP-NOW broadcast de creds). */
+    uint8_t ch = WiFi.channel();
+    if (ch < 1 || ch > 13) {
+        ch = 1;
+    }
+    WiFiCredentialsManager().saveCredentials(String(ssid), String(password ? password : ""), ch);
+
+    ack["ok"] = true;
+    ack["will_restart"] = true;
     emitJson(ack);
-    return false;
+
+    /* Igual SoftAP: NVS listo → reinicio para salir de WIFI_CONFIG_MODE y conectar STA. */
+    Serial.printf("[HMI UART] wifi_config NVS ok ssid=%s — reboot ~2.5s (parity SoftAP)\n", ssid);
+    scheduleRestart(2500);
+    return true;
+}
+
+void HmiUartBridge::scheduleRestart(unsigned long delayMs) {
+    pendingRestart_ = true;
+    pendingRestartAtMs_ = millis() + delayMs;
+}
+
+bool HmiUartBridge::handleMasterReboot() {
+    Serial.println("[HMI UART] master_reboot — reinicio en ~400ms");
+    scheduleRestart(400);
+    return true;
+}
+
+bool HmiUartBridge::handleFactoryReset() {
+    /* Soft factory: solo credenciales/perfil — NO erase flash / SPIFFS. */
+    Serial.println("[HMI UART] factory_reset — limpiando hydro_system + wifi_creds");
+    Preferences prefs;
+    if (prefs.begin("hydro_system", false)) {
+        prefs.clear();
+        prefs.end();
+    }
+    WiFiCredentialsManager().clearCredentials();
+    WiFi.disconnect(true, true);
+    scheduleRestart(500);
+    return true;
 }
 
 bool HmiUartBridge::handleCommand(JsonDocument& doc) {
@@ -486,9 +828,15 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
         return false;
     }
 
-    Serial.print("[HMI UART RX] ");
-    serializeJson(doc, Serial);
-    Serial.println();
+    if (strcmp(action, "wifi_config") == 0) {
+        Serial.printf("[HMI UART RX] {\"t\":\"cmd\",\"action\":\"wifi_config\",\"ssid\":\"%s\","
+                      "\"password\":\"***\"}\n",
+                      doc["ssid"] | "");
+    } else {
+        Serial.print("[HMI UART RX] ");
+        serializeJson(doc, Serial);
+        Serial.println();
+    }
 
     bool ok = false;
     if (strcmp(action, "dose") == 0 || strcmp(action, "dose_stop") == 0 ||
@@ -511,6 +859,14 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
     } else if (strcmp(action, "wifi_config") == 0) {
         handleWifiConfig(doc);
         return true;
+    } else if (strcmp(action, "master_reboot") == 0) {
+        ok = handleMasterReboot();
+        sendCmdAck(action, ok);
+        return true;
+    } else if (strcmp(action, "factory_reset") == 0) {
+        ok = handleFactoryReset();
+        sendCmdAck(action, ok);
+        return true;
     } else if (strcmp(action, "sys_info_req") == 0) {
         sendSysInfo();
         sendCmdAck(action, true);
@@ -532,6 +888,11 @@ void HmiUartBridge::loop() {
     if (!ready_) {
         return;
     }
+    if (pendingRestart_ && static_cast<long>(millis() - pendingRestartAtMs_) >= 0) {
+        pendingRestart_ = false;
+        Serial.println("[HMI UART] ESP.restart()");
+        ESP.restart();
+    }
     while (HmiSerial.available() > 0) {
         const char c = static_cast<char>(HmiSerial.read());
 #if UART_LINK_DEBUG
@@ -547,6 +908,10 @@ void HmiUartBridge::loop() {
                     hmiRxLineCount++;
 #endif
                     handleCommand(doc);
+                } else if (err == DeserializationError::NoMemory) {
+                    Serial.printf("[HMI UART] BUFFER LLENO (cap=%u, linea=%u B) — mensaje descartado\n",
+                                  static_cast<unsigned>(kJsonCapacity),
+                                  static_cast<unsigned>(lineLen_));
                 } else {
 #if UART_LINK_DEBUG
                     logInvalidLine(lineBuf_, err.c_str());
@@ -561,9 +926,8 @@ void HmiUartBridge::loop() {
         if (lineLen_ + 1 < sizeof(lineBuf_)) {
             lineBuf_[lineLen_++] = c;
         } else {
-#if UART_LINK_DEBUG
-            Serial.println("[HMI UART] linea truncada (>768 B)");
-#endif
+            Serial.printf("[HMI UART] linea truncada (>%u B)\n",
+                          static_cast<unsigned>(sizeof(lineBuf_) - 1));
             lineLen_ = 0;
         }
     }
