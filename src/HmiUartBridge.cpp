@@ -9,12 +9,14 @@
 #include "ESPNowController.h"
 #include "Controller.h"
 #include "DecisionEngine.h"
+#include "MqttClient.h"
 #include "WiFiCredentialsManager.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <HardwareSerial.h>
 #include <cstring>
 #include <climits>
+#include <cstdio>
 #include <math.h>
 
 static HardwareSerial HmiSerial(1);
@@ -109,10 +111,15 @@ void HmiUartBridge::attach(const Context& ctx) {
     ctx_ = ctx;
 }
 
+void HmiUartBridge::bindMasterManager(MasterSlaveManager* masterManager) {
+    ctx_.masterManager = masterManager;
+}
+
 void HmiUartBridge::begin() {
     HmiSerial.begin(HMI_UART_BAUD, SERIAL_8N1, HMI_UART_RX_PIN, HMI_UART_TX_PIN);
     lineLen_ = 0;
     ready_ = true;
+    plantCfgPushed_ = false;
     lastTelemetryMs_ = 0;
     lastTelemetryValid_ = false;
     lastTelemetryJson_[0] = '\0';
@@ -142,6 +149,7 @@ void HmiUartBridge::end() {
 void HmiUartBridge::emitJson(const JsonDocument& doc) {
     serializeJson(doc, HmiSerial);
     HmiSerial.print('\n');
+    HmiSerial.flush();
     Serial.print("[HMI UART TX] ");
     serializeJson(doc, Serial);
     Serial.println();
@@ -223,16 +231,96 @@ void HmiUartBridge::sendSysInfo() {
     Serial.println(",\"process_bridge\":true}");
 }
 
+void HmiUartBridge::notifyRelayState(const uint8_t mac[6], int relay, bool on) {
+    if (!ready_ || !mac || relay < 0 || relay > 7) {
+        return;
+    }
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    StaticJsonDocument<96> doc;
+    doc["t"] = "relay";
+    doc["mac"] = macStr;
+    doc["relay"] = relay;
+    doc["on"] = on ? 1 : 0;
+    emitJson(doc);
+}
+
 void HmiUartBridge::sendSlavesList() {
-    StaticJsonDocument<kJsonCapacity> doc;
+    /* Snapshot primero (mutex corto): JSON + rule-lock fuera del lock ESP-NOW.
+     * Capacidad dedicada: Master+8 + varios Atlas+8 no caben fiable en kJsonCapacity=1536. */
+    static const size_t kSlavesJsonCapacity = 4096;
+    static const size_t kMaxSnap = 6;
+    struct SlaveSnap {
+        char mac[18];
+        char name[32];
+        bool online;
+        uint8_t numRelays;
+        bool relayOn[8];
+    };
+    SlaveSnap snaps[kMaxSnap];
+    size_t snapCount = 0;
+    bool mutexOk = false;
+
+    if (ctx_.masterManager) {
+        mutexOk = ctx_.masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
+            if (snapCount >= kMaxSnap) {
+                return;
+            }
+            SlaveSnap& s = snaps[snapCount];
+            memset(&s, 0, sizeof(s));
+            snprintf(s.mac, sizeof(s.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     slave.macAddress[0], slave.macAddress[1], slave.macAddress[2],
+                     slave.macAddress[3], slave.macAddress[4], slave.macAddress[5]);
+            strncpy(s.name, slave.deviceName.c_str(), sizeof(s.name) - 1);
+            /* Ping/pong (status ONLINE). lastSeen de 120 s marcaba Atlas apagados. */
+            s.online = slave.isOnline();
+            const int nr = slave.numRelays > 0 ? slave.numRelays : 8;
+            s.numRelays = static_cast<uint8_t>(nr > 8 ? 8 : nr);
+            for (uint8_t i = 0; i < s.numRelays; ++i) {
+                s.relayOn[i] = slave.relayStates[i].state;
+            }
+            ++snapCount;
+        });
+        if (!mutexOk) {
+            Serial.println("[HMI UART] slaves_req — mutex trustedSlaves timeout (lista incompleta)");
+        } else if (snapCount == 0) {
+            const int trusted = ctx_.masterManager->getTrustedSlaveCount();
+            if (trusted > 0) {
+                Serial.printf("[HMI UART] slaves_req — trusted=%d pero snapshot vacío\n", trusted);
+            }
+        }
+    } else {
+        Serial.println("[HMI UART] slaves_req SIN gestor — late-bind no aplicado");
+    }
+
+    bool localOn[8] = {};
+    if (ctx_.hydro) {
+        const bool* rs = ctx_.hydro->getRelayStates();
+        if (rs) {
+            for (int i = 0; i < 8; ++i) {
+                localOn[i] = rs[i];
+            }
+        }
+    }
+
+    /* BSS, no pila de loopTask: 4096 B en stack reventó el canary al armar t:slaves. */
+    static StaticJsonDocument<kSlavesJsonCapacity> doc;
+    doc.clear();
     doc["t"] = "slaves";
     JsonArray arr = doc.createNestedArray("slaves");
 
-    auto fillRelayLocks = [&](JsonObject o, const char* macStr, int numRelays, bool isLocal) {
+    auto fillRelays = [&](JsonObject o, const char* macStr, int numRelays, bool isLocal,
+                          const bool* onStates) {
         JsonArray relays = o.createNestedArray("relays");
         for (int i = 0; i < numRelays; ++i) {
             JsonObject r = relays.createNestedObject();
-            r["on"] = 0;
+            if (r.isNull()) {
+                Serial.printf("[HMI UART] slaves_req JSON overflow mid-relays mac=%s i=%d\n",
+                              macStr ? macStr : "?", i);
+                return;
+            }
+            r["on"] = (onStates && onStates[i]) ? 1 : 0;
             char reason[16] = {};
             char label[24] = {};
             const bool locked =
@@ -256,21 +344,29 @@ void HmiUartBridge::sendSlavesList() {
     local["local"] = true;
     local["online"] = true;
     local["numRelays"] = 8;
-    fillRelayLocks(local, "local", 8, true);
+    fillRelays(local, "local", 8, true, localOn);
 
-    if (ctx_.masterManager) {
-        ctx_.masterManager->forEachTrustedSlave([&](const TrustedSlave& slave) {
-            JsonObject o = arr.createNestedObject();
-            const String mac = ESPNowController::macToString(slave.macAddress);
-            o["mac"] = mac;
-            o["name"] = slave.deviceName;
-            o["local"] = false;
-            o["online"] = ctx_.masterManager->isSlaveReachable(slave);
-            const int nr = slave.numRelays > 0 ? slave.numRelays : 8;
-            o["numRelays"] = nr;
-            fillRelayLocks(o, mac.c_str(), nr, false);
-        });
+    for (size_t i = 0; i < snapCount; ++i) {
+        JsonObject o = arr.createNestedObject();
+        if (o.isNull()) {
+            Serial.printf("[HMI UART] slaves_req JSON overflow at Atlas[%u] mac=%s\n",
+                          static_cast<unsigned>(i), snaps[i].mac);
+            break;
+        }
+        o["mac"] = snaps[i].mac;
+        o["name"] = snaps[i].name;
+        o["local"] = false;
+        o["online"] = snaps[i].online;
+        o["numRelays"] = snaps[i].numRelays;
+        fillRelays(o, snaps[i].mac, snaps[i].numRelays, false, snaps[i].relayOn);
     }
+
+    if (doc.overflowed()) {
+        Serial.println("[HMI UART] slaves_req — JsonDocument overflowed");
+    }
+    const int trusted = ctx_.masterManager ? ctx_.masterManager->getTrustedSlaveCount() : -1;
+    Serial.printf("[HMI UART] slaves_req atlas=%u trusted=%d mutex=%d\n",
+                  static_cast<unsigned>(snapCount), trusted, mutexOk ? 1 : 0);
     emitJson(doc);
 }
 
@@ -395,6 +491,62 @@ void HmiUartBridge::publishTelemetryNow() {
     emitJson(doc);
 }
 
+void HmiUartBridge::publishPlantCfg() {
+    if (!ready_ || !ctx_.hydro) {
+        return;
+    }
+    HydroControl& hydro = *ctx_.hydro;
+    String nuts;
+    if (!hydro.buildNutrientsJsonForCloud(nuts)) {
+        nuts = "[]";
+    }
+    DynamicJsonDocument src(1536);
+    if (deserializeJson(src, nuts)) {
+        return;
+    }
+    DynamicJsonDocument doc(1536);
+    doc["t"] = "plant_cfg";
+    JsonArray pumps = doc.createNestedArray("pumps");
+    int n = 0;
+    bool seen[6] = {false, false, false, false, false, false};
+    for (JsonObject o : src.as<JsonArray>()) {
+        const int relay0 = o["relay"] | -1;
+        if (relay0 < 0 || relay0 >= 6) {
+            continue;
+        }
+        seen[relay0] = true;
+        JsonObject p = pumps.createNestedObject();
+        p["relay"] = relay0 + 1;
+        p["name"] = o["name"] | "";
+        p["mlPerLiter"] = o["mlPerLiter"] | 0.0f;
+        const float q = o["flowRate"] | 0.0f;
+        if (q > 0.01f) {
+            p["flowMlPerMin"] = q * 60.0f;
+        }
+        ++n;
+    }
+    const int up = hydro.getRelayPhUp();
+    const int down = hydro.getRelayPhDown();
+    if (up >= 0 && up < 6 && !seen[up] && hydro.getFlowRatePhUp() > 0.01f) {
+        JsonObject p = pumps.createNestedObject();
+        p["relay"] = up + 1;
+        p["name"] = "pH+";
+        p["mlPerLiter"] = 0.0f;
+        p["flowMlPerMin"] = hydro.getFlowRatePhUp() * 60.0f;
+        ++n;
+    }
+    if (down >= 0 && down < 6 && !seen[down] && hydro.getFlowRatePhDown() > 0.01f) {
+        JsonObject p = pumps.createNestedObject();
+        p["relay"] = down + 1;
+        p["name"] = "pH-";
+        p["mlPerLiter"] = 0.0f;
+        p["flowMlPerMin"] = hydro.getFlowRatePhDown() * 60.0f;
+        ++n;
+    }
+    emitJson(doc);
+    Serial.printf("[HMI PLANT] pumps=%d\n", n);
+}
+
 void HmiUartBridge::publishConfigHeartbeat() {
     StaticJsonDocument<kTelemetryJsonCapacity> doc;
     doc["t"] = "telemetry";
@@ -478,21 +630,20 @@ void HmiUartBridge::applyRecipeGain(HydroControl& hydro, float baseDose, float t
     }
 }
 
-void HmiUartBridge::applyDeadbandFromLimits(HydroControl& hydro, float lo, float hi, bool isEc) {
+bool HmiUartBridge::applyDeadbandFromLimits(HydroControl& hydro, float lo, float hi, bool isEc) {
     if (!(hi > lo)) {
         Serial.printf("[HMI UART] deadband inválida %s lo=%.2f hi=%.2f\n",
                       isEc ? "EC" : "pH", lo, hi);
-        return;
+        return false;
     }
     if (isEc) {
         const float tol = max(1.0f, (hi - lo) / 2.0f);
-        hydro.setECTolerance(tol, true);
-        Serial.printf("[HMI UART] EC deadband=%.1f µS (lo=%.0f hi=%.0f)\n", tol, lo, hi);
+        hydro.setECTolerance(tol, false);
     } else {
         const float tol = max(0.01f, (hi - lo) / 2.0f);
         hydro.setPHTolerance(tol);
-        Serial.printf("[HMI UART] pH deadband=%.2f (lo=%.2f hi=%.2f)\n", tol, lo, hi);
     }
+    return true;
 }
 
 bool HmiUartBridge::handleDose(JsonDocument& doc, const char* action) {
@@ -547,6 +698,8 @@ bool HmiUartBridge::handleNutrientProportions(JsonDocument& doc) {
         baseDose = doc["recipeEcUs"] | 0.0f;
     }
     applyRecipeGain(*ctx_.hydro, baseDose, totalMl);
+    syncPumpFlowToCloud(1);
+    publishPlantCfg();
     return true;
 }
 
@@ -555,12 +708,13 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
         return false;
     }
     HydroControl& hydro = *ctx_.hydro;
+    bool ecPersist = false;
 
     if (doc.containsKey("volumeL")) {
         const float vol = doc["volumeL"];
         if (vol > 0.0f) {
             hydro.getECController().setVolume(vol);
-            hydro.saveECControllerConfig();
+            ecPersist = true;
         }
     }
     if (doc.containsKey("homoSec")) {
@@ -570,13 +724,15 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
         hydro.setEcPulseDosing(doc["pulseMl"] | 2.0f, doc["pulseGapSec"] | 2.0f);
     }
     if (doc.containsKey("autoEcIntervalSec")) {
-        hydro.setAutoECInterval((int)(doc["autoEcIntervalSec"] | 30), true);
+        hydro.setAutoECInterval((int)(doc["autoEcIntervalSec"] | 30), false);
+        ecPersist = true;
     }
     if (doc.containsKey("autoPhIntervalSec")) {
         hydro.setAutoPHInterval((int)(doc["autoPhIntervalSec"] | 300), true);
     }
     if (doc.containsKey("autoEc")) {
-        hydro.setAutoECEnabled(doc["autoEc"] | false, true);
+        hydro.setAutoECEnabled(doc["autoEc"] | false, false);
+        ecPersist = true;
     }
     if (doc.containsKey("autoPh")) {
         hydro.setAutoPHEnabled(doc["autoPh"] | false, true);
@@ -593,26 +749,107 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
     if (doc.containsKey("consumoPh24h")) {
         hydro.setConsumoPh24hEnabled(doc["consumoPh24h"] | false);
     }
+    bool ecBandOk = false;
+    bool phBandOk = false;
     if (doc.containsKey("ecLo") && doc.containsKey("ecHi")) {
-        applyDeadbandFromLimits(hydro, doc["ecLo"], doc["ecHi"], true);
+        ecBandOk = applyDeadbandFromLimits(hydro, doc["ecLo"], doc["ecHi"], true);
+        if (ecBandOk) {
+            ecPersist = true;
+        }
     }
     if (doc.containsKey("phLo") && doc.containsKey("phHi")) {
-        applyDeadbandFromLimits(hydro, doc["phLo"], doc["phHi"], false);
+        phBandOk = applyDeadbandFromLimits(hydro, doc["phLo"], doc["phHi"], false);
+    }
+    if (ecPersist) {
+        hydro.saveECControllerConfig();
     }
     if (doc.containsKey("phUpRelay") || doc.containsKey("phDownRelay")) {
-        int up = doc["phUpRelay"] | 0;
-        int down = doc["phDownRelay"] | 0;
-        if (up > 0) up -= 1;
-        if (down > 0) down -= 1;
-        hydro.setPhPumpConfig(up, down, 1.0f, 1.0f, 1.0f, 1.0f);
+        const int prevUp = hydro.getRelayPhUp();
+        const int prevDown = hydro.getRelayPhDown();
+        auto fromHmi = [](int raw) { return (raw > 0 && raw <= 8) ? (raw - 1) : -1; };
+        int up = prevUp;
+        int down = prevDown;
+        if (doc.containsKey("phUpRelay")) {
+            up = fromHmi(doc["phUpRelay"] | 0);
+        }
+        if (doc.containsKey("phDownRelay")) {
+            down = fromHmi(doc["phDownRelay"] | 0);
+        }
+        if (up >= 0 && up == down) {
+            Serial.println("[HMI LOOP] pH relays iguales — sin cambio");
+        } else {
+            hydro.setPhPumpRelays(up, down);
+            int release0 = -1;
+            int release1 = -1;
+            auto noteRelease = [&](int prev) {
+                if (prev < 0 || prev > 7 || prev == up || prev == down) {
+                    return;
+                }
+                if (release0 < 0) {
+                    release0 = prev;
+                } else if (prev != release0) {
+                    release1 = prev;
+                }
+            };
+            noteRelease(prevUp);
+            noteRelease(prevDown);
+            if (ctx_.mqtt) {
+                ctx_.mqtt->publishPhFlow(
+                    hydro.getFlowRatePhUp(), hydro.getFlowRatePhDown(), up, down, release0, release1);
+            }
+        }
     }
-    if (doc.containsKey("nutrientGapSec")) {
-        Serial.printf("[HMI UART] nutrientGapSec=%d (NVS via MQTT config)\n",
-                      (int)(doc["nutrientGapSec"] | 3));
+
+    char ignored[80];
+    size_t ignoredLen = 0;
+    ignored[0] = '\0';
+    auto appendIgnored = [&](const char* token) {
+        if (ignoredLen >= sizeof(ignored)) {
+            return;
+        }
+        const int wrote = snprintf(ignored + ignoredLen, sizeof(ignored) - ignoredLen, "%s", token);
+        if (wrote > 0) {
+            ignoredLen += static_cast<size_t>(wrote);
+        }
+    };
+    if (doc.containsKey("dosingArmed")) {
+        appendIgnored(" armed=ignorado");
     }
     if (doc.containsKey("dosingDelaySec") || doc.containsKey("dosingMode")) {
-        Serial.println("[HMI UART] dosingDelay/mode recibido — sin handler v1");
+        appendIgnored(" delay/mode=ignorado");
     }
+    if (doc.containsKey("nutrientGapSec")) {
+        appendIgnored(" nutGap=no-uart");
+    }
+
+    char ecBand[24];
+    char phBand[24];
+    if (ecBandOk) {
+        snprintf(ecBand, sizeof(ecBand), "%.0f-%.0f", (float)doc["ecLo"], (float)doc["ecHi"]);
+    } else {
+        snprintf(ecBand, sizeof(ecBand), "-");
+    }
+    if (phBandOk) {
+        snprintf(phBand, sizeof(phBand), "%.2f-%.2f", (float)doc["phLo"], (float)doc["phHi"]);
+    } else {
+        snprintf(phBand, sizeof(phBand), "-");
+    }
+
+    Serial.printf(
+        "[HMI LOOP] autoEc=%d iv=%d autoPh=%d iv=%d vol=%.0f pulse=%.1f/%.1fs "
+        "maxStepEc=%.2f maxStepPh=%.2f ecBand=%s phBand=%s%s\n",
+        hydro.isAutoECEnabled() ? 1 : 0,
+        hydro.getAutoECInterval(),
+        hydro.isAutoPHEnabled() ? 1 : 0,
+        hydro.getAutoPHInterval(),
+        hydro.getECController().getVolume(),
+        hydro.getEcPulseMl(),
+        hydro.getEcPulseGapSec(),
+        hydro.getMaxStepEcFraction(),
+        hydro.getPhAggressiveness(),
+        ecBand,
+        phBand,
+        ignored);
     return true;
 }
 
@@ -658,6 +895,12 @@ bool HmiUartBridge::handleRelaySlave(JsonDocument& doc) {
     const int relay = doc["relay"] | -1;
     const char* state = doc["state"] | "off";
     const int duration = doc["duration"] | 0;
+    const int cycleOff = doc["cycleOff"] | 0;
+    const char* mode = doc["mode"] | "";
+    if (mode[0] == '\0' &&
+        (strcmp(state, "cycle") == 0 || strcmp(state, "cycle_stop") == 0)) {
+        mode = state;
+    }
     if (relay < 0 || relay >= 8) {
         return false;
     }
@@ -669,7 +912,14 @@ bool HmiUartBridge::handleRelaySlave(JsonDocument& doc) {
         return false;
     }
     const uint32_t cmdId = ctx_.coordinator->actuateSlave(
-        RelayOwner::Manual, mac, relay, state, duration, 0, 0, "");
+        RelayOwner::Manual, mac, relay, state, duration, 0, cycleOff, mode);
+    if (cmdId != 0 && ctx_.masterManager) {
+        if (strcmp(mode, "cycle") == 0 && duration > 0 && cycleOff > 0) {
+            ctx_.masterManager->rememberSlaveCycle(mac, relay, duration, cycleOff);
+        } else if (strcmp(mode, "cycle_stop") == 0) {
+            ctx_.masterManager->forgetSlaveCycle(mac, relay);
+        }
+    }
     return cmdId != 0;
 }
 
@@ -704,28 +954,64 @@ bool HmiUartBridge::handlePumpFlowCalib(JsonDocument& doc) {
         return false;
     }
     syncPumpFlowToCloud(target);
+    publishPlantCfg();
     return true;
 }
 
+static String activeRecipeJson(HydroControl& hydro) {
+    String raw;
+    if (!hydro.buildNutrientsJsonForCloud(raw)) {
+        return "[]";
+    }
+    DynamicJsonDocument src(1536);
+    if (deserializeJson(src, raw) || !src.is<JsonArray>()) {
+        return "[]";
+    }
+    DynamicJsonDocument out(1536);
+    JsonArray arr = out.to<JsonArray>();
+    for (JsonObject o : src.as<JsonArray>()) {
+        const char* name = o["name"] | "";
+        if (!name[0] || strncmp(name, "pump_r", 6) == 0) {
+            continue;
+        }
+        if (!(o["active"] | false)) {
+            continue;
+        }
+        const float ml = o["mlPerLiter"] | 0.0f;
+        if (ml <= 0.05f) {
+            continue;
+        }
+        JsonObject p = arr.createNestedObject();
+        p["name"] = name;
+        p["relay"] = o["relay"] | 0;
+        p["mlPerLiter"] = ml;
+        const float q = o["flowRate"] | 0.0f;
+        if (q > 0.01f) {
+            p["flowRate"] = q;
+        }
+    }
+    String result;
+    serializeJson(arr, result);
+    if (result.length() == 0) {
+        return "[]";
+    }
+    return result;
+}
+
 void HmiUartBridge::syncPumpFlowToCloud(int target) {
-    if (!ctx_.supabase || !ctx_.deviceIdFn || WiFi.status() != WL_CONNECTED) {
-        Serial.println("[HMI UART] cloud sync skip (WiFi/Supabase)");
+    if (!ctx_.mqtt || !ctx_.hydro) {
+        Serial.println("[MQTT] ph_flow publish failed");
         return;
     }
-    if (!ctx_.supabase->isReady()) {
-        Serial.println("[HMI UART] cloud sync skip (Supabase not ready)");
-        return;
+    if (target != 2) {
+        const String nutrientsJson = activeRecipeJson(*ctx_.hydro);
+        ctx_.mqtt->publishEcNutrients(nutrientsJson.c_str());
     }
-    const String deviceId = ctx_.deviceIdFn();
-    if (target == 2) {
-        ctx_.supabase->patchPhConfigFlowRates(
-            deviceId, ctx_.hydro->getFlowRatePhUp(), ctx_.hydro->getFlowRatePhDown());
-        return;
-    }
-    String nutrientsJson;
-    if (ctx_.hydro->buildNutrientsJsonForCloud(nutrientsJson)) {
-        ctx_.supabase->patchEcConfigNutrients(deviceId, nutrientsJson);
-    }
+    ctx_.mqtt->publishPhFlow(
+        ctx_.hydro->getFlowRatePhUp(),
+        ctx_.hydro->getFlowRatePhDown(),
+        ctx_.hydro->getRelayPhUp(),
+        ctx_.hydro->getRelayPhDown());
 }
 
 bool HmiUartBridge::handleWifiConfig(JsonDocument& doc) {
@@ -799,8 +1085,8 @@ void HmiUartBridge::scheduleRestart(unsigned long delayMs) {
 }
 
 bool HmiUartBridge::handleMasterReboot() {
-    Serial.println("[HMI UART] master_reboot — reinicio en ~400ms");
-    scheduleRestart(400);
+    Serial.println("[HMI UART] master_reboot — reinicio en ~600ms");
+    scheduleRestart(600);
     return true;
 }
 
@@ -860,9 +1146,14 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
         handleWifiConfig(doc);
         return true;
     } else if (strcmp(action, "master_reboot") == 0) {
-        ok = handleMasterReboot();
-        sendCmdAck(action, ok);
-        return true;
+        /* Reboot inmediato tras ACK: schedule diferido fallaba si loop() tardaba
+         * o si HMI reiniciaba antes de que Master volviera a llamar loop(). */
+        Serial.println("[HMI UART] master_reboot — ACK + ESP.restart() ahora");
+        sendCmdAck(action, true);
+        HmiSerial.flush();
+        delay(30);
+        ESP.restart();
+        return true;  // unreachable
     } else if (strcmp(action, "factory_reset") == 0) {
         ok = handleFactoryReset();
         sendCmdAck(action, ok);
@@ -888,11 +1179,7 @@ void HmiUartBridge::loop() {
     if (!ready_) {
         return;
     }
-    if (pendingRestart_ && static_cast<long>(millis() - pendingRestartAtMs_) >= 0) {
-        pendingRestart_ = false;
-        Serial.println("[HMI UART] ESP.restart()");
-        ESP.restart();
-    }
+    /* Primero RX/comandos (pueden programar reboot); luego ejecutar pending. */
     while (HmiSerial.available() > 0) {
         const char c = static_cast<char>(HmiSerial.read());
 #if UART_LINK_DEBUG
@@ -901,13 +1188,19 @@ void HmiUartBridge::loop() {
         if (c == '\n' || c == '\r') {
             if (lineLen_ > 0) {
                 lineBuf_[lineLen_] = '\0';
-                StaticJsonDocument<kJsonCapacity> doc;
+                /* Mismo hilo que sendSlavesList: el doc de parse no puede sumarse en la pila. */
+                static StaticJsonDocument<kJsonCapacity> doc;
+                doc.clear();
                 const DeserializationError err = deserializeJson(doc, lineBuf_);
                 if (!err) {
 #if UART_LINK_DEBUG
                     hmiRxLineCount++;
 #endif
                     handleCommand(doc);
+                    if (!plantCfgPushed_ && ctx_.hydro) {
+                        plantCfgPushed_ = true;
+                        publishPlantCfg();
+                    }
                 } else if (err == DeserializationError::NoMemory) {
                     Serial.printf("[HMI UART] BUFFER LLENO (cap=%u, linea=%u B) — mensaje descartado\n",
                                   static_cast<unsigned>(kJsonCapacity),
@@ -930,6 +1223,12 @@ void HmiUartBridge::loop() {
                           static_cast<unsigned>(sizeof(lineBuf_) - 1));
             lineLen_ = 0;
         }
+    }
+
+    if (pendingRestart_ && static_cast<long>(millis() - pendingRestartAtMs_) >= 0) {
+        pendingRestart_ = false;
+        Serial.println("[HMI UART] ESP.restart()");
+        ESP.restart();
     }
 
 #if UART_LINK_DEBUG

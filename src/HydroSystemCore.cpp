@@ -393,6 +393,10 @@ void HydroSystemCore::setMasterManager(MasterSlaveManager* masterMgr) {
     } else {
         Serial.println("✅ DecisionEngine: MasterSlaveManager late-bind atualizado");
     }
+#if ENABLE_HMI_UART
+    hmiUartBridge.bindMasterManager(masterMgr);
+    Serial.println("[HMI UART] UART bridge MSM late-bind");
+#endif
 }
 
 HydroSystemCore::~HydroSystemCore() {
@@ -579,6 +583,7 @@ bool HydroSystemCore::begin() {
         hmiCtx.masterManager = masterManager;
         hmiCtx.supabase = &supabase;
         hmiCtx.decisionEngine = &decisionEngine;
+        hmiCtx.mqtt = &mqttClient;
         hmiCtx.cloudOkFn = &HydroSystemCore::hmiCloudOkStatic;
         hmiCtx.deviceIdFn = &HydroSystemCore::hmiDeviceIdStatic;
         hmiUartBridge.attach(hmiCtx);
@@ -1083,38 +1088,8 @@ void HydroSystemCore::loop() {
         lastRulesCheck = now;
     }
     
-    // Auto EC/pH config: só MQTT retained (sem GET HTTPS). Malha usa RAM/NVS.
-    static unsigned long lastConfigDebugPrint = 0;
-    if (now - lastConfigDebugPrint >= 10000) {
-        Serial.printf(
-            "🔍 [EC CONFIG DEBUG] auto_enabled: %s | mqttCfg: %s | intervalo: %d s\n",
-            hydroControl.isAutoECEnabled() ? "SIM" : "NÃO",
-#if ENABLE_MQTT
-            mqttEcConfigReceived ? "SIM" : "NÃO",
-#else
-            "n/a",
-#endif
-            hydroControl.getAutoECInterval());
-        Serial.printf(
-            "🔍 [PH CONFIG DEBUG] auto_enabled: %s | mqttCfg: %s | intervalo: %d s\n",
-            hydroControl.isAutoPHEnabled() ? "SIM" : "NÃO",
-#if ENABLE_MQTT
-            mqttPhConfigReceived ? "SIM" : "NÃO",
-#else
-            "n/a",
-#endif
-            hydroControl.getAutoPHInterval());
-#if ENABLE_MQTT
-        if (!mqttEcConfigReceived) {
-            Serial.println("   ⚠️ EC config MQTT ainda não chegou — RAM=NVS até retained");
-        }
-        if (!mqttPhConfigReceived) {
-            Serial.println("   ⚠️ pH config MQTT ainda não chegou — RAM=NVS até retained");
-        }
-#endif
-        lastConfigDebugPrint = now;
-    }
-    
+    // Auto EC/pH, MQTT y validez van en printPeriodicStatus (30s).
+
     // ✅ TÓPICO 4: PROCESAR COMANDOS DE QUEUE (Core 0 - como MASTER-TASK)
     processWebCommands();
     
@@ -3021,10 +2996,30 @@ bool HydroSystemCore::hasEnoughMemoryForHTTPS() {
 }
 
 void HydroSystemCore::printPeriodicStatus() {
-    Serial.printf("🔄 Sistema ativo há %ds | Heap: %d bytes | Supabase: %s | MASTER MODE\n", 
-                  (int)(getUptime()/1000), 
-                  ESP.getFreeHeap(),
-                  supabaseConnected ? "✅" : "❌");
+#if ENABLE_MQTT
+    const char* mqttEc = mqttEcConfigReceived ? "1" : "0";
+    const char* mqttPh = mqttPhConfigReceived ? "1" : "0";
+#else
+    const char* mqttEc = "n/a";
+    const char* mqttPh = "n/a";
+#endif
+    Serial.printf(
+        "STATUS up=%ds heap=%d supa=%s | autoEc=%d iv=%d mqttEc=%s | autoPh=%d iv=%d mqttPh=%s | "
+        "EC=%.0f ecValid=%d pH=%.2f phValid=%d PCF=%s\n",
+        (int)(getUptime() / 1000),
+        ESP.getFreeHeap(),
+        supabaseConnected ? "1" : "0",
+        hydroControl.isAutoECEnabled() ? 1 : 0,
+        hydroControl.getAutoECInterval(),
+        mqttEc,
+        hydroControl.isAutoPHEnabled() ? 1 : 0,
+        hydroControl.getAutoPHInterval(),
+        mqttPh,
+        hydroControl.getEC(),
+        hydroControl.isEcValidForTelemetry() ? 1 : 0,
+        hydroControl.getpH(),
+        hydroControl.isPhValidForTelemetry() ? 1 : 0,
+        hydroControl.isLevelPcfOnline() ? "on" : "off");
 }
 
 // ============================================
@@ -4407,8 +4402,12 @@ bool HydroSystemCore::parseMqttPhConfigJson(const char* json, size_t len, PHConf
     config.ml_per_ph_unit = o["ml_per_ph_unit"] | 2.0;
     config.ml_per_ph_unit_acid = o["ml_per_ph_unit_acid"] | config.ml_per_ph_unit;
     config.ml_per_ph_unit_base = o["ml_per_ph_unit_base"] | config.ml_per_ph_unit;
-    config.relay_ph_up = o["relay_ph_up"] | 1;
-    config.relay_ph_down = o["relay_ph_down"] | 0;
+    config.relay_ph_up = (!o.containsKey("relay_ph_up") || o["relay_ph_up"].isNull())
+                             ? -1
+                             : (o["relay_ph_up"] | -1);
+    config.relay_ph_down = (!o.containsKey("relay_ph_down") || o["relay_ph_down"].isNull())
+                               ? -1
+                               : (o["relay_ph_down"] | -1);
     config.auto_enabled = o["auto_enabled"] | false;
     config.intervalo_auto_ph = o["intervalo_auto_ph"] | 300;
     config.tempo_recirculacao = o["tempo_recirculacao"] | 60;
@@ -4432,8 +4431,14 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
         Serial.printf("ℹ️ [EC CONFIG] inalterada via=%s — NVS não reescrito\n", via ? via : "?");
         return true;
     }
-    Serial.printf("[EC CONFIG] apply via=%s auto=%s sp=%.0f\n",
-                  via ? via : "?", config.auto_enabled ? "SIM" : "NAO", config.ec_setpoint);
+    Serial.printf("[EC CONFIG] apply via=%s auto=%s sp=%.0f iv=%d pulse=%.1f/%.1fs maxStep=%.2f\n",
+                  via ? via : "?",
+                  config.auto_enabled ? "SIM" : "NAO",
+                  config.ec_setpoint,
+                  config.intervalo_auto_ec,
+                  (float)config.pulse_ml,
+                  (float)config.pulse_gap_sec,
+                  (float)config.aggressiveness);
     hydroControl.getECController().setBaseDose(config.base_dose);
     hydroControl.getECController().setVolume(config.volume);
     hydroControl.getECController().setTotalMl(config.total_ml);
@@ -4536,6 +4541,11 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
         syncEcOperationStateToSupabase();
     }
     Serial.println("✅ [EC CONFIG] NVS atualizado");
+#if ENABLE_HMI_UART
+    if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
+        bridge->publishPlantCfg();
+    }
+#endif
     return true;
 }
 
@@ -4563,6 +4573,11 @@ bool HydroSystemCore::applyPHConfig(const PHConfig& config, const char* via) {
     hydroControl.setPhRecirculacaoSeconds(config.tempo_recirculacao);
     hydroControl.setPhPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
     hydroControl.setConsumoPh24hEnabled(config.consumo_24h);
+#if ENABLE_HMI_UART
+    if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
+        bridge->publishPlantCfg();
+    }
+#endif
     return true;
 }
 

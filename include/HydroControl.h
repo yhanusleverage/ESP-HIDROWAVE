@@ -331,6 +331,7 @@ public:
     void setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
                          float mlPerUnitAcid, float mlPerUnitBase);
     void setPhAdaptiveConfig(float aggressiveness, float gainAlpha);
+    float getPhAggressiveness() const { return phAggressiveness; }
     void resetPhLearnedGains();
     void setPhDoseCallback(PhDoseCallback cb, void* userData);
     void setPhGainLearnedCallback(PhGainLearnedCallback cb, void* userData);
@@ -382,6 +383,11 @@ public:
     int getRelayPhDown() const { return relayPhDown; }
     float getFlowRatePhUp() const { return flowRatePhUp; }
     float getFlowRatePhDown() const { return flowRatePhDown; }
+    /** Solo el rol. -1 = sin bomba. No toca el caudal calibrado. */
+    void setPhPumpRelays(int relayUp, int relayDown) {
+        relayPhUp = relayUp;
+        relayPhDown = relayDown;
+    }
 
 private:
     // Hardware

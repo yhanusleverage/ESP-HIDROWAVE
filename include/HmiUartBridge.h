@@ -12,6 +12,7 @@ class RelayCoordinator;
 class MasterSlaveManager;
 class SupabaseClient;
 class DecisionEngine;
+class MqttClientWrapper;
 
 class HmiUartBridge {
 public:
@@ -21,11 +22,14 @@ public:
         MasterSlaveManager* masterManager = nullptr;
         SupabaseClient* supabase = nullptr;
         DecisionEngine* decisionEngine = nullptr;
+        MqttClientWrapper* mqtt = nullptr;
         bool (*cloudOkFn)() = nullptr;
         String (*deviceIdFn)() = nullptr;
     };
 
     void attach(const Context& ctx);
+    /** Solo el puntero MSM. No reabre UART ni pisa hydro/coordinator. */
+    void bindMasterManager(MasterSlaveManager* masterManager);
     void begin();
     void end();
     void loop();
@@ -35,6 +39,10 @@ public:
     void dumpLastTelemetry(Stream& out) const;
     bool isReady() const { return ready_; }
     static HmiUartBridge* activeInstance();
+    /** ml/L y ml/min de cada bomba, los mismos que sube a la web. */
+    void publishPlantCfg();
+    /** Un bit confirmado por RELAY-ACK. No reconstruye t:slaves. */
+    void notifyRelayState(const uint8_t mac[6], int relay, bool on);
 
 private:
     static const size_t kJsonCapacity = 1536;
@@ -45,6 +53,7 @@ private:
 
     Context ctx_;
     bool ready_ = false;
+    bool plantCfgPushed_ = false;
     unsigned long lastTelemetryMs_ = 0;
     uint32_t commandId_ = 0;
     char lineBuf_[1536];
@@ -84,7 +93,7 @@ private:
     static int parseRelayChannel(const char* channel);
     static bool parseMacString(const char* macStr, uint8_t macOut[6]);
     static void applyRecipeGain(HydroControl& hydro, float baseDose, float totalMl);
-    static void applyDeadbandFromLimits(HydroControl& hydro, float lo, float hi, bool isEc);
+    static bool applyDeadbandFromLimits(HydroControl& hydro, float lo, float hi, bool isEc);
 };
 
 #endif // ENABLE_HMI_UART

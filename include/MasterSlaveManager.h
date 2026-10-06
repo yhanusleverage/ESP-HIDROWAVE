@@ -345,6 +345,11 @@ public:
                                      int duration = 0, int supabaseCommandId = 0, bool updateStatus = true,
                                      int cycleOffDuration = 0, const String& commandMode = "");
 
+    /** Ciclo ON/OFF del esclavo. Sobrevive sin HMI y se reenvía al volver ONLINE. */
+    void rememberSlaveCycle(const uint8_t* macAddress, int relayNumber, int onSec, int offSec);
+    void forgetSlaveCycle(const uint8_t* macAddress, int relayNumber);
+    void rearmSlaveCycles(const uint8_t* macAddress);
+
     /** Un paquete SET_RELAY_MASK (bit i = relé i). mask 0xFF = on_all, 0x00 = off_all. */
     uint32_t sendRelayMaskToSlave(const uint8_t* macAddress, uint8_t mask,
                                   int durationSec = 0, int supabaseCommandId = 0);

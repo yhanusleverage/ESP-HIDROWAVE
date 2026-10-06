@@ -4214,8 +4214,12 @@ bool SupabaseClient::getPHConfigFromSupabase(PHConfig& config) {
     config.ml_per_ph_unit = o["ml_per_ph_unit"] | 2.0;
     config.ml_per_ph_unit_acid = o["ml_per_ph_unit_acid"] | config.ml_per_ph_unit;
     config.ml_per_ph_unit_base = o["ml_per_ph_unit_base"] | config.ml_per_ph_unit;
-    config.relay_ph_up = o["relay_ph_up"] | 1;
-    config.relay_ph_down = o["relay_ph_down"] | 0;
+    config.relay_ph_up = (!o.containsKey("relay_ph_up") || o["relay_ph_up"].isNull())
+                             ? -1
+                             : (o["relay_ph_up"] | -1);
+    config.relay_ph_down = (!o.containsKey("relay_ph_down") || o["relay_ph_down"].isNull())
+                               ? -1
+                               : (o["relay_ph_down"] | -1);
     config.auto_enabled = o["auto_enabled"] | false;
     config.intervalo_auto_ph = o["intervalo_auto_ph"] | 300;
     config.tempo_recirculacao = o["tempo_recirculacao"] | 60;

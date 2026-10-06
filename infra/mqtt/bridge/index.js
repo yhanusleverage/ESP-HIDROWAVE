@@ -12,7 +12,9 @@
  *   hidrowave/+/ec_metric       → INSERT ec_controller_metrics
  *   hidrowave/+/ph_metric       → INSERT ph_controller_metrics
  *   hidrowave/+/ec_gain         → PATCH ec_config_view.k_value (K aprendido firmware)
+ *   hidrowave/+/ec_nutrients    → PATCH ec_config_view.nutrients (receta HMI)
  *   hidrowave/+/ph_gain         → PATCH ph_config_view k_acid/k_base
+ *   hidrowave/+/ph_flow         → PATCH ph_config_view caudales y relés pH
  *   hidrowave/+/command_ack     → RPC complete_relay_command
  *   hidrowave/+/rule_executed   → INSERT relay_commands (DE local espejo)
  *   hidrowave/+/procedure_finished → INSERT procedure_events (Complete/Aborted)
@@ -40,7 +42,9 @@ const TOPICS = [
   'hidrowave/+/ec_metric',
   'hidrowave/+/ph_metric',
   'hidrowave/+/ec_gain',
+  'hidrowave/+/ec_nutrients',
   'hidrowave/+/ph_gain',
+  'hidrowave/+/ph_flow',
   'hidrowave/+/ec_dilution',
   'hidrowave/+/command_ack',
   'hidrowave/+/rule_executed',
@@ -1670,6 +1674,83 @@ async function handlePhMetric(topic, message) {
   await insertPhMetric(validated.row);
 }
 
+function validateEcNutrients(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+  if (!Array.isArray(payload.nutrients)) {
+    return { ok: false, reason: 'nutrients must be an array' };
+  }
+  if (payload.nutrients.length > 16) {
+    return { ok: false, reason: 'nutrients length > 16' };
+  }
+  const nutrients = [];
+  for (const item of payload.nutrients) {
+    if (!item || typeof item.name !== 'string' || item.name.length === 0 || item.name.length > 32) {
+      return { ok: false, reason: 'nutrient name invalid' };
+    }
+    if (item.name.startsWith('pump_r')) {
+      continue;
+    }
+    const relay = Number(item.relay);
+    if (!Number.isInteger(relay) || relay < 0 || relay > 7) {
+      return { ok: false, reason: 'relay must be integer 0..7' };
+    }
+    const mlPerLiter = Number(item.mlPerLiter);
+    if (!Number.isFinite(mlPerLiter) || mlPerLiter < 0) {
+      return { ok: false, reason: 'mlPerLiter must be finite number >= 0' };
+    }
+    const row = { name: item.name, relay, mlPerLiter };
+    if (item.flowRate !== undefined && item.flowRate !== null) {
+      const flowRate = Number(item.flowRate);
+      if (!Number.isFinite(flowRate) || flowRate <= 0) {
+        return { ok: false, reason: 'flowRate must be finite number > 0' };
+      }
+      row.flowRate = flowRate;
+    }
+    nutrients.push(row);
+  }
+  return { ok: true, row: { deviceId, nutrients } };
+}
+
+async function patchEcConfigNutrients(row) {
+  const nowIso = new Date().toISOString();
+  const { error } = await supabase
+    .from('ec_config_view')
+    .update({ nutrients: row.nutrients, updated_at: nowIso })
+    .eq('device_id', row.deviceId);
+
+  if (error) {
+    console.error(`[bridge] ec_nutrients PATCH failed (${row.deviceId}):`, error.message);
+    return false;
+  }
+  console.log(`[bridge] ec_nutrients PATCH ec_config_view ${row.deviceId} n=${row.nutrients.length}`);
+  return true;
+}
+
+async function handleEcNutrients(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'ec_nutrients');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateEcNutrients(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await patchEcConfigNutrients(validated.row);
+}
+
 async function handleEcGain(topic, message) {
   const deviceId = parseDeviceIdFromTopic(topic, 'ec_gain');
   if (!deviceId) return;
@@ -1787,6 +1868,143 @@ async function patchPhConfigGain(row) {
     `[bridge] ph_gain PATCH ph_config_view ${row.deviceId} k_acid=${row.k_acid} k_base=${row.k_base}`
   );
   return true;
+}
+
+function phRelayOrNull(value) {
+  if (value === null || value === undefined) return { ok: true, relay: null };
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > 7) return { ok: false, relay: null };
+  return { ok: true, relay: n };
+}
+
+function validatePhFlow(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const flowUp = Number(payload.flow_rate_ph_up);
+  const flowDown = Number(payload.flow_rate_ph_down);
+  const relayUpParsed = phRelayOrNull(payload.relay_ph_up);
+  const relayDownParsed = phRelayOrNull(payload.relay_ph_down);
+  const relayUp = relayUpParsed.relay;
+  const relayDown = relayDownParsed.relay;
+  if (!Number.isFinite(flowUp) || flowUp <= 0) {
+    return { ok: false, reason: 'flow_rate_ph_up must be finite number > 0' };
+  }
+  if (!Number.isFinite(flowDown) || flowDown <= 0) {
+    return { ok: false, reason: 'flow_rate_ph_down must be finite number > 0' };
+  }
+  if (!relayUpParsed.ok) {
+    return { ok: false, reason: 'relay_ph_up must be integer 0..7 or null' };
+  }
+  if (!relayDownParsed.ok) {
+    return { ok: false, reason: 'relay_ph_down must be integer 0..7 or null' };
+  }
+  if (relayUp != null && relayUp === relayDown) {
+    return { ok: false, reason: 'relay_ph_up and relay_ph_down must differ' };
+  }
+
+  const release = [];
+  if (payload.release != null) {
+    if (!Array.isArray(payload.release) || payload.release.length > 8) {
+      return { ok: false, reason: 'release must be an array of at most 8 relays' };
+    }
+    for (const item of payload.release) {
+      const n = Number(item);
+      if (!Number.isInteger(n) || n < 0 || n > 7) {
+        return { ok: false, reason: 'release relay must be integer 0..7' };
+      }
+      if (!release.includes(n)) release.push(n);
+    }
+  }
+
+  return {
+    ok: true,
+    row: {
+      deviceId,
+      flow_rate_ph_up: flowUp,
+      flow_rate_ph_down: flowDown,
+      relay_ph_up: relayUp,
+      relay_ph_down: relayDown,
+      release,
+    },
+  };
+}
+
+async function patchPhConfigFlow(row) {
+  const nowIso = new Date().toISOString();
+  const { error } = await supabase
+    .from('ph_config_view')
+    .update({
+      flow_rate_ph_up: row.flow_rate_ph_up,
+      flow_rate_ph_down: row.flow_rate_ph_down,
+      relay_ph_up: row.relay_ph_up,
+      relay_ph_down: row.relay_ph_down,
+      updated_at: nowIso,
+    })
+    .eq('device_id', row.deviceId);
+
+  if (error) {
+    console.error(`[bridge] ph_flow PATCH failed (${row.deviceId}):`, error.message);
+    return false;
+  }
+  console.log(
+    `[bridge] ph_flow PATCH ph_config_view ${row.deviceId} up=${row.flow_rate_ph_up} down=${row.flow_rate_ph_down} R${row.relay_ph_up}/R${row.relay_ph_down}`
+  );
+
+  const { data: namesRow, error: namesReadError } = await supabase
+    .from('relay_master')
+    .select('doser_relay_names')
+    .eq('device_id', row.deviceId)
+    .maybeSingle();
+  if (namesReadError) {
+    console.error(`[bridge] ph_flow names read failed (${row.deviceId}):`, namesReadError.message);
+    return true;
+  }
+  const doser = Array.isArray(namesRow?.doser_relay_names)
+    ? [...namesRow.doser_relay_names]
+    : Array(8).fill('');
+  while (doser.length < 8) doser.push('');
+  for (const relay of row.release || []) {
+    if (relay >= 0 && relay <= 7) doser[relay] = '';
+  }
+  if (row.relay_ph_up != null) doser[row.relay_ph_up] = 'pH+';
+  if (row.relay_ph_down != null) doser[row.relay_ph_down] = 'pH-';
+  const { error: namesWriteError } = await supabase
+    .from('relay_master')
+    .update({ doser_relay_names: doser.slice(0, 8), updated_at: nowIso })
+    .eq('device_id', row.deviceId);
+  if (namesWriteError) {
+    console.error(`[bridge] ph_flow names PATCH failed (${row.deviceId}):`, namesWriteError.message);
+    return true;
+  }
+  console.log(
+    `[bridge] ph_flow names ${row.deviceId} release=${(row.release || []).join(',') || '-'} up=${row.relay_ph_up} down=${row.relay_ph_down}`
+  );
+  return true;
+}
+
+async function handlePhFlow(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'ph_flow');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validatePhFlow(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await patchPhConfigFlow(validated.row);
 }
 
 function slaveDeviceIdFromMac(mac) {
@@ -2689,8 +2907,12 @@ client.on('message', (topic, message, packet) => {
       await handlePhMetric(topic, message);
     } else if (suffix === 'ec_gain') {
       await handleEcGain(topic, message);
+    } else if (suffix === 'ec_nutrients') {
+      await handleEcNutrients(topic, message);
     } else if (suffix === 'ph_gain') {
       await handlePhGain(topic, message);
+    } else if (suffix === 'ph_flow') {
+      await handlePhFlow(topic, message);
     } else if (suffix === 'ec_dilution') {
       await handleEcDilution(topic, message);
     } else if (suffix === 'command_ack') {

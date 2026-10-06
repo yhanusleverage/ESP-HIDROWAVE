@@ -129,6 +129,8 @@ bool MqttClientWrapper::begin(const String& id) {
     phMetricTopic = String("hidrowave/") + deviceId + "/ph_metric";
     ecGainTopic = String("hidrowave/") + deviceId + "/ec_gain";
     phGainTopic = String("hidrowave/") + deviceId + "/ph_gain";
+    phFlowTopic = String("hidrowave/") + deviceId + "/ph_flow";
+    ecNutrientsTopic = String("hidrowave/") + deviceId + "/ec_nutrients";
     ecDilutionTopic = String("hidrowave/") + deviceId + "/ec_dilution";
     commandAckTopic = String("hidrowave/") + deviceId + "/command_ack";
     ruleExecutedTopic = String("hidrowave/") + deviceId + "/rule_executed";
@@ -724,6 +726,35 @@ bool MqttClientWrapper::publishEcGain(float kValue) {
     return published;
 }
 
+bool MqttClientWrapper::publishEcNutrients(const char* nutrientsJson) {
+    if (!mqtt.connected() || !nutrientsJson || nutrientsJson[0] != '[') {
+        Serial.println("[MQTT] ec_nutrients publish failed");
+        return false;
+    }
+
+    static char payload[1800];
+    const int wrote = snprintf(payload, sizeof(payload),
+                               "{\"v\":1,\"device_id\":\"%s\",\"nutrients\":%s}",
+                               deviceId.c_str(), nutrientsJson);
+    if (wrote <= 0 || wrote >= static_cast<int>(sizeof(payload))) {
+        Serial.println("[MQTT] ec_nutrients publish failed");
+        return false;
+    }
+
+    int n = 0;
+    for (const char* p = nutrientsJson; (p = strstr(p, "\"name\"")) != nullptr; p += 6) {
+        ++n;
+    }
+
+    const bool published = mqtt.publish(ecNutrientsTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ec_nutrients n=%d\n", n);
+    } else {
+        Serial.println("[MQTT] ec_nutrients publish failed");
+    }
+    return published;
+}
+
 bool MqttClientWrapper::publishPhGain(float kAcid, float kBase) {
     if (!mqtt.connected() || kAcid <= 0.0f || kBase <= 0.0f) {
         return false;
@@ -747,6 +778,64 @@ bool MqttClientWrapper::publishPhGain(float kAcid, float kBase) {
         Serial.printf("[MQTT] ph_gain k_acid=%.3e k_base=%.3e\n", kAcid, kBase);
     } else {
         Serial.println("[MQTT] ph_gain publish failed");
+    }
+    return published;
+}
+
+static bool phRelayOk(int relay) {
+    return relay == -1 || (relay >= 0 && relay <= 7);
+}
+
+static void writePhRelayJson(char* buf, size_t n, int relay) {
+    if (relay < 0) {
+        snprintf(buf, n, "null");
+        return;
+    }
+    snprintf(buf, n, "%d", relay);
+}
+
+bool MqttClientWrapper::publishPhFlow(float flowUp, float flowDown, int relayUp, int relayDown,
+                                      int release0, int release1) {
+    if (!mqtt.connected() ||
+        !(flowUp > 0.01f) || !(flowDown > 0.01f) ||
+        !phRelayOk(relayUp) || !phRelayOk(relayDown) ||
+        (relayUp >= 0 && relayUp == relayDown)) {
+        Serial.println("[MQTT] ph_flow publish failed");
+        return false;
+    }
+
+    char upBuf[8];
+    char downBuf[8];
+    writePhRelayJson(upBuf, sizeof(upBuf), relayUp);
+    writePhRelayJson(downBuf, sizeof(downBuf), relayDown);
+
+    char releaseBuf[16] = "[]";
+    const bool r0 = release0 >= 0 && release0 <= 7;
+    const bool r1 = release1 >= 0 && release1 <= 7 && release1 != release0;
+    if (r0 && r1) {
+        snprintf(releaseBuf, sizeof(releaseBuf), "[%d,%d]", release0, release1);
+    } else if (r0) {
+        snprintf(releaseBuf, sizeof(releaseBuf), "[%d]", release0);
+    } else if (r1) {
+        snprintf(releaseBuf, sizeof(releaseBuf), "[%d]", release1);
+    }
+
+    char payload[256];
+    const int wrote = snprintf(
+        payload, sizeof(payload),
+        "{\"v\":1,\"device_id\":\"%s\",\"flow_rate_ph_up\":%.3f,\"flow_rate_ph_down\":%.3f,"
+        "\"relay_ph_up\":%s,\"relay_ph_down\":%s,\"release\":%s}",
+        deviceId.c_str(), flowUp, flowDown, upBuf, downBuf, releaseBuf);
+    if (wrote <= 0 || wrote >= static_cast<int>(sizeof(payload))) {
+        Serial.println("[MQTT] ph_flow publish failed");
+        return false;
+    }
+
+    const bool published = mqtt.publish(phFlowTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ph_flow up=%.3f down=%.3f\n", flowUp, flowDown);
+    } else {
+        Serial.println("[MQTT] ph_flow publish failed");
     }
     return published;
 }

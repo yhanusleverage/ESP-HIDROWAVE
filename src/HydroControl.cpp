@@ -417,6 +417,7 @@ void HydroControl::pollDiscreteLevels() {
 #else
     static unsigned long lastLevelPollMs = 0;
     static unsigned long lastLevelLogMs = 0;
+    static bool levelOfflineLatched = false;
     const unsigned long now = millis();
 
     maybeRetryLevelPcf();
@@ -428,6 +429,7 @@ void HydroControl::pollDiscreteLevels() {
 
     if (levelBank.poll(pcf1, pcf1_ok)) {
         refreshTankLevelOkFromAggregate();
+        levelOfflineLatched = false;
         if (now - lastLevelLogMs >= LEVEL_LOG_MS) {
             lastLevelLogMs = now;
             // Formato auditable (grep LEVEL / PCF=) — paridad 4level_sensors
@@ -444,8 +446,11 @@ void HydroControl::pollDiscreteLevels() {
         }
     } else {
         tankLevelOk = false;
-        if (now - lastLevelLogMs >= LEVEL_LOG_MS) {
-            lastLevelLogMs = now;
+        static unsigned long lastOfflineBeatMs = 0;
+        const bool justOffline = !levelOfflineLatched;
+        if (justOffline || (now - lastOfflineBeatMs >= 30000UL)) {
+            lastOfflineBeatMs = now;
+            levelOfflineLatched = true;
             Serial.printf(
                 "LEVEL offline pcf1=%d addr=0x%02X pcf2=%d — sin L1-L4 reales (no XKR) | retry=%lums\n",
                 pcf1_ok ? 1 : 0,
@@ -494,15 +499,24 @@ bool HydroControl::discoverAndBindLevelPcf() {
         0x20, 0x21, 0x22, 0x23, /* skip 0x24 */ 0x25, 0x26, 0x27,
         0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F
     };
-    Serial.println("[LEVEL] scan PCF niveles 0x20-0x27 / 0x38-0x3F (skip 0x24 relés)…");
+    /* -1 desconocido, 0 fallo, 1 ok. El scan solo se anuncia si el resultado cambia. */
+    static int lastScanResult = -1;
+    const bool announce = (lastScanResult != 0);
+    if (announce) {
+        Serial.println("[LEVEL] scan PCF niveles 0x20-0x27 / 0x38-0x3F (skip 0x24 relés)…");
+    }
     for (uint8_t i = 0; i < sizeof(order); i++) {
         if (tryBindLevelPcf(order[i])) {
+            lastScanResult = 1;
             return true;
         }
     }
     pcf1_ok = false;
     levelBank.begin();  // available=false
-    Serial.println("✗ [LEVEL] ningún PCF niveles en bus (solo relés 0x24 u offline)");
+    if (announce) {
+        Serial.println("✗ [LEVEL] ningún PCF niveles en bus (solo relés 0x24 u offline)");
+    }
+    lastScanResult = 0;
     return false;
 }
 
@@ -518,7 +532,6 @@ void HydroControl::maybeRetryLevelPcf() {
         return;
     }
     lastLevelPcfRetryMs = now;
-    Serial.println("[LEVEL] reintento I2C / PCF niveles…");
     Wire.setClock(I2C_CLOCK_HZ);
     if (discoverAndBindLevelPcf()) {
         Serial.println("[LEVEL] PCF niveles recuperado — L1-L4 activos");
@@ -1011,12 +1024,6 @@ void HydroControl::setTankProcedureActive(bool active) {
 // ✅ Função para verificar e ajustar EC automaticamente
 void HydroControl::checkAutoEC() {
     if (!autoECEnabled) {
-        static unsigned long lastDebugPrint = 0;
-        unsigned long now = millis();
-        if (now - lastDebugPrint >= 30000) {
-            lastDebugPrint = now;
-            Serial.println("⚠️ [AUTO EC] auto_enabled desativado");
-        }
         return;
     }
 
@@ -1789,33 +1796,15 @@ void HydroControl::loadPHControllerConfig() {
 
 // ✅ Salvar configuração do Controller KP no NVS
 void HydroControl::saveECControllerConfig() {
-    Serial.println("\n╔════════════════════════════════════════════════════╗");
-    Serial.println("║   💾 ATUALIZANDO EC_CONFIG NO NVS                   ║");
-    Serial.println("╚════════════════════════════════════════════════════╝");
-    
-    // Obtener valores actuales
-    float baseDose = ecController.getBaseDose();
-    float flowRate = ecController.getFlowRate();
-    float volume = ecController.getVolume();
-    float totalMl = ecController.getTotalMl();
-    float kp = ecController.getKp();
-    float setpoint = ecSetpoint;
-    bool autoEnabled = autoECEnabled;
-    int interval = autoECIntervalSeconds;
-    
-    // Mostrar valores ANTES de guardar
-    Serial.println("📊 Valores a serem salvos:");
-    Serial.printf("   • base_dose:        %.2f µS/cm\n", baseDose);
-    Serial.printf("   • flow_rate:        %.3f ml/s\n", flowRate);
-    Serial.printf("   • volume:           %.2f L\n", volume);
-    Serial.printf("   • total_ml:         %.2f ml/L\n", totalMl);
-    Serial.printf("   • kp:               %.2f\n", kp);
-    Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", setpoint);
-    Serial.printf("   • tolerance:        %.0f µS/cm\n", ecTolerance);
-    Serial.printf("   • auto_enabled:     %s\n", autoEnabled ? "true" : "false");
-    Serial.printf("   • intervalo_auto_ec: %d segundos\n", interval);
-    
-    // Guardar en NVS
+    const float baseDose = ecController.getBaseDose();
+    const float flowRate = ecController.getFlowRate();
+    const float volume = ecController.getVolume();
+    const float totalMl = ecController.getTotalMl();
+    const float kp = ecController.getKp();
+    const float setpoint = ecSetpoint;
+    const bool autoEnabled = autoECEnabled;
+    const int interval = autoECIntervalSeconds;
+
     bool success = true;
     success &= PreferencesManager::saveConfigFloat("ec_baseDose", baseDose);
     success &= PreferencesManager::saveConfigFloat("ec_flowRate", flowRate);
@@ -1827,14 +1816,28 @@ void HydroControl::saveECControllerConfig() {
     success &= PreferencesManager::saveConfigFloat("ec_tolerance", ecTolerance);
     success &= PreferencesManager::saveConfigInt("ec_autoEnabled", autoEnabled ? 1 : 0);
     success &= PreferencesManager::saveConfigInt("ec_interval", interval);
-    
+
     if (success) {
-        Serial.println("✅ EC_CONFIG salvo no NVS com sucesso");
-        Serial.println("╚════════════════════════════════════════════════════╝\n");
-    } else {
-        Serial.println("❌ Erro ao salvar EC_CONFIG no NVS");
-        Serial.println("╚════════════════════════════════════════════════════╝\n");
+        Serial.printf("EC_CONFIG NVS ok auto=%d vol=%.0f iv=%d\n",
+                      autoEnabled ? 1 : 0, volume, interval);
+        return;
     }
+
+    Serial.println("\n╔════════════════════════════════════════════════════╗");
+    Serial.println("║   💾 ATUALIZANDO EC_CONFIG NO NVS                   ║");
+    Serial.println("╚════════════════════════════════════════════════════╝");
+    Serial.println("📊 Valores a serem salvos:");
+    Serial.printf("   • base_dose:        %.2f µS/cm\n", baseDose);
+    Serial.printf("   • flow_rate:        %.3f ml/s\n", flowRate);
+    Serial.printf("   • volume:           %.2f L\n", volume);
+    Serial.printf("   • total_ml:         %.2f ml/L\n", totalMl);
+    Serial.printf("   • kp:               %.2f\n", kp);
+    Serial.printf("   • ec_setpoint:      %.0f µS/cm\n", setpoint);
+    Serial.printf("   • tolerance:        %.0f µS/cm\n", ecTolerance);
+    Serial.printf("   • auto_enabled:     %s\n", autoEnabled ? "true" : "false");
+    Serial.printf("   • intervalo_auto_ec: %d segundos\n", interval);
+    Serial.println("❌ Erro ao salvar EC_CONFIG no NVS");
+    Serial.println("╚════════════════════════════════════════════════════╝\n");
 }
 
 // ✅ Carregar proporções nutricionais do NVS
@@ -2018,7 +2021,7 @@ int HydroControl::applyPumpFlowCalib(int relay, float flowMlPerSec) {
 }
 
 bool HydroControl::buildNutrientsJsonForCloud(String& out) const {
-    StaticJsonDocument<1536> doc;
+    DynamicJsonDocument doc(1536);
     JsonArray arr = doc.to<JsonArray>();
     bool usedRelay[6] = {false, false, false, false, false, false};
 
@@ -2112,7 +2115,6 @@ static float clampEcAggressiveness(float fraction) {
 
 void HydroControl::setMaxStepEcFraction(float fraction) {
     ecAggressiveness = clampEcAggressiveness(fraction);
-    Serial.printf("📐 [AUTO EC] aggressiveness / maxStep=%.2f\n", ecAggressiveness);
 }
 
 void HydroControl::setEcPulseDosing(float pulseMl, float pulseGapSec) {
@@ -2122,7 +2124,6 @@ void HydroControl::setEcPulseDosing(float pulseMl, float pulseGapSec) {
     ecPulseGapSec = pulseGapSec;
     if (ecPulseGapSec < 0.0f) ecPulseGapSec = 0.0f;
     if (ecPulseGapSec > 120.0f) ecPulseGapSec = 120.0f;
-    Serial.printf("📐 [AUTO EC] pulse_ml=%.2f gap=%.2fs\n", ecPulseMl, ecPulseGapSec);
 }
 
 void HydroControl::setPhPulseDosing(float pulseMl, float pulseGapSec) {
@@ -2893,14 +2894,6 @@ void HydroControl::processPhAutoState() {
 
 void HydroControl::checkAutoPH() {
     if (!autoPHEnabled) {
-        static unsigned long lastPhDebugPrint = 0;
-        const unsigned long now = millis();
-        if (now - lastPhDebugPrint >= 30000) {
-            Serial.println("⚠️ [AUTO pH] auto_enabled = false - ative no frontend primeiro!");
-            Serial.printf("   💡 Valores atuais: setpoint=%.2f, ph=%.2f, tolerance=%.2f\n",
-                phSetpoint, pH, phTolerance);
-            lastPhDebugPrint = now;
-        }
         return;
     }
     if (phAutoState != PH_IDLE) return;
@@ -2982,6 +2975,10 @@ void HydroControl::checkAutoPH() {
     }
 
     const int relay = path == PH_PATH_BASE ? relayPhUp : relayPhDown;
+    if (relay < 0 || relay > 7) {
+        Serial.println("[PH AUTO] sin bomba asignada");
+        return;
+    }
     const float hBefore = AdaptivePHController::toH(phForControl);
     const float phError = phSetpoint - pH;
 

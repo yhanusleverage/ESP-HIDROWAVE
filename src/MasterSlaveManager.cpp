@@ -10,6 +10,9 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include "ESPNowTypes.h"  // ✅ Para SlaveRelayStatesCache
+#if ENABLE_HMI_UART
+#include "HmiUartBridge.h"
+#endif
 
 // Instância estática para callbacks
 MasterSlaveManager* MasterSlaveManager::instance = nullptr;
@@ -46,6 +49,110 @@ MasterSlaveManager::MasterSlaveManager(ESPNowController* espNowController)
     pendingRelayCommandsMutex = xSemaphoreCreateMutex();
     if (pendingRelayCommandsMutex == NULL) {
         Serial.println("❌ Erro ao criar mutex para pendingRelayCommands!");
+    }
+}
+
+namespace {
+
+constexpr int kSlaveCycleMax = 16;
+constexpr const char *kSlaveCycleNs = "slave_cyc";
+
+struct SlaveCycleSlot {
+    uint8_t mac[6];
+    uint8_t relay;
+    uint8_t used;
+    uint32_t onSec;
+    uint32_t offSec;
+};
+
+SlaveCycleSlot slaveCycles_[kSlaveCycleMax];
+
+void saveSlaveCyclesToNvs() {
+    Preferences prefs;
+    if (!prefs.begin(kSlaveCycleNs, false)) {
+        return;
+    }
+    prefs.putBytes("tab", slaveCycles_, sizeof(slaveCycles_));
+    prefs.end();
+}
+
+void loadSlaveCyclesFromNvs() {
+    memset(slaveCycles_, 0, sizeof(slaveCycles_));
+    Preferences prefs;
+    if (!prefs.begin(kSlaveCycleNs, true)) {
+        return;
+    }
+    if (prefs.getBytesLength("tab") == sizeof(slaveCycles_)) {
+        prefs.getBytes("tab", slaveCycles_, sizeof(slaveCycles_));
+    }
+    prefs.end();
+}
+
+int findSlaveCycleSlot(const uint8_t *mac, int relay, bool create) {
+    if (!mac || relay < 0 || relay > 7) {
+        return -1;
+    }
+    int freeIx = -1;
+    for (int i = 0; i < kSlaveCycleMax; ++i) {
+        if (slaveCycles_[i].used && slaveCycles_[i].relay == static_cast<uint8_t>(relay) &&
+            memcmp(slaveCycles_[i].mac, mac, 6) == 0) {
+            return i;
+        }
+        if (!slaveCycles_[i].used && freeIx < 0) {
+            freeIx = i;
+        }
+    }
+    return create ? freeIx : -1;
+}
+
+}  // namespace
+
+void MasterSlaveManager::rememberSlaveCycle(const uint8_t *macAddress, int relayNumber, int onSec,
+                                            int offSec) {
+    if (onSec < 1 || offSec < 1) {
+        return;
+    }
+    const int ix = findSlaveCycleSlot(macAddress, relayNumber, true);
+    if (ix < 0) {
+        Serial.println("[CYCLE] tabla llena, no guardo");
+        return;
+    }
+    SlaveCycleSlot &slot = slaveCycles_[ix];
+    memcpy(slot.mac, macAddress, 6);
+    slot.relay = static_cast<uint8_t>(relayNumber);
+    slot.used = 1;
+    slot.onSec = static_cast<uint32_t>(onSec);
+    slot.offSec = static_cast<uint32_t>(offSec);
+    saveSlaveCyclesToNvs();
+    Serial.printf("[CYCLE] guardado %s R%d on=%ds off=%ds\n",
+                  ESPNowController::macToString(macAddress).c_str(), relayNumber, onSec, offSec);
+}
+
+void MasterSlaveManager::forgetSlaveCycle(const uint8_t *macAddress, int relayNumber) {
+    const int ix = findSlaveCycleSlot(macAddress, relayNumber, false);
+    if (ix < 0) {
+        return;
+    }
+    memset(&slaveCycles_[ix], 0, sizeof(slaveCycles_[ix]));
+    saveSlaveCyclesToNvs();
+    Serial.printf("[CYCLE] borrado %s R%d\n", ESPNowController::macToString(macAddress).c_str(),
+                  relayNumber);
+}
+
+void MasterSlaveManager::rearmSlaveCycles(const uint8_t *macAddress) {
+    if (!macAddress) {
+        return;
+    }
+    for (int i = 0; i < kSlaveCycleMax; ++i) {
+        const SlaveCycleSlot &slot = slaveCycles_[i];
+        if (!slot.used || memcmp(slot.mac, macAddress, 6) != 0) {
+            continue;
+        }
+        Serial.printf("[CYCLE] rearme %s R%d on=%us off=%us\n",
+                      ESPNowController::macToString(macAddress).c_str(), slot.relay, slot.onSec,
+                      slot.offSec);
+        sendRelayCommandToSlave(macAddress, slot.relay, "cycle", static_cast<int>(slot.onSec), 0,
+                                false, static_cast<int>(slot.offSec), "cycle");
     }
 }
 
@@ -97,6 +204,8 @@ bool MasterSlaveManager::begin() {
     } else {
         Serial.println("💡 Nenhum peer em cache (primeira inicialização)");
     }
+
+    loadSlaveCyclesFromNvs();
 
     lastEspNowChannel = EspNowChannelPolicy::loadLastChannelFromNvs();
     if (lastEspNowChannel > 0) {
@@ -1178,6 +1287,7 @@ void MasterSlaveManager::touchSlaveLink(const uint8_t* mac, const char* reason) 
 
     if (wasOffline) {
         sendPendingCommandsToSlave(mac);
+        rearmSlaveCycles(mac);
         requestSlaveStatus(mac);
         if (slaveOnlineCallback) {
             slaveOnlineCallback(mac, deviceName);
@@ -2411,6 +2521,15 @@ void MasterSlaveManager::processRelayCommandAck(const RelayCommandAck& ack, cons
     } else if (!ack.success) {
         Serial.printf("⚠️ [RELAY-ACK] falha esp=%u (slave desconhecido)\n", (unsigned)ack.commandId);
     }
+
+#if ENABLE_HMI_UART
+    /* Bit real al HMI. El JSON grande de slaves no se rearma en cada ACK. */
+    if (ack.relayNumber < 8) {
+        if (HmiUartBridge* hmi = HmiUartBridge::activeInstance()) {
+            hmi->notifyRelayState(senderMac, ack.relayNumber, currentState);
+        }
+    }
+#endif
 }
 
 

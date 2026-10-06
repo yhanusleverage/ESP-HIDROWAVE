@@ -420,6 +420,9 @@ uint32_t RelayCoordinator::requestActuation(
     if (action == RelayActuationAction::Toggle) {
         actionStr = "toggle";
     }
+    if (commandMode == "cycle" || commandMode == "cycle_stop") {
+        actionStr = commandMode;
+    }
 
     bool ok = false;
     uint32_t result = 0;
@@ -497,7 +500,7 @@ uint32_t RelayCoordinator::actuateSlave(
     const char* pathRuleId) {
     RelayTarget target = RelayTarget::remote(mac, relay);
     RelayActuationAction act = RelayActuationAction::Toggle;
-    if (action == "on" || action == "timed_on") {
+    if (action == "on" || action == "timed_on" || action == "cycle") {
         act = RelayActuationAction::On;
     } else if (action == "off" || action == "cycle_stop") {
         act = RelayActuationAction::Off;
