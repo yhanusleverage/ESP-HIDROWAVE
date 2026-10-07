@@ -24,8 +24,14 @@ import 'dotenv/config';
 import mqtt from 'mqtt';
 import ws from 'ws';
 import { createHash } from 'crypto';
+import { readFileSync, writeFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { evaluateSchedules } from './schedule-evaluator.js';
+
+const OWNER_EMAILS_PATH = join(dirname(fileURLToPath(import.meta.url)), 'device-owner-emails.json');
+const ownerReleaseInFlight = new Set();
 
 const DEVICE_ID_RE = /^ESP32_HIDRO_[0-9A-F]{6}$/;
 const SLAVE_MAC_RE = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
@@ -1434,6 +1440,7 @@ async function handleHeartbeat(topic, message) {
       `[bridge] heartbeat OK en MQTT pero PATCH device_status FALLÓ — UI Master puede quedar Offline (${deviceId})`
     );
   }
+  await noteDeviceOwnerEmail(deviceId);
 }
 
 async function handleEcOperation(topic, message) {
@@ -2460,6 +2467,156 @@ function publishRuleDisableMqtt(deviceId, ruleRow) {
   };
 
   return run();
+}
+
+function normalizeOwnerEmail(value) {
+  if (value == null) return '';
+  return String(value).trim().toLowerCase();
+}
+
+function loadOwnerEmails() {
+  try {
+    const parsed = JSON.parse(readFileSync(OWNER_EMAILS_PATH, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      console.warn('[bridge] owner emails read:', err.message);
+    }
+  }
+  return {};
+}
+
+function saveOwnerEmails(map) {
+  writeFileSync(OWNER_EMAILS_PATH, JSON.stringify(map));
+}
+
+function publishRetainedEmpty(topic) {
+  const publishUser = process.env.MQTT_PUBLISH_USER || process.env.MQTT_USER;
+  const publishPass = process.env.MQTT_PUBLISH_PASS || process.env.MQTT_PASS;
+  if (!publishUser || !publishPass) {
+    console.warn('[bridge] retained clear skip — sin MQTT_PUBLISH_* / MQTT_USER');
+    return Promise.resolve({ ok: false, skipped: true });
+  }
+
+  const publishOnce = (mqttClient) =>
+    new Promise((resolve) => {
+      mqttClient.publish(topic, '', { qos: 1, retain: true }, (err) => {
+        if (err) {
+          console.error(`[bridge] retained clear failed ${topic}:`, err.message);
+          resolve({ ok: false, error: err.message });
+        } else {
+          console.log(`[bridge] retained clear → ${topic}`);
+          resolve({ ok: true });
+        }
+      });
+    });
+
+  const useSeparateClient =
+    Boolean(process.env.MQTT_PUBLISH_USER) &&
+    process.env.MQTT_PUBLISH_USER !== process.env.MQTT_USER;
+
+  if (!useSeparateClient && client?.connected) {
+    return publishOnce(client);
+  }
+
+  return new Promise((resolve) => {
+    const pub = mqtt.connect(mqttUrl, {
+      username: publishUser,
+      password: publishPass,
+      connectTimeout: 5000,
+    });
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        pub.end(true);
+      } catch {
+        /* ignore */
+      }
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ ok: false, error: 'timeout' }), 8000);
+    pub.on('connect', () => {
+      publishOnce(pub).then(finish);
+    });
+    pub.on('error', (err) => {
+      console.error(`[bridge] retained clear connect ${topic}:`, err.message);
+      finish({ ok: false, error: err.message });
+    });
+  });
+}
+
+async function releaseDeviceRulesForNewOwner(deviceId) {
+  const { data: rules, error: fetchErr } = await supabase
+    .from('decision_rules')
+    .select('rule_id, rule_name, priority, enabled')
+    .eq('device_id', deviceId);
+
+  if (fetchErr) {
+    console.error(`[bridge] owner-change fetch decision_rules ${deviceId}:`, fetchErr.message);
+    return false;
+  }
+
+  const rows = rules || [];
+  const { error: updErr } = await supabase
+    .from('decision_rules')
+    .update({ enabled: false, updated_at: new Date().toISOString() })
+    .eq('device_id', deviceId);
+
+  if (updErr) {
+    console.error(`[bridge] owner-change disable decision_rules ${deviceId}:`, updErr.message);
+    return false;
+  }
+
+  for (const rule of rows) {
+    const published = await publishRuleDisableMqtt(deviceId, rule);
+    if (!published?.ok) {
+      console.error(`[bridge] owner-change MQTT disable failed ${deviceId} ${rule.rule_id}`);
+      return false;
+    }
+  }
+
+  const cleared = await publishRetainedEmpty(`hidrowave/${deviceId}/circ/config`);
+  if (!cleared?.ok) {
+    return false;
+  }
+
+  console.log(`[bridge] owner-change released ${rows.length} rules ${deviceId}`);
+  return true;
+}
+
+async function noteDeviceOwnerEmail(deviceId) {
+  if (!deviceId || ownerReleaseInFlight.has(deviceId)) return;
+
+  const dev = await fetchDeviceUserEmail(deviceId);
+  const next = normalizeOwnerEmail(dev?.user_email);
+  if (!next) return;
+
+  const known = loadOwnerEmails();
+  const prev = normalizeOwnerEmail(known[deviceId]);
+  if (!prev) {
+    known[deviceId] = next;
+    saveOwnerEmails(known);
+    console.log(`[bridge] owner email first-seen ${deviceId}`);
+    return;
+  }
+  if (prev === next) return;
+
+  ownerReleaseInFlight.add(deviceId);
+  try {
+    const ok = await releaseDeviceRulesForNewOwner(deviceId);
+    if (!ok) return;
+    const latest = loadOwnerEmails();
+    latest[deviceId] = next;
+    saveOwnerEmails(latest);
+    console.log(`[bridge] owner email changed ${deviceId}`);
+  } finally {
+    ownerReleaseInFlight.delete(deviceId);
+  }
 }
 
 /**

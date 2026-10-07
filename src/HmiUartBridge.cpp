@@ -13,6 +13,7 @@
 #include "WiFiCredentialsManager.h"
 #include <WiFi.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
 #include <HardwareSerial.h>
 #include <cstring>
 #include <climits>
@@ -1091,14 +1092,25 @@ bool HmiUartBridge::handleMasterReboot() {
 }
 
 bool HmiUartBridge::handleFactoryReset() {
-    /* Soft factory: solo credenciales/perfil — NO erase flash / SPIFFS. */
-    Serial.println("[HMI UART] factory_reset — limpiando hydro_system + wifi_creds");
+    /* Soft factory: hydro_system + wifi_creds + solo /rules.json. No formatea SPIFFS. */
+    Serial.println("[HMI UART] factory_reset — limpiando hydro_system + wifi_creds + /rules.json");
     Preferences prefs;
     if (prefs.begin("hydro_system", false)) {
         prefs.clear();
         prefs.end();
     }
     WiFiCredentialsManager().clearCredentials();
+    if (SPIFFS.begin(true)) {
+        if (SPIFFS.exists("/rules.json")) {
+            if (SPIFFS.remove("/rules.json")) {
+                Serial.println("[HMI UART] factory_reset — /rules.json borrado");
+            } else {
+                Serial.println("[HMI UART] factory_reset — no se pudo borrar /rules.json");
+            }
+        }
+    } else {
+        Serial.println("[HMI UART] factory_reset — SPIFFS no montado, /rules.json no tocado");
+    }
     WiFi.disconnect(true, true);
     scheduleRestart(500);
     return true;

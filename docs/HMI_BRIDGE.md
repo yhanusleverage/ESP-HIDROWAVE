@@ -53,7 +53,7 @@ Buffer JSON RX Master: **1536 B** (`kJsonCapacity`). Si un `loop_control` / `nut
 | `calib` | Ack stub |
 | `wifi_config` | Mismo NVS SoftAP (`hydro_system`) + `wifi_config_ack` + reboot ~2.5 s |
 | `master_reboot` | `cmd_ack` + `ESP.restart()` (~400 ms) — no borra NVS |
-| `factory_reset` | Limpia `hydro_system` + `wifi_creds`, `cmd_ack`, reinicio (~500 ms) — **no** erase flash |
+| `factory_reset` | Limpia `hydro_system` + `wifi_creds` y borra `/rules.json`, `cmd_ack`, reinicio (~500 ms) — no formatea la flash |
 | `sys_info_req` / `slaves_req` | Respuesta inmediata |
 
 ## Deadband
