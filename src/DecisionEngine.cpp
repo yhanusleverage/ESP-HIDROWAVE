@@ -220,11 +220,33 @@ bool DecisionEngine::loadRulesFromFile(const String& filename) {
         return false;
     }
     
-    String json_str = file.readString();
+    const size_t len = file.size();
+    if (len == 0 || len > 48000) {
+        file.close();
+        Serial.printf("❌ [DE] rules.json tamaño inválido %u\n", static_cast<unsigned>(len));
+        return false;
+    }
+    char *raw = static_cast<char *>(malloc(len + 1));
+    if (!raw) {
+        file.close();
+        Serial.println("❌ [DE] rules.json sin buffer de lectura");
+        return false;
+    }
+    const size_t nread = file.read(reinterpret_cast<uint8_t *>(raw), len);
+    raw[nread] = '\0';
     file.close();
-    
-    DynamicJsonDocument doc(JSON_BUFFER_SIZE);
-    DeserializationError error = deserializeJson(doc, json_str);
+
+    size_t cap = nread + (nread / 2) + 1024;
+    if (cap < 4096) {
+        cap = 4096;
+    }
+    const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+    if (maxAlloc > 6144 && cap + 1536 > maxAlloc) {
+        cap = static_cast<size_t>(maxAlloc) - 1536;
+    }
+    DynamicJsonDocument doc(cap);
+    const DeserializationError error = deserializeJson(doc, raw);
+    free(raw);
     
     if (error) {
         Serial.println("❌ Erro ao parsear JSON das regras: " + String(error.c_str()));
@@ -272,48 +294,68 @@ bool DecisionEngine::loadRulesFromFile(const String& filename) {
 }
 
 bool DecisionEngine::saveRulesToFile(const String& filename) {
-    // 65k fijos fallan con maxAlloc~47k (heap fragmentado) → overflow falso.
-    const uint32_t maxAlloc = ESP.getMaxAllocHeap();
-    size_t cap = JSON_BUFFER_SIZE;
-    if (maxAlloc > 12288) {
-        const size_t safe = static_cast<size_t>(maxAlloc) - 8192;
-        if (safe < cap) {
-            cap = safe;
+    /* Una regla por documento chico. Un bloque de 32 KB falla con el heap partido
+     * (maxAlloc ~40 KB aunque haya 70 KB libres). */
+    auto writeOne = [this](File &out, const DecisionRule &rule) -> bool {
+        const size_t caps[] = {4096, 8192, 12288};
+        for (size_t cap : caps) {
+            if (ESP.getMaxAllocHeap() < cap + 512) {
+                continue;
+            }
+            DynamicJsonDocument doc(cap);
+            if (doc.capacity() == 0) {
+                continue;
+            }
+            JsonObject obj = doc.to<JsonObject>();
+            ruleToJSON(rule, obj, doc);
+            if (doc.overflowed()) {
+                continue;
+            }
+            serializeJson(doc, out);
+            return true;
         }
-    } else {
-        Serial.printf("❌ [DE] saveRulesToFile: maxAlloc=%u insuficiente\n", maxAlloc);
+        Serial.printf("❌ [DE] regla no cabe al guardar %s\n", rule.id.c_str());
         return false;
-    }
+    };
 
-    DynamicJsonDocument doc(cap);
-    JsonArray rules_array = doc.createNestedArray("rules");
-    
-    for (const auto& rule : rules) {
-        JsonObject rule_json = rules_array.createNestedObject();
-        ruleToJSON(rule, rule_json, doc);
-    }
-
-    if (doc.overflowed()) {
-        Serial.printf(
-            "❌ [DE] saveRulesToFile: JSON overflow cap=%u maxAlloc=%u usage=%u — "
-            "slim scripts / menos regras\n",
-            static_cast<unsigned>(cap), maxAlloc,
-            static_cast<unsigned>(doc.memoryUsage()));
-        return false;
-    }
-    
-    File file = SPIFFS.open(filename, "w");
+    const String tmpName = filename + ".tmp";
+    File file = SPIFFS.open(tmpName, "w");
     if (!file) {
         Serial.println("❌ Erro ao criar arquivo de regras");
         return false;
     }
-    
-    serializeJson(doc, file);
+    file.print("{\"rules\":[");
+    bool first = true;
+    bool ok = true;
+    for (const auto &rule : rules) {
+        if (!first) {
+            file.print(',');
+        }
+        if (!writeOne(file, rule)) {
+            ok = false;
+            break;
+        }
+        first = false;
+    }
+    if (ok) {
+        file.print("]}");
+    }
     file.close();
-    
-    Serial.printf("✅ Regras salvas em: %s (cap=%u usage=%u)\n",
-                  filename.c_str(), static_cast<unsigned>(cap),
-                  static_cast<unsigned>(doc.memoryUsage()));
+    if (!ok) {
+        SPIFFS.remove(tmpName);
+        Serial.printf("❌ [DE] saveRulesToFile abort maxAlloc=%u\n",
+                      static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        return false;
+    }
+    if (SPIFFS.exists(filename)) {
+        SPIFFS.remove(filename);
+    }
+    if (!SPIFFS.rename(tmpName, filename)) {
+        Serial.printf("❌ [DE] rename %s → %s\n", tmpName.c_str(), filename.c_str());
+        return false;
+    }
+    Serial.printf("✅ Regras salvas em: %s (%u)\n", filename.c_str(),
+                  static_cast<unsigned>(rules.size()));
     return true;
 }
 

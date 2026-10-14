@@ -10,6 +10,7 @@
 #include "Controller.h"
 #include "DecisionEngine.h"
 #include "MqttClient.h"
+#include "RelayNameCatalog.h"
 #include "WiFiCredentialsManager.h"
 #include <WiFi.h>
 #include <Preferences.h>
@@ -481,8 +482,14 @@ void HmiUartBridge::publishTelemetryNow() {
     const float temp = hydro.getWaterTemp();
     if (isfinite(temp)) {
         doc["temp_agua"] = temp;
-    } else if (tempOk) {
+    } else     if (tempOk) {
         doc["temp_agua"] = hydro.getTemperature();
+    }
+    if (hydro.hasConsumoEc24hDelta()) {
+        doc["deriv_ec"] = hydro.consumoEc24hDelta();
+    }
+    if (hydro.hasConsumoPh24hDelta()) {
+        doc["deriv_ph"] = hydro.consumoPh24hDelta();
     }
     const size_t n = serializeJson(doc, lastTelemetryJson_, sizeof(lastTelemetryJson_));
     lastTelemetryValid_ = (n > 0 && n < sizeof(lastTelemetryJson_));
@@ -1116,6 +1123,460 @@ bool HmiUartBridge::handleFactoryReset() {
     return true;
 }
 
+namespace {
+
+struct RuleStateSlot {
+    bool used;
+    char name[20];
+    char level[24];
+    bool enabled;
+};
+
+RuleStateSlot ruleStates_[6];
+
+void copyField(char *dst, size_t n, const char *src) {
+    if (!dst || n == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    strncpy(dst, src, n - 1);
+    dst[n - 1] = '\0';
+}
+
+}  // namespace
+
+bool HmiUartBridge::handleRuleState(JsonDocument& doc) {
+    const char *name = doc["name"] | "";
+    const char *level = doc["level"] | "";
+    const bool enabled = (doc["enabled"] | 0) != 0;
+    if (!name || !name[0]) {
+        return false;
+    }
+    int slot = -1;
+    int freeSlot = -1;
+    for (int i = 0; i < 6; ++i) {
+        if (ruleStates_[i].used && strcmp(ruleStates_[i].name, name) == 0) {
+            slot = i;
+            break;
+        }
+        if (!ruleStates_[i].used && freeSlot < 0) {
+            freeSlot = i;
+        }
+    }
+    if (slot < 0) {
+        slot = freeSlot;
+    }
+    if (slot < 0) {
+        slot = 0;
+    }
+    ruleStates_[slot].used = true;
+    copyField(ruleStates_[slot].name, sizeof(ruleStates_[slot].name), name);
+    copyField(ruleStates_[slot].level, sizeof(ruleStates_[slot].level),
+              (level && level[0]) ? level : "vacio");
+    ruleStates_[slot].enabled = enabled;
+    Serial.printf("[REGLA] %s nivel=%s estado=%s\n",
+                  ruleStates_[slot].name,
+                  ruleStates_[slot].level,
+                  enabled ? "activa" : "parada");
+    return true;
+}
+
+namespace {
+
+struct StepLine {
+    char text[64];
+    char until[16];
+    char mac[18];
+    int relay;
+};
+
+struct RuleSnap {
+    char level[32];
+    StepLine steps[4];
+    uint8_t n;
+};
+
+void copyClip(char *dst, size_t n, const char *src) {
+    if (!dst || n == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    strncpy(dst, src, n - 1);
+    dst[n - 1] = '\0';
+}
+
+int readRelayNumber(JsonObject o) {
+    if (o.isNull()) {
+        return -1;
+    }
+    if (!o["relay_number"].isNull()) {
+        if (o["relay_number"].is<const char *>()) {
+            return String(o["relay_number"].as<const char *>()).toInt();
+        }
+        return o["relay_number"].as<int>();
+    }
+    if (!o["relay"].isNull()) {
+        if (o["relay"].is<const char *>()) {
+            return String(o["relay"].as<const char *>()).toInt();
+        }
+        return o["relay"].as<int>();
+    }
+    if (!o["relayIndex"].isNull()) {
+        return o["relayIndex"].as<int>();
+    }
+    if (!o["relay_index"].isNull()) {
+        return o["relay_index"].as<int>();
+    }
+    return -1;
+}
+
+void relayCaption(JsonObject o, int relay, char *dst, size_t n) {
+    const char *mac = "";
+    if (o["slave_mac"].is<const char *>()) {
+        mac = o["slave_mac"].as<const char *>();
+    } else if (o["target_device_id"].is<const char *>()) {
+        mac = o["target_device_id"].as<const char *>();
+    }
+    const char *catalog = RelayNameCatalog::nameFor(mac, relay);
+    if (catalog && catalog[0]) {
+        copyClip(dst, n, catalog);
+        return;
+    }
+    const char *label = "";
+    if (o["label"].is<const char *>()) {
+        label = o["label"].as<const char *>();
+    }
+    if ((!label || !label[0]) && o["name"].is<const char *>()) {
+        label = o["name"].as<const char *>();
+    }
+    if ((!label || !label[0]) && o["relay_names"].is<JsonArray>()) {
+        JsonVariant first = o["relay_names"][0];
+        if (first.is<const char *>()) {
+            label = first.as<const char *>();
+        }
+    }
+    if (label && label[0]) {
+        copyClip(dst, n, label);
+        return;
+    }
+    if (relay >= 0 && relay <= 7) {
+        snprintf(dst, n, "Relé %d", relay + 1);
+    } else {
+        snprintf(dst, n, "Relé");
+    }
+}
+
+void readMac(JsonObject o, char *dst, size_t n) {
+    const char *mac = "";
+    if (!o.isNull()) {
+        if (o["slave_mac"].is<const char *>()) {
+            mac = o["slave_mac"].as<const char *>();
+        } else if (o["target_device_id"].is<const char *>()) {
+            mac = o["target_device_id"].as<const char *>();
+        }
+    }
+    copyClip(dst, n, mac);
+}
+
+void pushStep(RuleSnap &snap, const char *name, const char *until, const char *mac, int relay) {
+    if (snap.n >= 4 || !name || !name[0]) {
+        return;
+    }
+    StepLine &s = snap.steps[snap.n];
+    if (until && until[0]) {
+        snprintf(s.text, sizeof(s.text), "%s ON -> OFF", name);
+        copyClip(s.until, sizeof(s.until), until);
+    } else {
+        snprintf(s.text, sizeof(s.text), "%s ON", name);
+        s.until[0] = '\0';
+    }
+    copyClip(s.mac, sizeof(s.mac), mac ? mac : "");
+    s.relay = relay;
+    snap.n++;
+}
+
+void joinLevel(RuleSnap &snap) {
+    snap.level[0] = '\0';
+    for (uint8_t i = 0; i < snap.n; ++i) {
+        if (!snap.steps[i].until[0]) {
+            continue;
+        }
+        const size_t len = strlen(snap.level);
+        if (len > 0 && len + 1 < sizeof(snap.level)) {
+            snap.level[len] = '+';
+            snap.level[len + 1] = '\0';
+        }
+        strncat(snap.level, snap.steps[i].until, sizeof(snap.level) - strlen(snap.level) - 1);
+    }
+    if (!snap.level[0]) {
+        copyClip(snap.level, sizeof(snap.level), "-");
+    }
+}
+
+void stepsFromScript(const String &json, RuleSnap &snap) {
+    if (json.length() == 0 || snap.n >= 4) {
+        return;
+    }
+    DynamicJsonDocument doc(3072);
+    if (deserializeJson(doc, json)) {
+        return;
+    }
+    JsonArray instrs = doc["instructions"].as<JsonArray>();
+    if (instrs.isNull()) {
+        return;
+    }
+    for (JsonObject ij : instrs) {
+        if (snap.n >= 4) {
+            break;
+        }
+        String type = ij["type"] | "";
+        type.toLowerCase();
+        if (type == "while") {
+            JsonObject cond = ij["condition"].as<JsonObject>();
+            String until;
+            if (!cond.isNull() && cond["value"].is<const char *>()) {
+                until = cond["value"].as<const char *>();
+            }
+            until.toLowerCase();
+            until.trim();
+            JsonArray body = ij["body"].as<JsonArray>();
+            int relay = -1;
+            char name[40] = {};
+            JsonObject picked;
+            if (!body.isNull()) {
+                for (JsonObject bi : body) {
+                    JsonObject target = bi;
+                    String bt = bi["type"] | "";
+                    bt.toLowerCase();
+                    if (bt == "if") {
+                        JsonArray thenArr = bi["then"].as<JsonArray>();
+                        if (!thenArr.isNull() && thenArr.size() > 0) {
+                            target = thenArr[0].as<JsonObject>();
+                        }
+                    }
+                    const int r = readRelayNumber(target);
+                    if (r >= 0) {
+                        relay = r;
+                        picked = target;
+                        relayCaption(target, r, name, sizeof(name));
+                        break;
+                    }
+                }
+            }
+            if (relay >= 0) {
+                char mac[18];
+                readMac(picked, mac, sizeof(mac));
+                pushStep(snap, name, until.c_str(), mac, relay);
+            }
+            continue;
+        }
+        JsonObject act = ij["actuator"].as<JsonObject>();
+        JsonObject target = act.isNull() ? ij : act;
+        const int relay = readRelayNumber(target);
+        if (relay >= 0) {
+            char name[40];
+            relayCaption(target, relay, name, sizeof(name));
+            const char *until = ij["until"] | "";
+            char mac[18];
+            readMac(target, mac, sizeof(mac));
+            pushStep(snap, name, until, mac, relay);
+        }
+    }
+}
+
+void stepsFromFsm(const String &json, RuleSnap &snap) {
+    if (json.length() == 0 || snap.n > 0) {
+        return;
+    }
+    DynamicJsonDocument doc(1536);
+    if (deserializeJson(doc, json)) {
+        return;
+    }
+    const char *keys[2] = {"drain", "fill"};
+    for (int i = 0; i < 2 && snap.n < 4; ++i) {
+        JsonObject o = doc[keys[i]].as<JsonObject>();
+        const int relay = readRelayNumber(o);
+        if (relay < 0) {
+            continue;
+        }
+        char name[40];
+        relayCaption(o, relay, name, sizeof(name));
+        const char *until = o["until"] | "";
+        char mac[18];
+        readMac(o, mac, sizeof(mac));
+        pushStep(snap, name, until, mac, relay);
+    }
+}
+
+void stepsFromActions(const DecisionRule &rule, RuleSnap &snap) {
+    if (snap.n > 0) {
+        return;
+    }
+    for (const RuleAction &action : rule.actions) {
+        if (snap.n >= 4) {
+            break;
+        }
+        if (action.type != RELAY_ON && action.type != RELAY_PULSE) {
+            continue;
+        }
+        char name[40];
+        const char *catalog =
+            RelayNameCatalog::nameFor(action.target_device_id.c_str(), action.target_relay);
+        if (catalog && catalog[0]) {
+            snprintf(name, sizeof(name), "%s", catalog);
+        } else if (action.target_relay >= 0 && action.target_relay <= 7) {
+            snprintf(name, sizeof(name), "Relé %d", action.target_relay + 1);
+        } else {
+            snprintf(name, sizeof(name), "Relé");
+        }
+        pushStep(snap, name, nullptr, action.target_device_id.c_str(), action.target_relay);
+    }
+}
+
+void fillSnap(const DecisionRule &rule, RuleSnap &snap) {
+    memset(&snap, 0, sizeof(snap));
+    stepsFromScript(rule.script_json, snap);
+    stepsFromFsm(rule.fsm_json, snap);
+    stepsFromActions(rule, snap);
+    joinLevel(snap);
+}
+
+void logRuleLine(const char *name, const char *level, bool enabled) {
+    Serial.printf("[REGLA] %s nivel=%s estado=%s\n",
+                  (name && name[0]) ? name : "Regla",
+                  (level && level[0]) ? level : "-",
+                  enabled ? "activa" : "parada");
+}
+
+}  // namespace
+
+void HmiUartBridge::pushRelayCatalog() {
+    {
+        StaticJsonDocument<64> begin;
+        begin["t"] = "relay_names_begin";
+        emitJson(begin);
+    }
+    const int n = RelayNameCatalog::slotCount();
+    for (int i = 0; i < n; ++i) {
+        RelayNameCatalog::SlotView slot;
+        if (!RelayNameCatalog::slotAt(i, slot) || !slot.mac) {
+            continue;
+        }
+        StaticJsonDocument<1024> doc;
+        doc["t"] = "relay_names";
+        doc["mac"] = slot.mac;
+        doc["place"] = slot.place ? slot.place : "";
+        JsonArray names = doc.createNestedArray("names");
+        for (int r = 0; r < 8; ++r) {
+            names.add(slot.names[r] ? slot.names[r] : "");
+        }
+        emitJson(doc);
+    }
+    StaticJsonDocument<64> endDoc;
+    endDoc["t"] = "relay_names_end";
+    emitJson(endDoc);
+}
+
+void HmiUartBridge::sendRulesList() {
+    pushRelayCatalog();
+    {
+        StaticJsonDocument<64> begin;
+        begin["t"] = "rules_begin";
+        emitJson(begin);
+    }
+    uint8_t sent = 0;
+    if (ctx_.decisionEngine) {
+        for (const DecisionRule &rule : ctx_.decisionEngine->getAllRules()) {
+            if (sent >= 8) {
+                break;
+            }
+            RuleSnap snap;
+            fillSnap(rule, snap);
+            const char *name = rule.name.length() ? rule.name.c_str() : rule.id.c_str();
+            logRuleLine(name, snap.level, rule.enabled);
+            StaticJsonDocument<1400> doc;
+            doc["t"] = "rule";
+            doc["id"] = rule.id;
+            doc["name"] = name;
+            doc["enabled"] = rule.enabled ? 1 : 0;
+            doc["level"] = snap.level;
+            JsonArray steps = doc.createNestedArray("steps");
+            JsonArray relays = doc.createNestedArray("relays");
+            for (uint8_t i = 0; i < snap.n; ++i) {
+                steps.add(snap.steps[i].text);
+                JsonObject slot = relays.createNestedObject();
+                slot["r"] = snap.steps[i].relay;
+                slot["mac"] = snap.steps[i].mac;
+                slot["until"] = snap.steps[i].until;
+            }
+            emitJson(doc);
+            sent++;
+        }
+    }
+    StaticJsonDocument<64> endDoc;
+    endDoc["t"] = "rules_end";
+    emitJson(endDoc);
+}
+
+bool HmiUartBridge::handleRuleSet(JsonDocument &doc) {
+    const char *id = doc["id"] | "";
+    const bool enabled = (doc["enabled"] | 0) != 0;
+    if (!id || !id[0] || !ctx_.applyRuleSetFn || !ctx_.decisionEngine) {
+        return false;
+    }
+    if (!ctx_.applyRuleSetFn(id, enabled)) {
+        return false;
+    }
+    DecisionRule *rule = ctx_.decisionEngine->getRule(String(id));
+    if (rule) {
+        RuleSnap snap;
+        fillSnap(*rule, snap);
+        const char *name = rule->name.length() ? rule->name.c_str() : rule->id.c_str();
+        logRuleLine(name, snap.level, rule->enabled);
+    }
+    return true;
+}
+
+bool HmiUartBridge::handleRuleDelete(JsonDocument &doc) {
+    const char *id = doc["id"] | "";
+    if (!id || !id[0] || !ctx_.applyRuleDeleteFn) {
+        return false;
+    }
+    return ctx_.applyRuleDeleteFn(id);
+}
+
+bool HmiUartBridge::handleRuleCreate(JsonDocument &doc) {
+    const char *name = doc["name"] | "";
+    const char *mac = doc["mac"] | "";
+    const int relay = doc["relay"] | -1;
+    const char *until = doc["until"] | "";
+    const int relay2 = doc["relay2"] | -1;
+    const char *until2 = doc["until2"] | "";
+    if (!ctx_.applyRuleCreateFn) {
+        return false;
+    }
+    const char *keepId = doc["id"] | "";
+    return ctx_.applyRuleCreateFn(name, mac, relay, until, relay2,
+                                  (until2 && until2[0]) ? until2 : nullptr,
+                                  (keepId && keepId[0]) ? keepId : nullptr);
+}
+
+bool HmiUartBridge::handleRelayRename(JsonDocument &doc) {
+    const char *mac = doc["mac"] | "";
+    const int relay = doc["relay"] | -1;
+    const char *name = doc["name"] | "";
+    if (!ctx_.applyRelayRenameFn) {
+        return false;
+    }
+    return ctx_.applyRelayRenameFn(mac, relay, name);
+}
+
 bool HmiUartBridge::handleCommand(JsonDocument& doc) {
     const char* t = doc["t"] | "";
     if (strcmp(t, "cmd") != 0) {
@@ -1170,6 +1631,20 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
         ok = handleFactoryReset();
         sendCmdAck(action, ok);
         return true;
+    } else if (strcmp(action, "rule_state") == 0) {
+        ok = handleRuleState(doc);
+    } else if (strcmp(action, "rules_req") == 0) {
+        sendRulesList();
+        sendCmdAck(action, true);
+        return true;
+    } else if (strcmp(action, "rule_set") == 0) {
+        ok = handleRuleSet(doc);
+    } else if (strcmp(action, "rule_delete") == 0) {
+        ok = handleRuleDelete(doc);
+    } else if (strcmp(action, "rule_create") == 0) {
+        ok = handleRuleCreate(doc);
+    } else if (strcmp(action, "relay_rename") == 0) {
+        ok = handleRelayRename(doc);
     } else if (strcmp(action, "sys_info_req") == 0) {
         sendSysInfo();
         sendCmdAck(action, true);

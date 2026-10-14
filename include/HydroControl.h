@@ -223,6 +223,11 @@ public:
     bool isPhValidForTelemetry() const;
     bool isEcValidForTelemetry() const;
     bool isTempValidForTelemetry() const;
+    /** Δ = lectura ahora − referencia al abrir la ventana de 24 h. */
+    bool hasConsumoEc24hDelta() const { return consumoEc24hDeltaValid_; }
+    float consumoEc24hDelta() const { return consumoEc24hDelta_; }
+    bool hasConsumoPh24hDelta() const { return consumoPh24hDeltaValid_; }
+    float consumoPh24hDelta() const { return consumoPh24hDelta_; }
     /** ms desde última lectura válida; ULONG_MAX si nunca hubo. */
     unsigned long getEcValidAgeMs() const;
     unsigned long getPhValidAgeMs() const;
@@ -470,6 +475,8 @@ private:
     unsigned long consumoEc24hStartMs;
     bool consumoEc24hHungerPending;
     bool consumoEc24hDilutePending;
+    float consumoEc24hDelta_;
+    bool consumoEc24hDeltaValid_;
     unsigned long lastECCheckAtMs;
     float ecAtLastSequenceStart;
     float ecSetpointAtLastSequence;
@@ -517,6 +524,8 @@ private:
     float consumoPh24hT0;
     unsigned long consumoPh24hStartMs;
     bool consumoPh24hForcePending;
+    float consumoPh24hDelta_;
+    bool consumoPh24hDeltaValid_;
     enum PhAutoState { PH_IDLE, PH_DOSING, PH_PULSE_GAP, PH_RECIRCULATING };
     PhAutoState phAutoState;
     unsigned long phStateStartMs;

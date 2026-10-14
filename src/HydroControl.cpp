@@ -58,6 +58,8 @@ HydroControl::HydroControl()
     consumoEc24hStartMs = 0;
     consumoEc24hHungerPending = false;
     consumoEc24hDilutePending = false;
+    consumoEc24hDelta_ = NAN;
+    consumoEc24hDeltaValid_ = false;
     ecAtLastSequenceStart = 0.0f;
     ecSetpointAtLastSequence = 0.0f;
     lastSequenceTotalMl = 0.0f;
@@ -99,6 +101,8 @@ HydroControl::HydroControl()
     consumoPh24hT0 = 0.0f;
     consumoPh24hStartMs = 0;
     consumoPh24hForcePending = false;
+    consumoPh24hDelta_ = NAN;
+    consumoPh24hDeltaValid_ = false;
     phAutoState = PH_IDLE;
     phStateStartMs = 0;
     phActiveRelay = -1;
@@ -2184,6 +2188,8 @@ void HydroControl::tickConsumoEcWindow() {
         return;
     }
     const float deltaEc = consumoEc24hT0 - ec;
+    consumoEc24hDelta_ = ec - consumoEc24hT0;
+    consumoEc24hDeltaValid_ = isfinite(consumoEc24hDelta_);
     Serial.printf("📅 [CONSUMO EC 24h] fim janela Δ=%.0f (t0=%.0f now=%.0f)\n",
                   deltaEc, consumoEc24hT0, ec);
     if (deltaEc > ecTolerance) {
@@ -2211,6 +2217,8 @@ void HydroControl::tickConsumoPhWindow() {
         return;
     }
     const float deltaPh = pH - consumoPh24hT0;
+    consumoPh24hDelta_ = deltaPh;
+    consumoPh24hDeltaValid_ = isfinite(consumoPh24hDelta_);
     Serial.printf("📅 [CONSUMO pH 24h] fim janela Δ=%.2f (t0=%.2f now=%.2f)\n",
                   deltaPh, consumoPh24hT0, pH);
     if (fabsf(deltaPh) > phTolerance) {

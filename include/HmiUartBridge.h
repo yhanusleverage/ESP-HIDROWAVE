@@ -25,6 +25,17 @@ public:
         MqttClientWrapper* mqtt = nullptr;
         bool (*cloudOkFn)() = nullptr;
         String (*deviceIdFn)() = nullptr;
+        /** Activa o desactiva una regla del DecisionEngine y avisa a la web. */
+        bool (*applyRuleSetFn)(const char* ruleId, bool enabled) = nullptr;
+        /** Borra una regla del DecisionEngine y avisa a la web. */
+        bool (*applyRuleDeleteFn)(const char* ruleId) = nullptr;
+        /** Crea una regla corta (nombre, relé Atlas, nivel) y avisa a la web. */
+        /** id vacío crea una regla nueva. Con id, actualiza esa regla. */
+        bool (*applyRuleCreateFn)(const char* name, const char* mac, int relay,
+                                  const char* until, int relay2, const char* until2,
+                                  const char* id) = nullptr;
+        /** Guarda el nombre Atlas en el catálogo y lo publica a la web. */
+        bool (*applyRelayRenameFn)(const char* mac, int relay, const char* name) = nullptr;
     };
 
     void attach(const Context& ctx);
@@ -43,6 +54,8 @@ public:
     void publishPlantCfg();
     /** Un bit confirmado por RELAY-ACK. No reconstruye t:slaves. */
     void notifyRelayState(const uint8_t mac[6], int relay, bool on);
+    /** Empuja el catálogo de nombres de relé al HMI. */
+    void pushRelayCatalog();
 
 private:
     static const size_t kJsonCapacity = 1536;
@@ -83,6 +96,12 @@ private:
     bool handlePumpFlowCalib(JsonDocument& doc);
     bool handleMasterReboot();
     bool handleFactoryReset();
+    bool handleRuleState(JsonDocument& doc);
+    bool handleRuleSet(JsonDocument& doc);
+    bool handleRuleDelete(JsonDocument& doc);
+    bool handleRuleCreate(JsonDocument& doc);
+    bool handleRelayRename(JsonDocument& doc);
+    void sendRulesList();
     void syncPumpFlowToCloud(int target);
     void scheduleRestart(unsigned long delayMs);
     /** true si MAC+relay está lastreado a regra enabled o ciclo Auto. */

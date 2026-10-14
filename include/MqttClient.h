@@ -228,6 +228,14 @@ public:
     /** hidrowave/{id}/procedure_finished — fin de procedimiento ScriptRunner */
     bool publishProcedureFinished(const MqttProcedureFinishedReading& reading);
     bool publishRelayState(const MqttRelayStateReading& reading);
+    /** hidrowave/{id}/hmi_rule_set — el bridge actualiza decision_rules.enabled */
+    bool publishHmiRuleSet(const char* ruleId, bool enabled);
+    /** hidrowave/{id}/hmi_rule_set op=delete */
+    bool publishHmiRuleDelete(const char* ruleId);
+    /** hidrowave/{id}/hmi_rule_set op=create. json ya serializado. */
+    bool publishHmiRuleJson(const char* json);
+    /** hidrowave/{id}/hmi_rule_set op=relay_name. El bridge escribe relay_slaves.relay_names. */
+    bool publishHmiRelayName(const char* mac, int relay, const char* name);
 
     void setIncomingHandler(MqttIncomingHandler handler, void* userData);
 
@@ -307,6 +315,9 @@ public:
     bool publishRuleExecuted(const MqttRuleExecutedReading&) { return false; }
     bool publishProcedureFinished(const MqttProcedureFinishedReading&) { return false; }
     bool publishRelayState(const MqttRelayStateReading&) { return false; }
+    bool publishHmiRuleSet(const char*, bool) { return false; }
+    bool publishHmiRuleDelete(const char*) { return false; }
+    bool publishHmiRuleJson(const char*) { return false; }
     void setIncomingHandler(MqttIncomingHandler, void*) {}
 };
 

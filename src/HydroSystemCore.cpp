@@ -27,6 +27,7 @@
 #include "MasterSlaveManager.h" // ✅ Para integración ESP-NOW
 #include "ScriptRunner.h"
 #include "TankProcedureFsm.h"
+#include "RelayNameCatalog.h"
 #include <math.h>
 #include <cstdio>
 // ✅ NÃO incluir ESPNowTypes.h aqui - master relays são LOCAIS, não ESP-NOW
@@ -163,6 +164,326 @@ bool HydroSystemCore::hmiCloudOkStatic() {
 
 String HydroSystemCore::hmiDeviceIdStatic() {
     return getDeviceID();
+}
+
+bool HydroSystemCore::hmiApplyRuleSetStatic(const char* ruleId, bool enabled) {
+    return hmiBridgeInstance ? hmiBridgeInstance->applyHmiRuleSet(ruleId, enabled) : false;
+}
+
+bool HydroSystemCore::hmiApplyRuleDeleteStatic(const char* ruleId) {
+    return hmiBridgeInstance ? hmiBridgeInstance->applyHmiRuleDelete(ruleId) : false;
+}
+
+bool HydroSystemCore::hmiApplyRuleCreateStatic(const char* name, const char* mac, int relay,
+                                              const char* until, int relay2, const char* until2,
+                                              const char* id) {
+    return hmiBridgeInstance
+               ? hmiBridgeInstance->applyHmiRuleCreate(name, mac, relay, until, relay2, until2, id)
+               : false;
+}
+
+bool HydroSystemCore::hmiApplyRelayRenameStatic(const char* mac, int relay, const char* name) {
+    return hmiBridgeInstance ? hmiBridgeInstance->applyHmiRelayRename(mac, relay, name) : false;
+}
+
+/** Pega el JSON guardado como objeto real. serialized() no se puede leer después. */
+static bool pasteStoredObject(JsonDocument& dest, const char* key, const String& raw) {
+    if (raw.length() == 0) {
+        return true;
+    }
+    DynamicJsonDocument part(raw.length() + 256);
+    const DeserializationError err = deserializeJson(part, raw);
+    if (err || part.capacity() == 0) {
+        Serial.printf("[REGLA] %s no parsea (%s)\n", key, err.c_str());
+        return false;
+    }
+    dest[key] = part.as<JsonVariant>();
+    return !dest.overflowed();
+}
+
+/** Carga el cuerpo guardado. 16 KB, igual que el upsert MQTT de una recarga completa. */
+static bool buildHmiRuleBody(DecisionRule& rule, DynamicJsonDocument& body) {
+    body.clear();
+    body["execution_class"] = "procedure";
+    if (!pasteStoredObject(body, "script", rule.script_json)) {
+        return false;
+    }
+    if (!pasteStoredObject(body, "fsm", rule.fsm_json)) {
+        return false;
+    }
+    if (!pasteStoredObject(body, "procedure_triggers", rule.procedure_triggers_json)) {
+        return false;
+    }
+    return !body.overflowed();
+}
+
+/** Tanque: cargar y start. Otro script: recargar el runner, que arranca en el tick. */
+static bool armHmiRuleRuntime(DecisionRule& rule) {
+    const bool looksTank =
+        rule.fsm_json.length() > 0 || rule.script_json.indexOf("water_level") >= 0;
+    const bool hasScript = rule.script_json.length() > 0;
+    if (!looksTank && !hasScript) {
+        return true;
+    }
+    if (ESP.getMaxAllocHeap() < 28000) {
+        Serial.printf("[REGLA] arm heap %u %s\n", static_cast<unsigned>(ESP.getMaxAllocHeap()),
+                      rule.id.c_str());
+        return false;
+    }
+    DynamicJsonDocument body(16384);
+    if (!buildHmiRuleBody(rule, body)) {
+        Serial.printf("[REGLA] arm overflow %s\n", rule.id.c_str());
+        return false;
+    }
+    JsonVariant triggers = body["procedure_triggers"];
+    if (looksTank) {
+        const bool loaded = TankProcedureFsmManager::instance().loadFromRuleJson(
+            rule.id, rule.priority, true, body.as<JsonObject>(), triggers);
+        if (!loaded) {
+            Serial.printf("[REGLA] arm sin pasos script=%u fsm=%u %s\n",
+                          static_cast<unsigned>(rule.script_json.length()),
+                          static_cast<unsigned>(rule.fsm_json.length()), rule.id.c_str());
+            return false;
+        }
+        ScriptRunnerManager::instance().removeByRuleId(rule.id);
+        const bool started = TankProcedureFsmManager::instance().handleCmd(rule.id, "start");
+        Serial.printf("[REGLA] arm tanque %s start=%d\n", rule.id.c_str(), started ? 1 : 0);
+        return started;
+    }
+    const bool loaded = ScriptRunnerManager::instance().loadFromRuleJson(
+        rule.id, rule.priority, body.as<JsonObject>(), triggers);
+    Serial.printf("[REGLA] arm script %s ok=%d\n", rule.id.c_str(), loaded ? 1 : 0);
+    return loaded;
+}
+
+bool HydroSystemCore::applyHmiRuleSet(const char* ruleId, bool enabled) {
+    if (!ruleId || !ruleId[0] || !decisionEngineReady) {
+        return false;
+    }
+    DecisionRule* rule = decisionEngine.getRule(String(ruleId));
+    if (!rule) {
+        Serial.printf("[REGLA] id ausente %s\n", ruleId);
+        return false;
+    }
+    if (!enabled) {
+        if (rule->enabled) {
+            releaseDecisionRuleActuators(*rule);
+        }
+        rule->enabled = false;
+        ScriptRunnerManager::instance().removeByRuleId(rule->id);
+        TankProcedureFsmManager::instance().removeByRuleId(rule->id);
+    } else {
+        rule->enabled = true;
+        const bool runnable = rule->fsm_json.length() > 0 || rule->script_json.length() > 0;
+        if (runnable && !armHmiRuleRuntime(*rule)) {
+            rule->enabled = false;
+            ScriptRunnerManager::instance().removeByRuleId(rule->id);
+            TankProcedureFsmManager::instance().removeByRuleId(rule->id);
+            decisionEngine.saveRulesToFile();
+            Serial.printf("[REGLA] activar sin motor %s\n", ruleId);
+            return false;
+        }
+    }
+    decisionEngine.saveRulesToFile();
+#if ENABLE_MQTT
+    mqttClient.publishHmiRuleSet(ruleId, enabled);
+#endif
+    return true;
+}
+
+bool HydroSystemCore::applyHmiRuleDelete(const char* ruleId) {
+    if (!ruleId || !ruleId[0] || !decisionEngineReady) {
+        return false;
+    }
+    DecisionRule* rule = decisionEngine.getRule(String(ruleId));
+    if (rule) {
+        if (rule->enabled) {
+            releaseDecisionRuleActuators(*rule);
+        }
+        ScriptRunnerManager::instance().removeByRuleId(rule->id);
+        TankProcedureFsmManager::instance().removeByRuleId(rule->id);
+    }
+    if (!decisionEngine.removeRule(String(ruleId))) {
+        Serial.printf("[REGLA] delete ausente %s\n", ruleId);
+        return false;
+    }
+    decisionEngine.saveRulesToFile();
+#if ENABLE_MQTT
+    mqttClient.publishHmiRuleDelete(ruleId);
+#endif
+    Serial.printf("[REGLA] delete %s\n", ruleId);
+    return true;
+}
+
+bool HydroSystemCore::applyHmiRuleCreate(const char* name, const char* mac, int relay,
+                                        const char* until, int relay2, const char* until2,
+                                        const char* keepId) {
+    auto levelOk = [](const char* u) {
+        return u && (strcmp(u, "vazio") == 0 || strcmp(u, "baixo") == 0 || strcmp(u, "medio") == 0 ||
+                     strcmp(u, "medio_alto") == 0 || strcmp(u, "alto") == 0);
+    };
+    const bool second = relay2 >= 0 && relay2 <= 7 && levelOk(until2);
+    if (!name || !name[0] || !mac || strlen(mac) < 11 || relay < 0 || relay > 7 || !levelOk(until) ||
+        !decisionEngineReady) {
+        return false;
+    }
+    char clean[41];
+    size_t j = 0;
+    for (size_t i = 0; name[i] && j + 1 < sizeof(clean); ++i) {
+        const char c = name[i];
+        if (c == '"' || c == '\\' || c < 32) {
+            continue;
+        }
+        clean[j++] = c;
+    }
+    clean[j] = '\0';
+    if (!clean[0]) {
+        return false;
+    }
+
+    char id[48];
+    bool enabled = false;
+    int priority = 40;
+    if (keepId && keepId[0]) {
+        size_t n = 0;
+        for (; keepId[n] && n + 1 < sizeof(id); ++n) {
+            const char c = keepId[n];
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!ok) {
+                return false;
+            }
+            id[n] = c;
+        }
+        id[n] = '\0';
+        if (n < 3) {
+            return false;
+        }
+        if (DecisionRule* prev = decisionEngine.getRule(String(id))) {
+            enabled = prev->enabled;
+            priority = prev->priority;
+        }
+    } else {
+        snprintf(id, sizeof(id), "hmi_%08lx", static_cast<unsigned long>(esp_random()));
+    }
+
+    const bool fill = strcmp(until, "alto") == 0;
+    const bool drain = strcmp(until, "vazio") == 0 || strcmp(until, "baixo") == 0;
+    const bool fill2 = second && strcmp(until2, "alto") == 0;
+    const bool drain2 = second && (strcmp(until2, "vazio") == 0 || strcmp(until2, "baixo") == 0);
+    const char* kind = "generic";
+    if (!second) {
+        kind = fill ? "fill_only" : (drain ? "drain_only" : "generic");
+    } else if ((drain && fill2) || (fill && drain2)) {
+        kind = "full_recharge";
+    }
+
+    static StaticJsonDocument<2048> doc;
+    doc.clear();
+    doc["v"] = 1;
+    doc["op"] = "create";
+    doc["device_id"] = getDeviceID();
+    doc["rule_id"] = id;
+    doc["rule_name"] = clean;
+    doc["rule_description"] = (keepId && keepId[0]) ? "Editada en el HMI" : "Creada en el HMI";
+    doc["enabled"] = enabled;
+    doc["priority"] = priority;
+    doc["trigger_type"] = "scheduled";
+
+    JsonObject ruleJson = doc.createNestedObject("rule_json");
+    ruleJson["priority"] = priority;
+    ruleJson["execution_class"] = "procedure";
+    ruleJson["procedure_kind"] = kind;
+    JsonObject script = ruleJson.createNestedObject("script");
+    script["loop_interval_ms"] = 1000;
+    script["max_iterations"] = 1;
+    JsonArray instr = script.createNestedArray("instructions");
+    JsonArray actions = ruleJson.createNestedArray("actions");
+
+    auto addStep = [&](int r, const char* u) {
+        const char* relayLabel = RelayNameCatalog::nameFor(mac, r);
+        JsonObject wh = instr.createNestedObject();
+        wh["type"] = "while";
+        JsonObject cond = wh.createNestedObject("condition");
+        cond["sensor"] = "water_level";
+        cond["operator"] = "!=";
+        cond["value"] = u;
+        JsonArray body = wh.createNestedArray("body");
+        JsonObject step = body.createNestedObject();
+        step["type"] = "relay_action";
+        step["action"] = "on";
+        step["relay_number"] = r;
+        step["target"] = "slave";
+        step["slave_mac"] = mac;
+        if (relayLabel && relayLabel[0]) {
+            step["label"] = relayLabel;
+        }
+        JsonObject action = actions.createNestedObject();
+        action["type"] = "relay_on";
+        action["target_relay"] = r;
+        action["target_device_id"] = mac;
+        action["duration_ms"] = 0;
+    };
+    addStep(relay, until);
+    if (second) {
+        addStep(relay2, until2);
+    }
+
+    if (doc.overflowed() || !decisionEngine.upsertRuleFromJson(doc.as<JsonObject>(), true)) {
+        Serial.printf("[REGLA] create fallo %s\n", clean);
+        return false;
+    }
+#if ENABLE_MQTT
+    char payload[1800];
+    const size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0 || len >= sizeof(payload)) {
+        Serial.printf("[REGLA] create local ok, MQTT overflow %s\n", id);
+    } else if (!mqttClient.publishHmiRuleJson(payload)) {
+        Serial.printf("[REGLA] create local ok, MQTT fail %s\n", id);
+    }
+#endif
+    Serial.printf("[REGLA] create %s %s R%d hasta %s\n", id, clean, relay + 1, until);
+    return true;
+}
+
+bool HydroSystemCore::applyHmiRelayRename(const char* mac, int relay, const char* name) {
+    if (!mac || strlen(mac) < 11 || relay < 0 || relay > 7 || !name) {
+        return false;
+    }
+    char clean[32];
+    size_t j = 0;
+    for (size_t i = 0; name[i] && j + 1 < sizeof(clean); ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (c < 32 || c == '"' || c == '\\') {
+            continue;
+        }
+        clean[j++] = static_cast<char>(c);
+    }
+    clean[j] = '\0';
+    size_t start = 0;
+    while (clean[start] == ' ') {
+        ++start;
+    }
+    if (start > 0) {
+        memmove(clean, clean + start, strlen(clean + start) + 1);
+    }
+    j = strlen(clean);
+    while (j > 0 && clean[j - 1] == ' ') {
+        clean[--j] = '\0';
+    }
+    RelayNameCatalog::setName(mac, relay, clean);
+#if ENABLE_MQTT
+    if (!mqttClient.publishHmiRelayName(mac, relay, clean)) {
+        Serial.printf("[NOMBRE] MQTT fail R%d\n", relay + 1);
+    }
+#endif
+#if ENABLE_HMI_UART
+    if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
+        bridge->pushRelayCatalog();
+    }
+#endif
+    Serial.printf("[NOMBRE] R%d %s\n", relay + 1, clean);
+    return true;
 }
 
 void HydroSystemCore::dumpHmiUartLinkStatus(Stream& out) const {
@@ -586,6 +907,10 @@ bool HydroSystemCore::begin() {
         hmiCtx.mqtt = &mqttClient;
         hmiCtx.cloudOkFn = &HydroSystemCore::hmiCloudOkStatic;
         hmiCtx.deviceIdFn = &HydroSystemCore::hmiDeviceIdStatic;
+        hmiCtx.applyRuleSetFn = &HydroSystemCore::hmiApplyRuleSetStatic;
+        hmiCtx.applyRuleDeleteFn = &HydroSystemCore::hmiApplyRuleDeleteStatic;
+        hmiCtx.applyRuleCreateFn = &HydroSystemCore::hmiApplyRuleCreateStatic;
+        hmiCtx.applyRelayRenameFn = &HydroSystemCore::hmiApplyRelayRenameStatic;
         hmiUartBridge.attach(hmiCtx);
         hmiUartBridge.begin();
     }
@@ -4627,6 +4952,12 @@ void HydroSystemCore::handleMqttIncoming(const char* topic, const char* payload,
         applyRulesManifestMqtt(payload, length);
         return;
     }
+    if (strstr(topic, "/rules/__relay_names") != nullptr) {
+        if (!applyRelayNamesMqtt(payload, length)) {
+            Serial.println("[MQTT] relay_names JSON inválido");
+        }
+        return;
+    }
     if (strstr(topic, "/rules/") != nullptr) {
         applyRuleUpsertMqtt(payload, length);
         return;
@@ -4730,6 +5061,19 @@ bool HydroSystemCore::applyCirculationConfigMqtt(const char* payload, size_t len
     relayCoordinator.setCirculationTarget(mac, relayIndex);
     Serial.printf("[MQTT] circ/config → binding NVS R%d (fn_* via rules upsert)\n",
                   relayIndex + 1);
+    return true;
+}
+
+bool HydroSystemCore::applyRelayNamesMqtt(const char* payload, size_t length) {
+    if (!RelayNameCatalog::applyJson(payload, length)) {
+        return false;
+    }
+    Serial.printf("[MQTT] relay_names slots=%d\n", RelayNameCatalog::slotCount());
+#if ENABLE_HMI_UART
+    if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
+        bridge->pushRelayCatalog();
+    }
+#endif
     return true;
 }
 

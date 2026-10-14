@@ -415,6 +415,7 @@ private:
     bool applyCirculationConfigMqtt(const char* payload, size_t length);
     bool upsertFnCirculationRule(const char* slaveMac, int relayIndex, bool enabled);
     bool applyRuleUpsertMqtt(const char* payload, size_t length);
+    bool applyRelayNamesMqtt(const char* payload, size_t length);
     bool applyRulesManifestMqtt(const char* payload, size_t length);
     bool applyProcedureCmdMqtt(const char* payload, size_t length);
     /** Ao desactivar regra: OFF dos relés que a regra mantinha em ON. */
@@ -432,6 +433,17 @@ private:
     bool isHmiCloudOk() const;
     static bool hmiCloudOkStatic();
     static String hmiDeviceIdStatic();
+    static bool hmiApplyRuleSetStatic(const char* ruleId, bool enabled);
+    static bool hmiApplyRuleDeleteStatic(const char* ruleId);
+    static bool hmiApplyRuleCreateStatic(const char* name, const char* mac, int relay,
+                                         const char* until, int relay2, const char* until2,
+                                         const char* id);
+    static bool hmiApplyRelayRenameStatic(const char* mac, int relay, const char* name);
+    bool applyHmiRuleSet(const char* ruleId, bool enabled);
+    bool applyHmiRuleDelete(const char* ruleId);
+    bool applyHmiRuleCreate(const char* name, const char* mac, int relay, const char* until,
+                            int relay2, const char* until2, const char* id);
+    bool applyHmiRelayRename(const char* mac, int relay, const char* name);
     static HydroSystemCore* hmiBridgeInstance;
 #endif
     

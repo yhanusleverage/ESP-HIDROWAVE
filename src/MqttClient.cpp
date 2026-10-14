@@ -965,6 +965,79 @@ bool MqttClientWrapper::publishProcedureFinished(const MqttProcedureFinishedRead
     return published;
 }
 
+bool MqttClientWrapper::publishHmiRuleSet(const char* ruleId, bool enabled) {
+    if (!mqtt.connected() || !ruleId || !ruleId[0] || deviceId.length() == 0) {
+        return false;
+    }
+    StaticJsonDocument<192> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["rule_id"] = ruleId;
+    doc["enabled"] = enabled ? 1 : 0;
+    char payload[192];
+    const size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+    const String topic = String("hidrowave/") + deviceId + "/hmi_rule_set";
+    const bool published = mqtt.publish(topic.c_str(), payload, false);
+    Serial.printf("[MQTT] hmi_rule_set %s enabled=%d %s\n",
+                  ruleId, enabled ? 1 : 0, published ? "ok" : "fail");
+    return published;
+}
+
+bool MqttClientWrapper::publishHmiRuleDelete(const char* ruleId) {
+    if (!mqtt.connected() || !ruleId || !ruleId[0] || deviceId.length() == 0) {
+        return false;
+    }
+    StaticJsonDocument<192> doc;
+    doc["v"] = 1;
+    doc["op"] = "delete";
+    doc["device_id"] = deviceId;
+    doc["rule_id"] = ruleId;
+    char payload[192];
+    const size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+    const String topic = String("hidrowave/") + deviceId + "/hmi_rule_set";
+    const bool published = mqtt.publish(topic.c_str(), payload, false);
+    Serial.printf("[MQTT] hmi_rule_set %s op=delete %s\n", ruleId, published ? "ok" : "fail");
+    return published;
+}
+
+bool MqttClientWrapper::publishHmiRelayName(const char* mac, int relay, const char* name) {
+    if (!mqtt.connected() || !mac || !mac[0] || relay < 0 || relay > 7 || deviceId.length() == 0) {
+        return false;
+    }
+    StaticJsonDocument<384> doc;
+    doc["v"] = 1;
+    doc["op"] = "relay_name";
+    doc["device_id"] = deviceId;
+    doc["mac"] = mac;
+    doc["relay"] = relay;
+    doc["name"] = name ? name : "";
+    char payload[320];
+    const size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+    const String topic = String("hidrowave/") + deviceId + "/hmi_rule_set";
+    const bool published = mqtt.publish(topic.c_str(), payload, false);
+    Serial.printf("[MQTT] hmi_rule_set relay_name R%d %s\n", relay + 1, published ? "ok" : "fail");
+    return published;
+}
+
+bool MqttClientWrapper::publishHmiRuleJson(const char* json) {
+    if (!mqtt.connected() || !json || !json[0] || deviceId.length() == 0) {
+        return false;
+    }
+    const String topic = String("hidrowave/") + deviceId + "/hmi_rule_set";
+    const bool published = mqtt.publish(topic.c_str(), json, false);
+    Serial.printf("[MQTT] hmi_rule_set op=create %s\n", published ? "ok" : "fail");
+    return published;
+}
+
 bool MqttClientWrapper::publishRelayState(const MqttRelayStateReading& reading) {
     if (!mqtt.connected()) {
         return false;

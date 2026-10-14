@@ -29,9 +29,12 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { evaluateSchedules } from './schedule-evaluator.js';
+import { publishMqttJson, publishRuleUpsertMqtt } from './schedule-mqtt-publish.js';
 
 const OWNER_EMAILS_PATH = join(dirname(fileURLToPath(import.meta.url)), 'device-owner-emails.json');
 const ownerReleaseInFlight = new Set();
+const catalogDevices = new Set();
+const catalogPublished = new Map();
 
 const DEVICE_ID_RE = /^ESP32_HIDRO_[0-9A-F]{6}$/;
 const SLAVE_MAC_RE = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
@@ -56,6 +59,7 @@ const TOPICS = [
   'hidrowave/+/rule_executed',
   'hidrowave/+/procedure_finished',
   'hidrowave/+/relay/state',
+  'hidrowave/+/hmi_rule_set',
 ];
 
 const EC_OPERATION_STATES = new Set([
@@ -1413,6 +1417,9 @@ async function handleLevels(topic, message) {
 async function handleHeartbeat(topic, message) {
   const deviceId = parseDeviceIdFromTopic(topic, 'heartbeat');
   if (!deviceId) return;
+  if (isValidDeviceId(deviceId)) {
+    catalogDevices.add(deviceId);
+  }
 
   let payload;
   try {
@@ -3035,6 +3042,216 @@ client.on('connect', () => {
   });
 });
 
+async function publishRelayCatalogs() {
+  for (const deviceId of catalogDevices) {
+    const { data, error } = await supabase
+      .from('relay_slaves')
+      .select('device_id, slave_mac_address, relay_names')
+      .eq('master_device_id', deviceId);
+    if (error) {
+      console.error(`[bridge] relay_names ${deviceId}:`, error.message);
+      continue;
+    }
+    const rows = (data || []).filter((row) =>
+      SLAVE_MAC_RE.test(String(row.slave_mac_address || ''))
+    );
+    const nameById = new Map();
+    const ids = [...new Set(rows.map((row) => row.device_id).filter(Boolean))];
+    if (ids.length > 0) {
+      const named = await supabase
+        .from('device_status')
+        .select('device_id, device_name')
+        .in('device_id', ids);
+      if (named.error) {
+        console.error(`[bridge] relay_names place ${deviceId}:`, named.error.message);
+      } else {
+        for (const row of named.data || []) {
+          nameById.set(row.device_id, typeof row.device_name === 'string' ? row.device_name : '');
+        }
+      }
+    }
+    const slaves = rows.map((row) => ({
+      mac: String(row.slave_mac_address),
+      place: nameById.get(row.device_id) || '',
+      names: Array.isArray(row.relay_names)
+        ? row.relay_names.slice(0, 8).map((name) => (typeof name === 'string' ? name : ''))
+        : [],
+    }));
+    const body = { v: 1, op: 'relay_names', device_id: deviceId, slaves };
+    const text = JSON.stringify(body);
+    const prev = catalogPublished.get(deviceId);
+    if (prev && prev.text === text && Date.now() - prev.at < 10 * 60 * 1000) {
+      continue;
+    }
+    const topic = `hidrowave/${deviceId}/rules/__relay_names`;
+    const published = await publishMqttJson(client, topic, body, { retain: true });
+    if (published.ok) {
+      catalogPublished.set(deviceId, { text, at: Date.now() });
+      const places = slaves.map((slave) => slave.place || '-').join(',');
+      console.log(`[bridge] relay_names ${deviceId} slaves=${slaves.length} place=${places}`);
+    } else {
+      console.error(`[bridge] relay_names publish ${deviceId}:`, published.error || published.skipped);
+    }
+  }
+}
+
+function macKey(mac) {
+  return String(mac || '').trim().toUpperCase();
+}
+
+async function handleHmiRelayName(deviceId, payload) {
+  const mac = macKey(payload.mac);
+  const relay = Number(payload.relay);
+  const name = String(payload.name || '')
+    .replace(/[\u0000-\u001f]/g, '')
+    .trim()
+    .slice(0, 31);
+  if (!SLAVE_MAC_RE.test(mac) || !Number.isInteger(relay) || relay < 0 || relay > 7) {
+    console.error(`[bridge] hmi_rule_set relay_name inválido ${deviceId}`);
+    return;
+  }
+  const { data, error } = await supabase
+    .from('relay_slaves')
+    .select('device_id, slave_mac_address, relay_names')
+    .eq('master_device_id', deviceId);
+  if (error) {
+    console.error(`[bridge] hmi_rule_set relay_name ${deviceId}:`, error.message);
+    return;
+  }
+  const row = (data || []).find((item) => macKey(item.slave_mac_address) === mac);
+  if (!row) {
+    console.error(`[bridge] hmi_rule_set relay_name sin slave ${mac}`);
+    return;
+  }
+  const names = Array.isArray(row.relay_names)
+    ? row.relay_names.slice(0, 8).map((item) => (typeof item === 'string' ? item : ''))
+    : [];
+  while (names.length < 8) {
+    names.push('');
+  }
+  names[relay] = name;
+  const { error: updErr } = await supabase
+    .from('relay_slaves')
+    .update({ relay_names: names, updated_at: new Date().toISOString() })
+    .eq('device_id', row.device_id);
+  if (updErr) {
+    console.error(`[bridge] hmi_rule_set relay_name ${mac} R${relay}:`, updErr.message);
+    return;
+  }
+  catalogPublished.delete(deviceId);
+  await publishRelayCatalogs();
+  console.log(`[bridge] hmi_rule_set relay_name ${deviceId} ${mac} R${relay} "${name}"`);
+}
+
+async function handleHmiRuleSet(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'hmi_rule_set');
+  if (!deviceId || !isValidDeviceId(deviceId)) {
+    return;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.error('[bridge] hmi_rule_set JSON inválido');
+    return;
+  }
+  if (String(payload.op || '') === 'relay_name') {
+    await handleHmiRelayName(deviceId, payload);
+    return;
+  }
+  const ruleId = String(payload.rule_id || '').trim();
+  if (!ruleId) {
+    return;
+  }
+  const op = String(payload.op || '').trim();
+  if (op === 'delete') {
+    const { error: delErr } = await supabase
+      .from('decision_rules')
+      .delete()
+      .eq('device_id', deviceId)
+      .eq('rule_id', ruleId);
+    if (delErr) {
+      console.error(`[bridge] hmi_rule_set delete ${ruleId}:`, delErr.message);
+      return;
+    }
+    const topicOut = `hidrowave/${deviceId}/rules/${safeMqttRuleId(ruleId)}`;
+    const published = await publishMqttJson(
+      client,
+      topicOut,
+      { v: 1, op: 'delete', device_id: deviceId, rule_id: ruleId },
+      { retain: true }
+    );
+    console.log(`[bridge] hmi_rule_set delete ${deviceId} ${ruleId} mqtt=${published.ok}`);
+    return;
+  }
+  if (op === 'create') {
+    const ruleJson = payload.rule_json;
+    if (!ruleJson || typeof ruleJson !== 'object') {
+      console.error(`[bridge] hmi_rule_set create ${ruleId}: sin rule_json`);
+      return;
+    }
+    const row = {
+      device_id: deviceId,
+      rule_id: ruleId,
+      rule_name: String(payload.rule_name || ruleId).slice(0, 80),
+      rule_description: String(payload.rule_description || 'Creada en el HMI'),
+      rule_json: ruleJson,
+      enabled: false,
+      priority: Number.isFinite(Number(payload.priority)) ? Number(payload.priority) : 40,
+      updated_at: new Date().toISOString(),
+      created_by: 'hmi',
+    };
+    const { data: existing, error: existErr } = await supabase
+      .from('decision_rules')
+      .select('rule_id')
+      .eq('device_id', deviceId)
+      .eq('rule_id', ruleId)
+      .maybeSingle();
+    if (existErr) {
+      console.error(`[bridge] hmi_rule_set create lookup ${ruleId}:`, existErr.message);
+      return;
+    }
+    const write = existing
+      ? await supabase.from('decision_rules').update(row).eq('device_id', deviceId).eq('rule_id', ruleId)
+      : await supabase.from('decision_rules').insert(row);
+    if (write.error) {
+      console.error(`[bridge] hmi_rule_set create ${ruleId}:`, write.error.message);
+      return;
+    }
+    const published = await publishRuleUpsertMqtt(client, deviceId, row);
+    console.log(`[bridge] hmi_rule_set create ${deviceId} ${ruleId} mqtt=${published.ok}`);
+    return;
+  }
+  const enabled = payload.enabled === true || payload.enabled === 1 || payload.enabled === '1';
+  const { error: updErr } = await supabase
+    .from('decision_rules')
+    .update({ enabled })
+    .eq('device_id', deviceId)
+    .eq('rule_id', ruleId);
+  if (updErr) {
+    console.error(`[bridge] hmi_rule_set update ${ruleId}:`, updErr.message);
+    return;
+  }
+  if (!enabled) {
+    await publishRuleDisableMqtt(deviceId, { rule_id: ruleId, rule_name: ruleId, priority: 50 });
+    console.log(`[bridge] hmi_rule_set disable ${deviceId} ${ruleId}`);
+    return;
+  }
+  const { data: row, error: fetchErr } = await supabase
+    .from('decision_rules')
+    .select('rule_id, rule_name, rule_description, rule_json, enabled, priority')
+    .eq('device_id', deviceId)
+    .eq('rule_id', ruleId)
+    .maybeSingle();
+  if (fetchErr || !row) {
+    console.error(`[bridge] hmi_rule_set fetch ${ruleId}:`, fetchErr?.message || 'ausente');
+    return;
+  }
+  row.enabled = true;
+  const published = await publishRuleUpsertMqtt(client, deviceId, row);
+  console.log(`[bridge] hmi_rule_set enable ${deviceId} ${ruleId} mqtt=${published.ok}`);
+}
+
 client.on('message', (topic, message, packet) => {
   if (packet && packet.retain && subscribedAt > 0 && Date.now() - subscribedAt < RETAIN_SUBSCRIBE_GRACE_MS) {
     console.log(`[bridge] ignore retained on subscribe ${topic}`);
@@ -3080,6 +3297,8 @@ client.on('message', (topic, message, packet) => {
       await handleProcedureFinished(topic, message);
     } else if (topic.endsWith('/relay/state')) {
       await handleRelayState(topic, message);
+    } else if (suffix === 'hmi_rule_set') {
+      await handleHmiRuleSet(topic, message);
     }
   };
   run().catch((e) => {
@@ -3096,6 +3315,12 @@ setInterval(() => {
     console.error('[bridge] Stale check error:', e.message);
   });
 }, Math.min(heartbeatStaleMs, 60000));
+
+setInterval(() => {
+  publishRelayCatalogs().catch((e) => {
+    console.error('[bridge] relay_names error:', e.message);
+  });
+}, 20000);
 
 // Scheduler — avalia rule_schedules a cada 60s
 setInterval(() => {

@@ -127,6 +127,15 @@ RelayDenyReason RelayCoordinator::mayExecute(
             lastDenyReason_ = RelayDenyReason::BlockedBit;
             return lastDenyReason_;
         }
+        /* Paso de regla: mientras el relé está suyo, otro dueño no lo apaga.
+         * Igual que la recirculación con su bomba. */
+        const RelayOwner held = bank->owners[target.relay];
+        const bool procedureHold =
+            held == RelayOwner::DecisionRule || held == RelayOwner::TankScriptP1;
+        if (procedureHold && turningOff && owner != held) {
+            lastDenyReason_ = RelayDenyReason::OwnerDenied;
+            return lastDenyReason_;
+        }
     }
 
     if (isCirculationTarget(target)) {
@@ -435,6 +444,16 @@ uint32_t RelayCoordinator::requestActuation(
         ok = result > 0;
     }
 
+    if (ok && bank && target.relay >= 0 && target.relay < 8) {
+        const bool procedureOwner =
+            owner == RelayOwner::DecisionRule || owner == RelayOwner::TankScriptP1;
+        if (procedureOwner && turningOn) {
+            bank->owners[target.relay] = owner;
+        } else if (turningOff && bank->owners[target.relay] == owner) {
+            bank->owners[target.relay] = RelayOwner::None;
+        }
+    }
+
     if (ok) {
         logRelayPath(owner, target.isLocal, target.relay, actionStr.c_str(), pathRuleId);
         Serial.printf("[COORD] %s %s relay %d owner=%s dur=%lus\n",
@@ -607,6 +626,12 @@ uint32_t RelayCoordinator::requestMask(RelayOwner owner, const uint8_t mac[6], u
         bank->updatedMs = millis();
         for (int i = 0; i < 8; i++) {
             if (apply & (1u << i)) {
+                const RelayOwner held = bank->owners[i];
+                const bool procedureHold =
+                    held == RelayOwner::DecisionRule || held == RelayOwner::TankScriptP1;
+                if (procedureHold && owner != held) {
+                    continue;
+                }
                 bank->owners[i] = owner;
             }
         }
