@@ -59,8 +59,8 @@ public:
 
 private:
     static const size_t kJsonCapacity = 1536;
-    static const size_t kTelemetryJsonCapacity = 384;
-    static const size_t kLastTelemetryMax = 384;
+    static const size_t kTelemetryJsonCapacity = 512;
+    static const size_t kLastTelemetryMax = 512;
 
     static HmiUartBridge* s_active_;
 

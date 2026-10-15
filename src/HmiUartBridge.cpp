@@ -16,6 +16,7 @@
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <HardwareSerial.h>
+#include <Wire.h>
 #include <cstring>
 #include <climits>
 #include <cstdio>
@@ -491,6 +492,7 @@ void HmiUartBridge::publishTelemetryNow() {
     if (hydro.hasConsumoPh24hDelta()) {
         doc["deriv_ph"] = hydro.consumoPh24hDelta();
     }
+    doc["ilock"] = hydro.getLevelInterlockModeName();
     const size_t n = serializeJson(doc, lastTelemetryJson_, sizeof(lastTelemetryJson_));
     lastTelemetryValid_ = (n > 0 && n < sizeof(lastTelemetryJson_));
     if (!lastTelemetryValid_) {
@@ -1092,6 +1094,14 @@ void HmiUartBridge::scheduleRestart(unsigned long delayMs) {
     pendingRestartAtMs_ = millis() + delayMs;
 }
 
+/** Suelta SDA/SCL antes del reinicio por software. El botón EN hace esto al cortar el chip; ESP.restart() solo no. */
+static void releaseI2cBeforeRestart() {
+    Wire.end();
+    pinMode(I2C_SDA, INPUT);
+    pinMode(I2C_SCL, INPUT);
+    delay(50);
+}
+
 bool HmiUartBridge::handleMasterReboot() {
     Serial.println("[HMI UART] master_reboot — reinicio en ~600ms");
     scheduleRestart(600);
@@ -1605,6 +1615,20 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
         ok = handleNutrientProportions(doc);
     } else if (strcmp(action, "loop_control") == 0) {
         ok = handleLoopControl(doc);
+    } else if (strcmp(action, "level_interlock") == 0) {
+        const char* mode = doc["mode"] | "";
+        if (!ctx_.hydro) {
+            ok = false;
+        } else if (strcmp(mode, "normal") == 0) {
+            ok = ctx_.hydro->setLevelInterlockMode(HydroControl::LEVEL_INTERLOCK_NORMAL);
+        } else if (strcmp(mode, "carrera") == 0) {
+            ok = ctx_.hydro->setLevelInterlockMode(HydroControl::LEVEL_INTERLOCK_CARRERA);
+        } else {
+            ok = false;
+        }
+        if (ok) {
+            publishTelemetryNow();
+        }
     } else if (strcmp(action, "setpoint") == 0) {
         ok = handleSetpoint(doc);
     } else if (strcmp(action, "relay_local") == 0) {
@@ -1621,10 +1645,13 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
     } else if (strcmp(action, "master_reboot") == 0) {
         /* Reboot inmediato tras ACK: schedule diferido fallaba si loop() tardaba
          * o si HMI reiniciaba antes de que Master volviera a llamar loop(). */
-        Serial.println("[HMI UART] master_reboot — ACK + ESP.restart() ahora");
+        Serial.println("[HMI UART] master_reboot — ACK + suelta I2C + ESP.restart()");
         sendCmdAck(action, true);
         HmiSerial.flush();
         delay(30);
+        releaseI2cBeforeRestart();
+        Serial.println("[HMI UART] I2C suelto (SDA/SCL entrada) — ESP.restart()");
+        Serial.flush();
         ESP.restart();
         return true;  // unreachable
     } else if (strcmp(action, "factory_reset") == 0) {
