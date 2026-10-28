@@ -53,6 +53,7 @@ private:
     unsigned long wifiReconnectStartedMs;
     unsigned long wifiLastAttemptMs;
     uint8_t wifiReconnectAttempts;
+    bool wifiUserOffline_;
 
 #if ENABLE_HMI_UART
     /* SoftAP: HydroSystemCore no corre — bridge liviano para wifi_config / link. */
@@ -102,6 +103,9 @@ public:
     void printESPNowStatus();
 
     void dumpWifiReconnectStatus(Stream& out) const;
+    /** true = el usuario dejó el Master sin WiFi. El cable HMI sigue. */
+    bool wifiUserOffline() const { return wifiUserOffline_; }
+    void setWifiUserOffline(bool offline);
     
 private:
     void cleanup();

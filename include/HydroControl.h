@@ -228,6 +228,23 @@ public:
     float consumoEc24hDelta() const { return consumoEc24hDelta_; }
     bool hasConsumoPh24hDelta() const { return consumoPh24hDeltaValid_; }
     float consumoPh24hDelta() const { return consumoPh24hDelta_; }
+    /** Ventana en curso: referencia (T0) y segundos desde que abrió. */
+    bool consumoEc24hOpen() const { return consumoEc24hWindowOpen; }
+    float consumoEc24hRef() const { return consumoEc24hT0; }
+    uint32_t consumoEc24hElapsedSec() const {
+        if (!consumoEc24hWindowOpen) {
+            return 0;
+        }
+        return static_cast<uint32_t>((millis() - consumoEc24hStartMs) / 1000UL);
+    }
+    bool consumoPh24hOpen() const { return consumoPh24hWindowOpen; }
+    float consumoPh24hRef() const { return consumoPh24hT0; }
+    uint32_t consumoPh24hElapsedSec() const {
+        if (!consumoPh24hWindowOpen) {
+            return 0;
+        }
+        return static_cast<uint32_t>((millis() - consumoPh24hStartMs) / 1000UL);
+    }
     /** ms desde última lectura válida; ULONG_MAX si nunca hubo. */
     unsigned long getEcValidAgeMs() const;
     unsigned long getPhValidAgeMs() const;
@@ -335,6 +352,8 @@ public:
     int getAutoPHInterval() const { return autoPHIntervalSeconds; }
     void setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
                          float mlPerUnitAcid, float mlPerUnitBase);
+    /** ml por punto de pH del vaso. acid=true es pH−. No usa litros del sistema. */
+    bool applyPhMlPerUnit(bool acid, float mlPerPh);
     void setPhAdaptiveConfig(float aggressiveness, float gainAlpha);
     float getPhAggressiveness() const { return phAggressiveness; }
     void resetPhLearnedGains();
@@ -616,9 +635,11 @@ private:
     float totalMlPerLiter;  // Soma total de mlPerLiter
     /** Caudal manual por bomba R1-R6 (relé 0-5) sem nutriente activo. ml/s */
     float pumpFlowGhostMlPerSec[6];
+    char pumpNameGhost_[6][32];
     
     void loadPumpFlowGhosts();
     void savePumpFlowGhost(int relay);
+    void parkPumpLeftRecipe(int relay, const char* name, float flowMlPerSec);
     void savePhFlowRatesToNVS();
     
     // Funções internas

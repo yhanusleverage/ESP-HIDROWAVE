@@ -152,6 +152,7 @@ HydroControl::HydroControl()
     totalMlPerLiter = 0.0;
     for (int i = 0; i < 6; i++) {
         pumpFlowGhostMlPerSec[i] = 0.0f;
+        pumpNameGhost_[i][0] = '\0';
     }
     for (int i = 0; i < 16; i++) {
         dynamicProportions[i].name = "";
@@ -1577,6 +1578,31 @@ bool HydroControl::abortAutoOperationsOnBoot() {
 
 // ✅ Atualizar proporções dinâmicas da tabela nutricional (recebido do frontend)
 void HydroControl::updateNutrientProportions(JsonArray nutrients) {
+    struct PrevPump {
+        char name[32];
+        float flow;
+        bool seen;
+    };
+    PrevPump prev[6];
+    for (int r = 0; r < 6; r++) {
+        prev[r].name[0] = '\0';
+        prev[r].flow = 0.0f;
+        prev[r].seen = false;
+    }
+    for (int i = 0; i < activeNutrientsCount; i++) {
+        if (!dynamicProportions[i].active) {
+            continue;
+        }
+        const int relay = dynamicProportions[i].relay;
+        if (relay < 0 || relay >= 6) {
+            continue;
+        }
+        prev[relay].seen = true;
+        prev[relay].flow = dynamicProportions[i].flowRate;
+        strncpy(prev[relay].name, dynamicProportions[i].name.c_str(), sizeof(prev[relay].name) - 1);
+        prev[relay].name[sizeof(prev[relay].name) - 1] = '\0';
+    }
+
     activeNutrientsCount = 0;
     totalMlPerLiter = 0.0;
 
@@ -1602,6 +1628,11 @@ void HydroControl::updateNutrientProportions(JsonArray nutrients) {
     
     if (totalMlPerLiter <= 0.0) {
         Serial.println("⚠️  Total ml/L é zero - proporções não podem ser calculadas");
+        for (int r = 0; r < 6; r++) {
+            if (prev[r].seen) {
+                parkPumpLeftRecipe(r, prev[r].name, prev[r].flow);
+            }
+        }
         saveNutrientProportions();
         return;
     }
@@ -1674,6 +1705,19 @@ void HydroControl::updateNutrientProportions(JsonArray nutrients) {
     
     Serial.printf("✅ %d nutrientes ativos configurados\n", activeNutrientsCount);
     Serial.println("   💡 Proporções serão usadas na próxima dosagem automática");
+
+    bool still[6] = {false, false, false, false, false, false};
+    for (int i = 0; i < activeNutrientsCount; i++) {
+        const int relay = dynamicProportions[i].relay;
+        if (dynamicProportions[i].active && relay >= 0 && relay < 6) {
+            still[relay] = true;
+        }
+    }
+    for (int r = 0; r < 6; r++) {
+        if (prev[r].seen && !still[r]) {
+            parkPumpLeftRecipe(r, prev[r].name, prev[r].flow);
+        }
+    }
     
     // ✅ Salvar proporções no NVS para persistência
     saveNutrientProportions();
@@ -1784,6 +1828,14 @@ void HydroControl::loadPHControllerConfig() {
     PreferencesManager::loadConfigFloat("ph_setpoint", setpoint);
     PreferencesManager::loadConfigInt("ph_autoEnabled", (int32_t&)autoEnabled);
     PreferencesManager::loadConfigInt("ph_interval", intervalSeconds);
+    float mlAcid = 0.0f;
+    float mlBase = 0.0f;
+    if (PreferencesManager::loadConfigFloat("ph_ml_acid", mlAcid) && mlAcid > 0.01f) {
+        mlPerPhUnitAcid = mlAcid;
+    }
+    if (PreferencesManager::loadConfigFloat("ph_ml_base", mlBase) && mlBase > 0.01f) {
+        mlPerPhUnitBase = mlBase;
+    }
 
     Serial.println("📊 Valores carregados do NVS (PH):");
     Serial.printf("   • ph_setpoint:       %.2f\n", setpoint);
@@ -1948,12 +2000,33 @@ float HydroControl::getFlowRateMlPerSecForRelay(int relay) const {
     return 0.0f;
 }
 
+void HydroControl::parkPumpLeftRecipe(int relay, const char* name, float flowMlPerSec) {
+    if (relay < 0 || relay >= 6) {
+        return;
+    }
+    if (name && name[0] && strncmp(name, "pump_r", 6) != 0) {
+        strncpy(pumpNameGhost_[relay], name, sizeof(pumpNameGhost_[relay]) - 1);
+        pumpNameGhost_[relay][sizeof(pumpNameGhost_[relay]) - 1] = '\0';
+        PreferencesManager::saveConfig(String("pump_name_r") + String(relay),
+                                       String(pumpNameGhost_[relay]));
+    }
+    if (flowMlPerSec > 0.01f && isfinite(flowMlPerSec)) {
+        pumpFlowGhostMlPerSec[relay] = roundf(flowMlPerSec * 1000.0f) / 1000.0f;
+        savePumpFlowGhost(relay);
+    }
+}
+
 void HydroControl::loadPumpFlowGhosts() {
     for (int r = 0; r < 6; r++) {
         const String key = "pump_flow_r" + String(r);
         float q = 0.0f;
         if (PreferencesManager::loadConfigFloat(key, q) && q > 0.01f) {
             pumpFlowGhostMlPerSec[r] = q;
+        }
+        String nm;
+        if (PreferencesManager::loadConfig(String("pump_name_r") + String(r), nm) && nm.length() > 0) {
+            strncpy(pumpNameGhost_[r], nm.c_str(), sizeof(pumpNameGhost_[r]) - 1);
+            pumpNameGhost_[r][sizeof(pumpNameGhost_[r]) - 1] = '\0';
         }
     }
     float qUp = 0.0f;
@@ -2049,17 +2122,29 @@ bool HydroControl::buildNutrientsJsonForCloud(String& out) const {
     }
 
     for (int r = 0; r < 6; r++) {
-        if (usedRelay[r] || pumpFlowGhostMlPerSec[r] <= 0.01f) {
+        if (usedRelay[r] || r == relayPhUp || r == relayPhDown) {
+            continue;
+        }
+        const bool hasName = pumpNameGhost_[r][0] != '\0' &&
+                             strncmp(pumpNameGhost_[r], "pump_r", 6) != 0;
+        const bool hasFlow = pumpFlowGhostMlPerSec[r] > 0.01f;
+        if (!hasName && !hasFlow) {
             continue;
         }
         JsonObject o = arr.createNestedObject();
-        char nm[16];
-        snprintf(nm, sizeof(nm), "pump_r%d", r + 1);
-        o["name"] = nm;
+        if (hasName) {
+            o["name"] = pumpNameGhost_[r];
+        } else {
+            char nm[16];
+            snprintf(nm, sizeof(nm), "Bomba %d", r + 1);
+            o["name"] = nm;
+        }
         o["relay"] = r;
         o["mlPerLiter"] = 0;
         o["active"] = false;
-        o["flowRate"] = roundFlowMlPerSec(pumpFlowGhostMlPerSec[r]);
+        if (hasFlow) {
+            o["flowRate"] = roundFlowMlPerSec(pumpFlowGhostMlPerSec[r]);
+        }
     }
 
     out = "";
@@ -2670,6 +2755,24 @@ void HydroControl::setAutoPHInterval(int intervalSeconds, bool saveToNVS) {
     }
 }
 
+bool HydroControl::applyPhMlPerUnit(bool acid, float mlPerPh) {
+    if (!isfinite(mlPerPh) || mlPerPh < 0.01f) {
+        return false;
+    }
+    if (acid) {
+        mlPerPhUnitAcid = mlPerPh;
+        PreferencesManager::saveConfigFloat("ph_ml_acid", mlPerPh);
+    } else {
+        mlPerPhUnitBase = mlPerPh;
+        PreferencesManager::saveConfigFloat("ph_ml_base", mlPerPh);
+    }
+    if (adaptivePhController.getValidLearningCycles() == 0) {
+        adaptivePhController.setSeedFromMlPerPhUnit(phSetpoint, mlPerPhUnitAcid, mlPerPhUnitBase);
+    }
+    Serial.printf("[PH GANHO] %s %.2f ml/pH\n", acid ? "down" : "up", mlPerPh);
+    return true;
+}
+
 void HydroControl::setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
                                      float mlPerUnitAcid, float mlPerUnitBase) {
     relayPhUp = relayUp;
@@ -2973,11 +3076,16 @@ void HydroControl::checkAutoPH() {
     }
 
     const float flow = path == PH_PATH_BASE ? flowRatePhUp : flowRatePhDown;
+    const float mlPerL = path == PH_PATH_BASE ? mlPerPhUnitBase : mlPerPhUnitAcid;
+    const float volumeL = ecController.getVolume();
     const bool commissioning = adaptivePhController.getValidLearningCycles() < 3;
     const PhDosePlan plan = adaptivePhController.planDose(
-        phSetpoint, phForControl, phTolerance, phAggressiveness, flow, commissioning);
+        phSetpoint, phForControl, phTolerance, phAggressiveness, flow, commissioning,
+        volumeL, mlPerL);
 
     if (!plan.valid) {
+        Serial.printf("💧 [AUTO PH] sem pulso: V=%.1f L  %.2f ml/L  u=%.3f ml  τ=%.2f s\n",
+                      volumeL, mlPerL, plan.doseRealMl, plan.durationSec);
         emitPhControllerMetric(true, false, path, &plan, "");
         return;
     }
@@ -2994,7 +3102,8 @@ void HydroControl::checkAutoPH() {
     Serial.printf("📊 pH Atual: %.2f\n", pH);
     Serial.printf("🎯 pH Setpoint: %.2f\n", phSetpoint);
     Serial.printf("⚡ Erro: %.2f\n", phError);
-    Serial.printf("💧 u(t) calculado: %.3f ml (domínio H, K=%.3e)\n", plan.doseRealMl, plan.kUsed);
+    Serial.printf("💧 u(t)=%.3f ml  (%.2f ml/L × %.1f L × |ΔpH| × A)\n",
+                  plan.doseRealMl, mlPerL, volumeL);
     Serial.printf("⏱️ Tempo de dosagem: %.2f segundos\n", plan.durationSec);
     Serial.printf("⏱️  Tempo de dosagem: %.1f segundos\n", plan.durationSec);
     Serial.println("================================\n");

@@ -129,7 +129,9 @@ bool MqttClientWrapper::begin(const String& id) {
     phMetricTopic = String("hidrowave/") + deviceId + "/ph_metric";
     ecGainTopic = String("hidrowave/") + deviceId + "/ec_gain";
     phGainTopic = String("hidrowave/") + deviceId + "/ph_gain";
+    autoSwitchTopic = String("hidrowave/") + deviceId + "/auto_switch";
     phFlowTopic = String("hidrowave/") + deviceId + "/ph_flow";
+    phMlTopic = String("hidrowave/") + deviceId + "/ph_ml";
     ecNutrientsTopic = String("hidrowave/") + deviceId + "/ec_nutrients";
     ecDilutionTopic = String("hidrowave/") + deviceId + "/ec_dilution";
     commandAckTopic = String("hidrowave/") + deviceId + "/command_ack";
@@ -722,6 +724,69 @@ bool MqttClientWrapper::publishEcGain(float kValue) {
         Serial.printf("[MQTT] ec_gain k_value=%.4f\n", kValue);
     } else {
         Serial.println("[MQTT] ec_gain publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishAutoSwitch(bool hasEc, bool autoEc, bool hasPh, bool autoPh) {
+    if (!mqtt.connected() || (!hasEc && !hasPh)) {
+        return false;
+    }
+
+    StaticJsonDocument<192> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    if (hasEc) {
+        doc["auto_ec"] = autoEc;
+    }
+    if (hasPh) {
+        doc["auto_ph"] = autoPh;
+    }
+
+    char payload[192];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        return false;
+    }
+
+    bool published = mqtt.publish(autoSwitchTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] auto_switch ec=%s ph=%s\n",
+                      hasEc ? (autoEc ? "1" : "0") : "-",
+                      hasPh ? (autoPh ? "1" : "0") : "-");
+    } else {
+        Serial.println("[MQTT] auto_switch publish failed");
+    }
+    return published;
+}
+
+bool MqttClientWrapper::publishPhMl(bool acid, float mlPerPh) {
+    if (!mqtt.connected() || !isfinite(mlPerPh) || mlPerPh < 0.01f) {
+        Serial.println("[MQTT] ph_ml publish failed");
+        return false;
+    }
+
+    StaticJsonDocument<160> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    if (acid) {
+        doc["ml_per_ph_unit_acid"] = mlPerPh;
+    } else {
+        doc["ml_per_ph_unit_base"] = mlPerPh;
+    }
+
+    char payload[160];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0) {
+        Serial.println("[MQTT] ph_ml publish failed");
+        return false;
+    }
+
+    bool published = mqtt.publish(phMlTopic.c_str(), payload, false);
+    if (published) {
+        Serial.printf("[MQTT] ph_ml %s=%.2f\n", acid ? "acid" : "base", mlPerPh);
+    } else {
+        Serial.println("[MQTT] ph_ml publish failed");
     }
     return published;
 }

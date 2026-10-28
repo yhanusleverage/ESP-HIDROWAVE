@@ -146,7 +146,8 @@ float AdaptivePHController::clampAggressiveness(float a) {
 
 PhDosePlan AdaptivePHController::planDose(float phSetpoint, float phMeasured, float tolerancePh,
                                          float aggressiveness, float flowRateMlPerSec,
-                                         bool commissioning) const {
+                                         bool commissioning, float volumeLiters,
+                                         float mlPerLiterPerPh) const {
     PhDosePlan plan = {};
     plan.valid = false;
 
@@ -154,13 +155,17 @@ PhDosePlan AdaptivePHController::planDose(float phSetpoint, float phMeasured, fl
     if (path == PH_PATH_NONE) return plan;
 
     const float errH = errorH(phSetpoint, phMeasured);
-    if (!isfinite(errH)) return plan;
     const float k = pickK(path);
     plan.path = path;
-    plan.errorH = errH;
+    plan.errorH = isfinite(errH) ? errH : 0.0f;
     plan.kUsed = k;
 
-    plan.doseIdealMl = fabsf(errH) / k;
+    const float dph = fabsf(phMeasured - phSetpoint);
+    if (volumeLiters > 0.01f && mlPerLiterPerPh > 0.01f && dph > tolerancePh) {
+        plan.doseIdealMl = mlPerLiterPerPh * volumeLiters * dph;
+    } else {
+        plan.doseIdealMl = 0.0f;
+    }
     float a = clampAggressiveness(aggressiveness);
     if (commissioning || validLearningCycles < COMMISSIONING_CYCLES) {
         a = fminf(a, COMMISSIONING_A);

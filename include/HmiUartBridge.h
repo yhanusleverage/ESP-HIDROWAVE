@@ -59,8 +59,8 @@ public:
 
 private:
     static const size_t kJsonCapacity = 1536;
-    static const size_t kTelemetryJsonCapacity = 512;
-    static const size_t kLastTelemetryMax = 512;
+    static const size_t kTelemetryJsonCapacity = 768;
+    static const size_t kLastTelemetryMax = 768;
 
     static HmiUartBridge* s_active_;
 
@@ -94,6 +94,7 @@ private:
     bool handleCalib(JsonDocument& doc);
     bool handleWifiConfig(JsonDocument& doc);
     bool handlePumpFlowCalib(JsonDocument& doc);
+    bool handlePhDeltaGain(JsonDocument& doc);
     bool handleMasterReboot();
     bool handleFactoryReset();
     bool handleRuleState(JsonDocument& doc);

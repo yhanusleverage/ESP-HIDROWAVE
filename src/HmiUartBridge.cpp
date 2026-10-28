@@ -2,6 +2,9 @@
 
 #if ENABLE_HMI_UART
 
+#include "HybridStateManager.h"
+extern HydroStateManager stateManager;
+
 #include "HydroControl.h"
 #include "RelayCoordinator.h"
 #include "MasterSlaveManager.h"
@@ -486,13 +489,29 @@ void HmiUartBridge::publishTelemetryNow() {
     } else     if (tempOk) {
         doc["temp_agua"] = hydro.getTemperature();
     }
+    if (hydro.consumoEc24hOpen() && isfinite(hydro.consumoEc24hRef())) {
+        doc["ec_t0"] = hydro.consumoEc24hRef();
+        doc["ec_el"] = hydro.consumoEc24hElapsedSec();
+    }
     if (hydro.hasConsumoEc24hDelta()) {
         doc["deriv_ec"] = hydro.consumoEc24hDelta();
+    }
+    if (hydro.consumoPh24hOpen() && isfinite(hydro.consumoPh24hRef())) {
+        doc["ph_t0"] = hydro.consumoPh24hRef();
+        doc["ph_el"] = hydro.consumoPh24hElapsedSec();
     }
     if (hydro.hasConsumoPh24hDelta()) {
         doc["deriv_ph"] = hydro.consumoPh24hDelta();
     }
     doc["ilock"] = hydro.getLevelInterlockModeName();
+    const char* ecOp = hydro.getEcOperationStateName();
+    const char* phOp = hydro.getPhOperationStateName();
+    const bool dosingNow =
+        (ecOp && strcmp(ecOp, "dosing") == 0) || (phOp && strcmp(phOp, "dosing") == 0);
+    doc["dosing"] = dosingNow ? 1 : 0;
+    doc["autoEc"] = hydro.isAutoECEnabled();
+    doc["autoPh"] = hydro.isAutoPHEnabled();
+    doc["wifi_off"] = stateManager.wifiUserOffline() ? 1 : 0;
     const size_t n = serializeJson(doc, lastTelemetryJson_, sizeof(lastTelemetryJson_));
     lastTelemetryValid_ = (n > 0 && n < sizeof(lastTelemetryJson_));
     if (!lastTelemetryValid_) {
@@ -740,12 +759,18 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
     if (doc.containsKey("autoPhIntervalSec")) {
         hydro.setAutoPHInterval((int)(doc["autoPhIntervalSec"] | 300), true);
     }
-    if (doc.containsKey("autoEc")) {
+    const bool pushedEc = doc.containsKey("autoEc");
+    const bool pushedPh = doc.containsKey("autoPh");
+    if (pushedEc) {
         hydro.setAutoECEnabled(doc["autoEc"] | false, false);
         ecPersist = true;
     }
-    if (doc.containsKey("autoPh")) {
+    if (pushedPh) {
         hydro.setAutoPHEnabled(doc["autoPh"] | false, true);
+    }
+    if ((pushedEc || pushedPh) && ctx_.mqtt) {
+        ctx_.mqtt->publishAutoSwitch(
+            pushedEc, hydro.isAutoECEnabled(), pushedPh, hydro.isAutoPHEnabled());
     }
     if (doc.containsKey("maxStepEc")) {
         hydro.setMaxStepEcFraction(doc["maxStepEc"] | 0.5f);
@@ -984,18 +1009,25 @@ static String activeRecipeJson(HydroControl& hydro) {
         if (!name[0] || strncmp(name, "pump_r", 6) == 0) {
             continue;
         }
-        if (!(o["active"] | false)) {
-            continue;
-        }
         const float ml = o["mlPerLiter"] | 0.0f;
-        if (ml <= 0.05f) {
+        const bool active = o["active"] | false;
+        const float q = o["flowRate"] | 0.0f;
+        if (!active || ml <= 0.05f) {
+            JsonObject p = arr.createNestedObject();
+            p["name"] = name;
+            p["relay"] = o["relay"] | 0;
+            p["mlPerLiter"] = 0;
+            p["active"] = false;
+            if (q > 0.01f) {
+                p["flowRate"] = q;
+            }
             continue;
         }
         JsonObject p = arr.createNestedObject();
         p["name"] = name;
         p["relay"] = o["relay"] | 0;
         p["mlPerLiter"] = ml;
-        const float q = o["flowRate"] | 0.0f;
+        p["active"] = true;
         if (q > 0.01f) {
             p["flowRate"] = q;
         }
@@ -1022,6 +1054,24 @@ void HmiUartBridge::syncPumpFlowToCloud(int target) {
         ctx_.hydro->getFlowRatePhDown(),
         ctx_.hydro->getRelayPhUp(),
         ctx_.hydro->getRelayPhDown());
+}
+
+bool HmiUartBridge::handlePhDeltaGain(JsonDocument& doc) {
+    if (!ctx_.hydro) {
+        return false;
+    }
+    const char* side = doc["side"] | "";
+    const float ml = doc["mlPerPh"] | 0.0f;
+    const bool acid = strcmp(side, "down") == 0;
+    const bool base = strcmp(side, "up") == 0;
+    if ((!acid && !base) || !ctx_.hydro->applyPhMlPerUnit(acid, ml)) {
+        Serial.println("[HMI UART] ph_delta_gain inválido");
+        return false;
+    }
+    if (ctx_.mqtt) {
+        ctx_.mqtt->publishPhMl(acid, ml);
+    }
+    return true;
 }
 
 bool HmiUartBridge::handleWifiConfig(JsonDocument& doc) {
@@ -1615,6 +1665,18 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
         ok = handleNutrientProportions(doc);
     } else if (strcmp(action, "loop_control") == 0) {
         ok = handleLoopControl(doc);
+    } else if (strcmp(action, "wifi_user") == 0) {
+        const char* mode = doc["mode"] | "";
+        if (strcmp(mode, "offline") == 0) {
+            stateManager.setWifiUserOffline(true);
+            ok = true;
+        } else if (strcmp(mode, "online") == 0) {
+            stateManager.setWifiUserOffline(false);
+            ok = true;
+        }
+        if (ok) {
+            publishTelemetryNow();
+        }
     } else if (strcmp(action, "level_interlock") == 0) {
         const char* mode = doc["mode"] | "";
         if (!ctx_.hydro) {
@@ -1639,6 +1701,8 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
         ok = handleCalib(doc);
     } else if (strcmp(action, "pump_flow_calib") == 0) {
         ok = handlePumpFlowCalib(doc);
+    } else if (strcmp(action, "ph_delta_gain") == 0) {
+        ok = handlePhDeltaGain(doc);
     } else if (strcmp(action, "wifi_config") == 0) {
         handleWifiConfig(doc);
         return true;

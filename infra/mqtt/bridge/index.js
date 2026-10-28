@@ -14,7 +14,9 @@
  *   hidrowave/+/ec_gain         → PATCH ec_config_view.k_value (K aprendido firmware)
  *   hidrowave/+/ec_nutrients    → PATCH ec_config_view.nutrients (receta HMI)
  *   hidrowave/+/ph_gain         → PATCH ph_config_view k_acid/k_base
+ *   hidrowave/+/auto_switch     → PATCH auto_enabled en ec_config_view / ph_config_view
  *   hidrowave/+/ph_flow         → PATCH ph_config_view caudales y relés pH
+ *   hidrowave/+/ph_ml           → PATCH ml_per_ph_unit_acid / ml_per_ph_unit_base
  *   hidrowave/+/command_ack     → RPC complete_relay_command
  *   hidrowave/+/rule_executed   → INSERT relay_commands (DE local espejo)
  *   hidrowave/+/procedure_finished → INSERT procedure_events (Complete/Aborted)
@@ -53,7 +55,9 @@ const TOPICS = [
   'hidrowave/+/ec_gain',
   'hidrowave/+/ec_nutrients',
   'hidrowave/+/ph_gain',
+  'hidrowave/+/auto_switch',
   'hidrowave/+/ph_flow',
+  'hidrowave/+/ph_ml',
   'hidrowave/+/ec_dilution',
   'hidrowave/+/command_ack',
   'hidrowave/+/rule_executed',
@@ -1716,7 +1720,12 @@ function validateEcNutrients(deviceId, payload) {
     if (!Number.isFinite(mlPerLiter) || mlPerLiter < 0) {
       return { ok: false, reason: 'mlPerLiter must be finite number >= 0' };
     }
-    const row = { name: item.name, relay, mlPerLiter };
+    const row = {
+      name: item.name,
+      relay,
+      mlPerLiter,
+      active: item.active !== false && mlPerLiter > 0,
+    };
     if (item.flowRate !== undefined && item.flowRate !== null) {
       const flowRate = Number(item.flowRate);
       if (!Number.isFinite(flowRate) || flowRate <= 0) {
@@ -1845,6 +1854,148 @@ function validatePhGain(deviceId, payload) {
     ok: true,
     row: { deviceId, k_acid: kAcid, k_base: kBase },
   };
+}
+
+function validateAutoSwitch(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const row = { deviceId };
+  if (Object.prototype.hasOwnProperty.call(payload, 'auto_ec')) {
+    if (typeof payload.auto_ec !== 'boolean') {
+      return { ok: false, reason: 'auto_ec must be boolean' };
+    }
+    row.auto_ec = payload.auto_ec;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'auto_ph')) {
+    if (typeof payload.auto_ph !== 'boolean') {
+      return { ok: false, reason: 'auto_ph must be boolean' };
+    }
+    row.auto_ph = payload.auto_ph;
+  }
+  if (row.auto_ec === undefined && row.auto_ph === undefined) {
+    return { ok: false, reason: 'auto_ec or auto_ph required' };
+  }
+  return { ok: true, row };
+}
+
+async function patchAutoSwitch(row) {
+  const nowIso = new Date().toISOString();
+  if (row.auto_ec !== undefined) {
+    const { error } = await supabase
+      .from('ec_config_view')
+      .update({ auto_enabled: row.auto_ec, updated_at: nowIso })
+      .eq('device_id', row.deviceId);
+    if (error) {
+      console.error(`[bridge] auto_switch EC PATCH failed (${row.deviceId}):`, error.message);
+      return false;
+    }
+    console.log(`[bridge] auto_switch EC ${row.deviceId} auto_enabled=${row.auto_ec}`);
+  }
+  if (row.auto_ph !== undefined) {
+    const { error } = await supabase
+      .from('ph_config_view')
+      .update({ auto_enabled: row.auto_ph, updated_at: nowIso })
+      .eq('device_id', row.deviceId);
+    if (error) {
+      console.error(`[bridge] auto_switch pH PATCH failed (${row.deviceId}):`, error.message);
+      return false;
+    }
+    console.log(`[bridge] auto_switch pH ${row.deviceId} auto_enabled=${row.auto_ph}`);
+  }
+  return true;
+}
+
+function validatePhMl(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const row = { deviceId };
+  if (Object.prototype.hasOwnProperty.call(payload, 'ml_per_ph_unit_acid')) {
+    const n = Number(payload.ml_per_ph_unit_acid);
+    if (!Number.isFinite(n) || n <= 0) {
+      return { ok: false, reason: 'ml_per_ph_unit_acid must be a number > 0' };
+    }
+    row.ml_per_ph_unit_acid = n;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'ml_per_ph_unit_base')) {
+    const n = Number(payload.ml_per_ph_unit_base);
+    if (!Number.isFinite(n) || n <= 0) {
+      return { ok: false, reason: 'ml_per_ph_unit_base must be a number > 0' };
+    }
+    row.ml_per_ph_unit_base = n;
+  }
+  if (row.ml_per_ph_unit_acid === undefined && row.ml_per_ph_unit_base === undefined) {
+    return { ok: false, reason: 'ml_per_ph_unit_acid or ml_per_ph_unit_base required' };
+  }
+  return { ok: true, row };
+}
+
+async function patchPhMl(row) {
+  const nowIso = new Date().toISOString();
+  const patch = { updated_at: nowIso };
+  if (row.ml_per_ph_unit_acid !== undefined) patch.ml_per_ph_unit_acid = row.ml_per_ph_unit_acid;
+  if (row.ml_per_ph_unit_base !== undefined) patch.ml_per_ph_unit_base = row.ml_per_ph_unit_base;
+  const { error } = await supabase
+    .from('ph_config_view')
+    .update(patch)
+    .eq('device_id', row.deviceId);
+  if (error) {
+    console.error(`[bridge] ph_ml PATCH failed (${row.deviceId}):`, error.message);
+    return false;
+  }
+  console.log(
+    `[bridge] ph_ml ${row.deviceId} acid=${row.ml_per_ph_unit_acid ?? '-'} base=${row.ml_per_ph_unit_base ?? '-'}`
+  );
+  return true;
+}
+
+async function handlePhMl(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'ph_ml');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validatePhMl(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await patchPhMl(validated.row);
+}
+
+async function handleAutoSwitch(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'auto_switch');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateAutoSwitch(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  await patchAutoSwitch(validated.row);
 }
 
 async function patchEcConfigGain(row) {
@@ -3285,8 +3436,12 @@ client.on('message', (topic, message, packet) => {
       await handleEcNutrients(topic, message);
     } else if (suffix === 'ph_gain') {
       await handlePhGain(topic, message);
+    } else if (suffix === 'auto_switch') {
+      await handleAutoSwitch(topic, message);
     } else if (suffix === 'ph_flow') {
       await handlePhFlow(topic, message);
+    } else if (suffix === 'ph_ml') {
+      await handlePhMl(topic, message);
     } else if (suffix === 'ec_dilution') {
       await handleEcDilution(topic, message);
     } else if (suffix === 'command_ack') {

@@ -4,11 +4,8 @@
 #include <Arduino.h>
 
 /**
- * Controlador adaptativo de pH em domínio H = 10^(-pH).
- * Convenção: ErroH = Hmedido - Hsetpoint
- *   ErroH > 0 → pH baixo → base (pH+)
- *   ErroH < 0 → pH alto  → ácido (pH-)
- * DoseIdeal = |ErroH| / K ; DoseReal = A × DoseIdeal
+ * Caminho da bomba: u(t) = A × (ml por litro e por ponto) × litros × |pH − SP|.
+ * ErroH segue só no diagnóstico. ErroH > 0 → base; ErroH < 0 → ácido.
  */
 enum PhCorrectionPath {
     PH_PATH_NONE = 0,
@@ -50,7 +47,9 @@ public:
 
     PhDosePlan planDose(float phSetpoint, float phMeasured, float tolerancePh,
                         float aggressiveness, float flowRateMlPerSec,
-                        bool commissioning = false) const;
+                        bool commissioning = false,
+                        float volumeLiters = 0.0f,
+                        float mlPerLiterPerPh = 0.0f) const;
 
     bool updateGainAfterDose(PhCorrectionPath path, float hBefore, float hAfter,
                              float mlApplied, float alpha,

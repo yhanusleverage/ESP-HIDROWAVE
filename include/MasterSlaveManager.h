@@ -665,6 +665,7 @@ private:
 
     uint8_t lastEspNowSendMac_[6];
     unsigned long lastEspNowSendAt_;
+    bool peerRefreshBusy_ = false;
 
     void logSlaveLink(const char* event, const uint8_t* mac, long lastSeenDeltaMs = -1);
     bool hasInFlightForMac(const uint8_t* mac) const;

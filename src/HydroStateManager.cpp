@@ -23,7 +23,8 @@ HydroStateManager::HydroStateManager() :
     wifiReconnectPhase(WIFI_RECONNECT_IDLE),
     wifiReconnectStartedMs(0),
     wifiLastAttemptMs(0),
-    wifiReconnectAttempts(0)
+    wifiReconnectAttempts(0),
+    wifiUserOffline_(false)
 #if ENABLE_HMI_UART
     , hmiConfigBridgeActive(false)
 #endif
@@ -71,6 +72,7 @@ void HydroStateManager::begin() {
     }
     
     Serial.println("✅ Namespace 'hydro_system' aberto com sucesso");
+    wifiUserOffline_ = preferences.getBool("wifi_user_off", false);
     
     // ===== VERIFICAÇÃO DETALHADA DAS CREDENCIAIS =====
     Serial.println("\n📋 === VERIFICAÇÃO DE CREDENCIAIS ===");
@@ -100,7 +102,13 @@ void HydroStateManager::begin() {
     Serial.println("🎯 hasWiFiCredentials(): " + String(hasCredentials ? "true" : "false"));
     
     // Decidir estado inicial baseado nas credenciais WiFi
-    if (hasCredentials) {
+    if (wifiUserOffline_) {
+        Serial.println("[WiFi] arranque fuera de linea — sin buscar red");
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(false);
+        WiFi.disconnect(false);
+        switchToHydroActive();
+    } else if (hasCredentials) {
         Serial.println("\n✅ === CREDENCIAIS ENCONTRADAS ===");
         Serial.println("📝 Tentando conectar à rede: " + ssid);
         
@@ -280,11 +288,14 @@ void HydroStateManager::switchToHydroActive() {
     stateStartTime = millis();
     resetWifiReconnectState();
     
-    // Verificar conexão WiFi
-    if (!WiFi.isConnected()) {
+    // Verificar conexão WiFi. Fuera de línea el tanque arranca igual, solo por HMI.
+    if (!WiFi.isConnected() && !wifiUserOffline_) {
         Serial.println("❌ WiFi não conectado - Não é possível ativar modo hidropônico");
         switchToWiFiConfig();
         return;
+    }
+    if (wifiUserOffline_) {
+        Serial.println("[WiFi] hidro local, sin red");
     }
     
     // ✅ CORREÇÃO: Usar injeção de dependências em vez de extern (anti-patrón)
@@ -591,7 +602,37 @@ void HydroStateManager::startWifiReconnectAttempt(unsigned long now) {
                   ssid.c_str());
 }
 
+void HydroStateManager::setWifiUserOffline(bool offline) {
+    wifiUserOffline_ = offline;
+    preferences.putBool("wifi_user_off", offline);
+    if (offline) {
+        WiFi.setAutoReconnect(false);
+        if (WiFi.isConnected()) {
+            WiFi.disconnect(false);
+        }
+        resetWifiReconnectState();
+        Serial.println("[WiFi] usuario fuera de linea");
+        return;
+    }
+    WiFi.setAutoReconnect(true);
+    resetWifiReconnectState();
+    Serial.println("[WiFi] usuario en linea");
+    if (currentState == HYDRO_ACTIVE_MODE && !WiFi.isConnected() && hasWiFiCredentials()) {
+        startWifiReconnectAttempt(millis());
+    }
+}
+
 void HydroStateManager::handleWifiReconnectRuntime(unsigned long now) {
+    if (wifiUserOffline_) {
+        if (WiFi.isConnected()) {
+            WiFi.setAutoReconnect(false);
+            WiFi.disconnect(false);
+        }
+        if (wifiReconnectPhase != WIFI_RECONNECT_IDLE) {
+            resetWifiReconnectState();
+        }
+        return;
+    }
     if (WiFi.isConnected()) {
         if (wifiReconnectPhase != WIFI_RECONNECT_IDLE) {
             WiFi.setSleep(WIFI_PS_NONE);

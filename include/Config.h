@@ -390,7 +390,8 @@
 
 // Auto pH: 1 = prototipo (relaja guards G4/G5/G9-G11/G14); 0 = producción
 #ifndef PH_PROTOTYPE_RELAX_GUARDS
-#define PH_PROTOTYPE_RELAX_GUARDS 1
+#define PH_PROTOTYPE_RELAX_GUARDS 0
+
 #endif
 
 // Banco/dev: 1 = sin interlocks por sensor (métricas + telemetría parcial); 0 = producción

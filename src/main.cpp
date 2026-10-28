@@ -2706,9 +2706,13 @@ void setup() {
     Serial.println("⏳ Aguarde 5 segundos...");
     
     // ✅ PATRÓN MASTER-TASK: Enviar 3 broadcasts espaçados para garantir descoberta
+    int discoverySent = 0;
     for (int i = 0; i < 3; i++) {
-        master.sendDiscoveryBroadcast();  // ✅ Directo como MASTER-TASK
-        Serial.printf("   Broadcast %d/3 enviado\n", i + 1);
+        const bool sent = master.sendDiscoveryBroadcast();
+        if (sent) {
+            discoverySent++;
+        }
+        Serial.printf("   Broadcast %d/3 %s\n", i + 1, sent ? "enviado" : "fallo");
         delay(1500); // 1.5s entre broadcasts
         master.update(); // Processar respostas imediatas
         if (masterManager) {
@@ -2717,10 +2721,12 @@ void setup() {
     }
     
     Serial.println();
-    Serial.println("✅ Discovery inicial concluído");
-    Serial.println("📋 Slaves descobertos: " + String(masterManager->getTrustedSlaveCount()));
+    Serial.printf("✅ Discovery inicial: %d/3 envios reales\n", discoverySent);
+    const int onlineSlaves = masterManager->getOnlineSlaveCount();
+    const int trustedSlaves = masterManager->getTrustedSlaveCount();
+    Serial.printf("📋 En radio: %d / guardados: %d\n", onlineSlaves, trustedSlaves);
     
-    if (masterManager->getTrustedSlaveCount() > 0) {
+    if (onlineSlaves > 0) {
         Serial.println();
         Serial.println("╔════════════════════════════════════════════════════╗");
         Serial.println("║   🎉 SLAVES ENCONTRADOS                            ║");

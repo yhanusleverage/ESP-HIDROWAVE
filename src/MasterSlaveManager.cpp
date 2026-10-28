@@ -489,6 +489,16 @@ void MasterSlaveManager::refreshEspNowPeersOnCurrentChannel() {
         return;
     }
 
+    static portMUX_TYPE refreshMux = portMUX_INITIALIZER_UNLOCKED;
+    portENTER_CRITICAL(&refreshMux);
+    if (peerRefreshBusy_) {
+        portEXIT_CRITICAL(&refreshMux);
+        Serial.println("⚠️ Refresh peers omitido (ya en curso)");
+        return;
+    }
+    peerRefreshBusy_ = true;
+    portEXIT_CRITICAL(&refreshMux);
+
     // STA down (provisioning ch11): WiFi.channel() inválido — usar radio actual
     uint8_t channel = 0;
     wifi_second_chan_t secondChan;
@@ -498,6 +508,7 @@ void MasterSlaveManager::refreshEspNowPeersOnCurrentChannel() {
     }
     if (channel < 1 || channel > 13) {
         Serial.println("⚠️ Refresh peers: canal rádio inválido");
+        peerRefreshBusy_ = false;
         return;
     }
 
@@ -516,6 +527,7 @@ void MasterSlaveManager::refreshEspNowPeersOnCurrentChannel() {
     if (channel != ESPNOW_CONFIG_CHANNEL) {
         saveEspNowLastChannel(channel);
     }
+    peerRefreshBusy_ = false;
 }
 
 void MasterSlaveManager::saveEspNowLastChannel(uint8_t channel) {
@@ -723,7 +735,7 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
         addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, false,
                         cycleOffDuration, commandMode);
         Serial.println("⏸️ [PROV] comando enfileirado (STA suspend CONFIG)");
-        return commandId;
+        return 0;
     }
     if (EspNowChannelPolicy::isProvisioningWindowActive() &&
         !ESPNowController::hasWifiCredentialsAckLatched()) {
@@ -732,7 +744,7 @@ uint32_t MasterSlaveManager::sendRelayCommandToSlave(const uint8_t* macAddress, 
         addToRetryQueue(macAddress, relayNumber, action, duration, commandId, supabaseCommandId, false,
                         cycleOffDuration, commandMode);
         Serial.println("⏸️ [PROV] comando enfileirado (aguardando creds-ack/op)");
-        return commandId;
+        return 0;
     }
     
     TrustedSlave* slave = nullptr;

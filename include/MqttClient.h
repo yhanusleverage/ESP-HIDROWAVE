@@ -219,9 +219,13 @@ public:
     bool publishEcNutrients(const char* nutrientsJson);
     /** hidrowave/{id}/ph_gain — bridge → PATCH ph_config_view k_acid/k_base */
     bool publishPhGain(float kAcid, float kBase);
+    /** hidrowave/{id}/auto_switch — bridge → PATCH auto_enabled en ec/ph config. */
+    bool publishAutoSwitch(bool hasEc, bool autoEc, bool hasPh, bool autoPh);
     /** hidrowave/{id}/ph_flow — bridge → PATCH ph_config_view caudales y relés. ml/s, relé desde 0. -1 = sin bomba. */
     bool publishPhFlow(float flowUp, float flowDown, int relayUp, int relayDown,
                        int release0 = -1, int release1 = -1);
+    /** hidrowave/{id}/ph_ml — bridge → PATCH ml_per_ph_unit_acid o _base. ml por punto, sin litros. */
+    bool publishPhMl(bool acid, float mlPerPh);
     bool publishCommandAck(const MqttCommandAckReading& reading);
     /** hidrowave/{id}/rule_executed — espejo historial DE local (fire-and-forget) */
     bool publishRuleExecuted(const MqttRuleExecutedReading& reading);
@@ -263,7 +267,9 @@ private:
     String phMetricTopic;
     String ecGainTopic;
     String phGainTopic;
+    String autoSwitchTopic;
     String phFlowTopic;
+    String phMlTopic;
     String ecNutrientsTopic;
     String ecDilutionTopic;
     String commandAckTopic;
@@ -310,7 +316,9 @@ public:
     bool publishEcGain(float) { return false; }
     bool publishEcNutrients(const char*) { return false; }
     bool publishPhGain(float, float) { return false; }
+    bool publishAutoSwitch(bool, bool, bool, bool) { return false; }
     bool publishPhFlow(float, float, int, int, int = -1, int = -1) { return false; }
+    bool publishPhMl(bool, float) { return false; }
     bool publishCommandAck(const MqttCommandAckReading&) { return false; }
     bool publishRuleExecuted(const MqttRuleExecutedReading&) { return false; }
     bool publishProcedureFinished(const MqttProcedureFinishedReading&) { return false; }

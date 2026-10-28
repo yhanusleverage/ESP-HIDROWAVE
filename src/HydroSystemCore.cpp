@@ -2173,7 +2173,8 @@ void HydroSystemCore::updateStatusLedFromWifi() {
     const int previousWifi = lastWifiLedState;
     lastWifiLedState = st;
     if (st == WL_CONNECTED) {
-        if (previousWifi != -1 && previousWifi != WL_CONNECTED && masterManager) {
+        if (previousWifi != -1 && previousWifi != WL_CONNECTED && masterManager &&
+            !EspNowChannelPolicy::isProvisioningStaSuspendActive()) {
             masterManager->refreshEspNowPeersOnCurrentChannel();
             masterManager->saveEspNowLastChannel(WiFi.channel());
         }

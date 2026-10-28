@@ -509,12 +509,12 @@ bool ESPNowController::sendDiscoveryBroadcast() {
     message.timestamp = millis();
     message.dataSize = 0;
     message.checksum = calculateChecksum(message);
-    sendMessage(message, broadcastMac);
+    const bool broadcastOk = sendMessage(message, broadcastMac);
 
 #ifdef MASTER_MODE
-    return sendDeviceInfo(nullptr, "MasterController", 8, true, millis(), ESP.getFreeHeap());
+    return broadcastOk && sendDeviceInfo(nullptr, "MasterController", 8, true, millis(), ESP.getFreeHeap());
 #else
-    return sendDeviceInfo(broadcastMac, "RelayBox", 8, true, millis(), ESP.getFreeHeap());
+    return broadcastOk && sendDeviceInfo(broadcastMac, "RelayBox", 8, true, millis(), ESP.getFreeHeap());
 #endif
 }
 
