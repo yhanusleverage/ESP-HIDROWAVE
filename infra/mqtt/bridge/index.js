@@ -15,6 +15,7 @@
  *   hidrowave/+/ec_nutrients    → PATCH ec_config_view.nutrients (receta HMI)
  *   hidrowave/+/ph_gain         → PATCH ph_config_view k_acid/k_base
  *   hidrowave/+/auto_switch     → PATCH auto_enabled en ec_config_view / ph_config_view
+ *   hidrowave/+/hmi_loop        → PATCH Auto EC/pH (agresividad, consumo 24 h, banda, volumen)
  *   hidrowave/+/ph_flow         → PATCH ph_config_view caudales y relés pH
  *   hidrowave/+/ph_ml           → PATCH ml_per_ph_unit_acid / ml_per_ph_unit_base
  *   hidrowave/+/command_ack     → RPC complete_relay_command
@@ -56,6 +57,7 @@ const TOPICS = [
   'hidrowave/+/ec_nutrients',
   'hidrowave/+/ph_gain',
   'hidrowave/+/auto_switch',
+  'hidrowave/+/hmi_loop',
   'hidrowave/+/ph_flow',
   'hidrowave/+/ph_ml',
   'hidrowave/+/ec_dilution',
@@ -1998,6 +2000,243 @@ async function handleAutoSwitch(topic, message) {
   await patchAutoSwitch(validated.row);
 }
 
+function finiteOrUndef(value) {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function clampOrUndef(value, min, max) {
+  const n = finiteOrUndef(value);
+  if (n === undefined) return undefined;
+  return Math.min(max, Math.max(min, n));
+}
+
+function positiveIntOrUndef(value, max) {
+  const n = finiteOrUndef(value);
+  if (n === undefined) return undefined;
+  const i = Math.floor(n);
+  if (i < 1) return undefined;
+  return Math.min(max, i);
+}
+
+function boolOrUndef(value) {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+/** Relé 0..7, null si el HMI no tiene bomba, undefined si el campo no vino. */
+function hmiRelayOrSkip(payload, key) {
+  if (!Object.prototype.hasOwnProperty.call(payload, key)) return undefined;
+  const value = payload[key];
+  if (value === null) return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > 7) return undefined;
+  return n;
+}
+
+function validateHmiLoop(deviceId, payload) {
+  if (!isValidDeviceId(deviceId)) {
+    return { ok: false, reason: 'invalid device_id format' };
+  }
+  const idCheck = checkDeviceIdMatch(deviceId, payload);
+  if (!idCheck.ok) return idCheck;
+
+  const ec = {};
+  const ph = {};
+  const volume = clampOrUndef(payload.volume, 0.1, 100000);
+  if (volume !== undefined) {
+    ec.volume = volume;
+    ph.volume = volume;
+  }
+  const tempo = positiveIntOrUndef(payload.tempo_recirculacao, 86400);
+  if (tempo !== undefined) {
+    ec.tempo_recirculacao = tempo;
+    ph.tempo_recirculacao = tempo;
+  }
+  const pulseMl = clampOrUndef(payload.pulse_ml, 0.05, 50);
+  if (pulseMl !== undefined) {
+    ec.pulse_ml = pulseMl;
+    ph.pulse_ml = pulseMl;
+  }
+  const pulseGap = clampOrUndef(payload.pulse_gap_sec, 0, 120);
+  if (pulseGap !== undefined) {
+    ec.pulse_gap_sec = pulseGap;
+    ph.pulse_gap_sec = pulseGap;
+  }
+  const ivEc = positiveIntOrUndef(payload.intervalo_auto_ec, 86400);
+  if (ivEc !== undefined) ec.intervalo_auto_ec = ivEc;
+  const ivPh = positiveIntOrUndef(payload.intervalo_auto_ph, 86400);
+  if (ivPh !== undefined) ph.intervalo_auto_ph = ivPh;
+  const aEc = clampOrUndef(payload.aggressiveness_ec, 0.05, 1);
+  if (aEc !== undefined) ec.aggressiveness = aEc;
+  const aPh = clampOrUndef(payload.aggressiveness_ph, 0.05, 1);
+  if (aPh !== undefined) ph.aggressiveness = aPh;
+  const consEc = boolOrUndef(payload.consumo_ec_24h);
+  if (consEc !== undefined) ec.consumo_24h = consEc;
+  const consPh = boolOrUndef(payload.consumo_ph_24h);
+  if (consPh !== undefined) ph.consumo_24h = consPh;
+  const ecSp = clampOrUndef(payload.ec_setpoint, 0, 20000);
+  if (ecSp !== undefined) ec.ec_setpoint = ecSp;
+  const ecTol = clampOrUndef(payload.tolerance, 1, 5000);
+  if (ecTol !== undefined) ec.tolerance = ecTol;
+  const phSp = clampOrUndef(payload.ph_setpoint, 0, 14);
+  if (phSp !== undefined) ph.ph_setpoint = phSp;
+  const phTol = clampOrUndef(payload.ph_tolerance, 0.01, 2);
+  if (phTol !== undefined) ph.ph_tolerance = phTol;
+  const autoEc = boolOrUndef(payload.auto_ec);
+  if (autoEc !== undefined) ec.auto_enabled = autoEc;
+  const autoPh = boolOrUndef(payload.auto_ph);
+  if (autoPh !== undefined) ph.auto_enabled = autoPh;
+
+  const relayUp = hmiRelayOrSkip(payload, 'relay_ph_up');
+  const relayDown = hmiRelayOrSkip(payload, 'relay_ph_down');
+  if (relayUp !== undefined && relayDown !== undefined && relayUp !== relayDown) {
+    ph.relay_ph_up = relayUp;
+    ph.relay_ph_down = relayDown;
+  }
+
+  if (Object.keys(ec).length === 0 && Object.keys(ph).length === 0) {
+    return { ok: false, reason: 'no writable fields' };
+  }
+  return { ok: true, row: { deviceId, ec, ph } };
+}
+
+async function patchHmiLoop(row) {
+  const nowIso = new Date().toISOString();
+  const jobs = [];
+  if (Object.keys(row.ec).length > 0) {
+    jobs.push(
+      supabase
+        .from('ec_config_view')
+        .update({ ...row.ec, updated_at: nowIso })
+        .eq('device_id', row.deviceId)
+        .then(({ error }) => {
+          if (error) {
+            console.error(`[bridge] hmi_loop EC PATCH failed (${row.deviceId}):`, error.message);
+            return false;
+          }
+          return true;
+        })
+    );
+  }
+  if (Object.keys(row.ph).length > 0) {
+    jobs.push(
+      supabase
+        .from('ph_config_view')
+        .update({ ...row.ph, updated_at: nowIso })
+        .eq('device_id', row.deviceId)
+        .then(({ error }) => {
+          if (error) {
+            console.error(`[bridge] hmi_loop pH PATCH failed (${row.deviceId}):`, error.message);
+            return false;
+          }
+          return true;
+        })
+    );
+  }
+  const results = await Promise.all(jobs);
+  const ok = results.every(Boolean);
+  if (ok) {
+    console.log(
+      `[bridge] hmi_loop ${row.deviceId} ecA=${row.ec.aggressiveness ?? '-'} phA=${row.ph.aggressiveness ?? '-'} consEc=${row.ec.consumo_24h ?? '-'} consPh=${row.ph.consumo_24h ?? '-'}`
+    );
+  }
+  return ok;
+}
+
+const EC_RETAIN_KEYS = [
+  'base_dose',
+  'volume',
+  'total_ml',
+  'kp',
+  'ec_setpoint',
+  'tolerance',
+  'auto_enabled',
+  'intervalo_auto_ec',
+  'tempo_recirculacao',
+  'dilution_auto_enabled',
+  'dilution_drain_relay',
+  'dilution_fill_relay',
+  'dilution_drain_slave_mac',
+  'dilution_fill_slave_mac',
+  'dilution_max_volume_l',
+  'flowmeter_pulses_per_liter',
+  'dilution_fill_flow_lps',
+  'aggressiveness',
+  'consumo_24h',
+  'pulse_ml',
+  'pulse_gap_sec',
+];
+
+const PH_RETAIN_KEYS = [
+  'ph_setpoint',
+  'ph_tolerance',
+  'flow_rate_ph_up',
+  'flow_rate_ph_down',
+  'volume',
+  'ml_per_ph_unit',
+  'ml_per_ph_unit_acid',
+  'ml_per_ph_unit_base',
+  'relay_ph_up',
+  'relay_ph_down',
+  'auto_enabled',
+  'intervalo_auto_ph',
+  'tempo_recirculacao',
+  'aggressiveness',
+  'consumo_24h',
+  'pulse_ml',
+  'pulse_gap_sec',
+  'gain_alpha',
+];
+
+/** La fila ya parcheada vuelve al MQTT retenido. Al reconectar, el Master lee la misma verdad. */
+async function republishRetainedConfig(deviceId, kind) {
+  const table = kind === 'ec' ? 'ec_config_view' : 'ph_config_view';
+  const keys = kind === 'ec' ? EC_RETAIN_KEYS : PH_RETAIN_KEYS;
+  const { data, error } = await supabase
+    .from(table)
+    .select('*')
+    .eq('device_id', deviceId)
+    .maybeSingle();
+  if (error || !data) {
+    console.error(
+      `[bridge] hmi_loop retain fetch ${kind} ${deviceId}:`,
+      error?.message || 'ausente'
+    );
+    return;
+  }
+  const body = { v: 1, device_id: deviceId };
+  for (const key of keys) {
+    if (data[key] !== undefined) body[key] = data[key];
+  }
+  const topic = `hidrowave/${deviceId}/${kind}/config`;
+  const published = await publishMqttJson(client, topic, body, { retain: true });
+  console.log(`[bridge] hmi_loop retain ${kind} ${deviceId} ok=${published.ok}`);
+}
+
+async function handleHmiLoop(topic, message) {
+  const deviceId = parseDeviceIdFromTopic(topic, 'hmi_loop');
+  if (!deviceId) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(message.toString());
+  } catch {
+    console.warn(`[bridge] Invalid JSON on ${topic}`);
+    return;
+  }
+
+  const validated = validateHmiLoop(deviceId, payload);
+  if (!validated.ok) {
+    console.warn(`[bridge] Rejected ${topic}: ${validated.reason}`);
+    return;
+  }
+
+  const patched = await patchHmiLoop(validated.row);
+  if (!patched) return;
+  await republishRetainedConfig(validated.row.deviceId, 'ec');
+  await republishRetainedConfig(validated.row.deviceId, 'ph');
+}
+
 async function patchEcConfigGain(row) {
   const nowIso = new Date().toISOString();
   const { error } = await supabase
@@ -3438,6 +3677,8 @@ client.on('message', (topic, message, packet) => {
       await handlePhGain(topic, message);
     } else if (suffix === 'auto_switch') {
       await handleAutoSwitch(topic, message);
+    } else if (suffix === 'hmi_loop') {
+      await handleHmiLoop(topic, message);
     } else if (suffix === 'ph_flow') {
       await handlePhFlow(topic, message);
     } else if (suffix === 'ph_ml') {

@@ -760,6 +760,65 @@ bool MqttClientWrapper::publishAutoSwitch(bool hasEc, bool autoEc, bool hasPh, b
     return published;
 }
 
+bool MqttClientWrapper::publishHmiLoop(const MqttHmiLoopReading& reading) {
+    if (!mqtt.connected() || deviceId.length() == 0) {
+        return false;
+    }
+
+    StaticJsonDocument<768> doc;
+    doc["v"] = 1;
+    doc["device_id"] = deviceId;
+    doc["volume"] = reading.volume;
+    doc["tempo_recirculacao"] = (uint32_t)reading.tempoRecirculacaoSec;
+    doc["pulse_ml"] = reading.pulseMl;
+    doc["pulse_gap_sec"] = reading.pulseGapSec;
+    doc["intervalo_auto_ec"] = reading.intervaloAutoEc;
+    doc["intervalo_auto_ph"] = reading.intervaloAutoPh;
+    doc["aggressiveness_ec"] = reading.aggressivenessEc;
+    doc["aggressiveness_ph"] = reading.aggressivenessPh;
+    doc["consumo_ec_24h"] = reading.consumoEc24h;
+    doc["consumo_ph_24h"] = reading.consumoPh24h;
+    doc["ec_setpoint"] = reading.ecSetpoint;
+    doc["tolerance"] = reading.ecTolerance;
+    doc["ph_setpoint"] = reading.phSetpoint;
+    doc["ph_tolerance"] = reading.phTolerance;
+    if (reading.relayPhUp >= 0 && reading.relayPhUp <= 7) {
+        doc["relay_ph_up"] = reading.relayPhUp;
+    }
+    if (reading.relayPhDown >= 0 && reading.relayPhDown <= 7) {
+        doc["relay_ph_down"] = reading.relayPhDown;
+    }
+    if (reading.hasAutoEc) {
+        doc["auto_ec"] = reading.autoEc;
+    }
+    if (reading.hasAutoPh) {
+        doc["auto_ph"] = reading.autoPh;
+    }
+
+    char payload[768];
+    const size_t len = serializeJson(doc, payload, sizeof(payload));
+    if (len == 0 || len >= sizeof(payload)) {
+        Serial.println("[MQTT] hmi_loop publish failed");
+        return false;
+    }
+
+    const String topic = String("hidrowave/") + deviceId + "/hmi_loop";
+    const bool published = mqtt.publish(topic.c_str(), payload, false);
+    if (published) {
+        Serial.printf(
+            "[MQTT] hmi_loop Aec=%.2f Aph=%.2f consEc=%d consPh=%d sp=%.0f/%.2f\n",
+            reading.aggressivenessEc,
+            reading.aggressivenessPh,
+            reading.consumoEc24h ? 1 : 0,
+            reading.consumoPh24h ? 1 : 0,
+            reading.ecSetpoint,
+            reading.phSetpoint);
+    } else {
+        Serial.println("[MQTT] hmi_loop publish failed");
+    }
+    return published;
+}
+
 bool MqttClientWrapper::publishPhMl(bool acid, float mlPerPh) {
     if (!mqtt.connected() || !isfinite(mlPerPh) || mlPerPh < 0.01f) {
         Serial.println("[MQTT] ph_ml publish failed");

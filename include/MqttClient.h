@@ -171,6 +171,30 @@ struct MqttCommandAckReading {
     uint32_t espnowId;
 };
 
+/** hidrowave/{id}/hmi_loop — bridge → PATCH ec_config_view y ph_config_view. */
+struct MqttHmiLoopReading {
+    float volume;
+    unsigned long tempoRecirculacaoSec;
+    float pulseMl;
+    float pulseGapSec;
+    int intervaloAutoEc;
+    int intervaloAutoPh;
+    float aggressivenessEc;
+    float aggressivenessPh;
+    bool consumoEc24h;
+    bool consumoPh24h;
+    float ecSetpoint;
+    float ecTolerance;
+    float phSetpoint;
+    float phTolerance;
+    int relayPhUp;
+    int relayPhDown;
+    bool hasAutoEc;
+    bool autoEc;
+    bool hasAutoPh;
+    bool autoPh;
+};
+
 /** hidrowave/{id}/relay/state — doc mqtt/04 §3.4 */
 struct MqttRelayStateReading {
     const bool* masterStates;
@@ -221,6 +245,8 @@ public:
     bool publishPhGain(float kAcid, float kBase);
     /** hidrowave/{id}/auto_switch — bridge → PATCH auto_enabled en ec/ph config. */
     bool publishAutoSwitch(bool hasEc, bool autoEc, bool hasPh, bool autoPh);
+    /** hidrowave/{id}/hmi_loop — bridge → PATCH la config que la web muestra en Auto EC/pH. */
+    bool publishHmiLoop(const MqttHmiLoopReading& reading);
     /** hidrowave/{id}/ph_flow — bridge → PATCH ph_config_view caudales y relés. ml/s, relé desde 0. -1 = sin bomba. */
     bool publishPhFlow(float flowUp, float flowDown, int relayUp, int relayDown,
                        int release0 = -1, int release1 = -1);
@@ -317,6 +343,7 @@ public:
     bool publishEcNutrients(const char*) { return false; }
     bool publishPhGain(float, float) { return false; }
     bool publishAutoSwitch(bool, bool, bool, bool) { return false; }
+    bool publishHmiLoop(const MqttHmiLoopReading&) { return false; }
     bool publishPhFlow(float, float, int, int, int = -1, int = -1) { return false; }
     bool publishPhMl(bool, float) { return false; }
     bool publishCommandAck(const MqttCommandAckReading&) { return false; }

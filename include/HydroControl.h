@@ -261,6 +261,9 @@ public:
     float getECTolerance() const { return ecTolerance; }
     void setAutoECEnabled(bool enabled, bool saveToNVS = true);  // ✅ saveToNVS: false para evitar guardar múltiples veces
     bool isAutoECEnabled() const { return autoECEnabled; }
+    /** Último candado. INACTIVO frena Auto EC y Auto pH sin borrar sus interruptores. */
+    void setDosingArmed(bool armed);
+    bool isDosingArmed() const { return dosingArmed_; }
     void setAutoECInterval(int intervalSeconds, bool saveToNVS = true);
     int getAutoECInterval() const { return autoECIntervalSeconds; }
     void setMaxStepEcFraction(float fraction);
@@ -283,6 +286,10 @@ public:
     void setEcMetricCallback(EcMetricCallback cb, void* userData);
     void setPhMetricCallback(PhMetricCallback cb, void* userData);
 
+    /** ml reales de la dosis en curso: u(t) × agresividad, ya repartidos en la receta. */
+    float activeEcDoseMl() const { return lastSequenceTotalMl; }
+    /** ml reales de la dosis pH en curso: ideal × agresividad. */
+    float activePhDoseMl() const { return phCycleMlApplied; }
     /** Estado operacional Auto EC para UI (relay_master.ec_operation_*). */
     const char* getEcOperationStateName() const;
     int getEcOperationRemainingSec() const;
@@ -392,6 +399,8 @@ public:
     void executeWebDosage(JsonArray distribution, int intervalo);
     bool isDosageActive() const { return (currentState != IDLE); }
     void cancelCurrentDosage();
+    /** Emergencia: corta EC y pH ya, sin guardar K, y deja el candado INACTIVO. */
+    void emergencyStopMesh();
     bool abortAutoOperationsOnBoot();
     
     // ✅ Proporções Dinâmicas da Tabela Nutricional
@@ -474,6 +483,7 @@ private:
     float ecSetpoint;
     float ecTolerance;
     bool autoECEnabled;
+    bool dosingArmed_ = false;
     /** Desactivar Auto EC: terminar secuencia proporcional + recirc antes de parar. */
     bool autoECGracefulStopPending;
     unsigned long lastECCheck;

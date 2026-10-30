@@ -40,6 +40,7 @@ HydroControl::HydroControl()
     ecSetpoint = 0.0;
     ecTolerance = 50.0f;
     autoECEnabled = false;
+    dosingArmed_ = false;
     autoECGracefulStopPending = false;
     lastECCheck = 0;
     lastECCheckAtMs = 0;
@@ -363,6 +364,11 @@ bool HydroControl::begin() {
     loadNutrientProportions();
     loadPumpFlowGhosts();
     loadPHControllerConfig();
+    int32_t armedNvs = 0;
+    if (PreferencesManager::loadConfigInt("dosing_armed", armedNvs)) {
+        dosingArmed_ = armedNvs != 0;
+    }
+    Serial.printf("[ARM] candado %s\n", dosingArmed_ ? "ACTIVO" : "INACTIVO");
     adaptivePhController.loadFromNVS();
     if (adaptivePhController.getValidLearningCycles() == 0) {
         adaptivePhController.setSeedFromMlPerPhUnit(phSetpoint, mlPerPhUnitAcid, mlPerPhUnitBase);
@@ -1031,6 +1037,9 @@ void HydroControl::checkAutoEC() {
     if (!autoECEnabled) {
         return;
     }
+    if (!dosingArmed_) {
+        return;
+    }
 
     {
         static unsigned long lastDebugPrint = 0;
@@ -1268,6 +1277,22 @@ void HydroControl::advanceAfterEcNutrientComplete(unsigned long now) {
         Serial.printf("⏳ Aguardando %ds antes do próximo nutriente...\n", intervalSeconds);
         showMessage("Aguardando...");
         notifyEcOperationChanged();
+    }
+}
+
+void HydroControl::setDosingArmed(bool armed) {
+    if (dosingArmed_ == armed) {
+        return;
+    }
+    dosingArmed_ = armed;
+    PreferencesManager::saveConfigInt("dosing_armed", armed ? 1 : 0);
+    const bool doseBusy = currentState != IDLE || dilutionState != DILUTION_IDLE ||
+                          phAutoState != PH_IDLE;
+    Serial.printf("[ARM] candado %s — Auto EC/pH %s\n",
+                  armed ? "ACTIVO" : "INACTIVO",
+                  armed ? "autorizados" : "sin ciclo nuevo");
+    if (!armed && doseBusy) {
+        Serial.println("[ARM] INACTIVO — la dosis en curso termina y guarda el K");
     }
 }
 
@@ -1550,6 +1575,26 @@ void HydroControl::cancelCurrentDosage() {
     }
 }
 
+void HydroControl::emergencyStopMesh() {
+    Serial.println("[URG] parada de malla");
+    cancelCurrentDosage();
+    if (phAutoState != PH_IDLE) {
+        if (phActiveRelay >= 0 && phActiveRelay < 8) {
+            writeLocalPumpPin(phActiveRelay, false);
+        }
+        if (phAutoState == PH_RECIRCULATING) {
+            notifyPhysicalRecirc(false, "ph");
+        }
+        phAutoState = PH_IDLE;
+        phActiveRelay = -1;
+        phActivePath = PH_PATH_NONE;
+        phPulseRemainingMl = 0.0f;
+        notifyPhOperationChanged();
+        Serial.println("[URG] pH cortado — sin guardar K");
+    }
+    setDosingArmed(false);
+}
+
 bool HydroControl::abortAutoOperationsOnBoot() {
     EcPhBootSnapshot snapshot = {};
     bool hadSnapshot = StatePersistenceManager::loadEcPhBootSnapshot(snapshot);
@@ -1790,6 +1835,19 @@ void HydroControl::loadECControllerConfig() {
     if (intervalSeconds > 0) autoECIntervalSeconds = intervalSeconds;
     if (tempoRecircSec > 0) tempoRecirculacaoSeconds = (unsigned long)tempoRecircSec;
 
+    float maxStep = 0.5f;
+    if (PreferencesManager::loadConfigFloat("ec_maxStep", maxStep)) {
+        if (maxStep < 0.05f) maxStep = 0.05f;
+        if (maxStep > 1.0f) maxStep = 1.0f;
+        ecAggressiveness = maxStep;
+        Serial.printf("   • maxStep:          %.2f\n", ecAggressiveness);
+    }
+    int32_t consEc = 0;
+    if (PreferencesManager::loadConfigInt("ec_cons24", consEc)) {
+        consumoEc24hEnabled = consEc != 0;
+        Serial.printf("   • consumo_24h:      %s\n", consumoEc24hEnabled ? "true" : "false");
+    }
+
     int32_t dilAuto = 0;
     int32_t drainRelay = DILUTION_DRAIN_RELAY_DEFAULT;
     int32_t fillRelay = DILUTION_FILL_RELAY_DEFAULT;
@@ -1845,6 +1903,19 @@ void HydroControl::loadPHControllerConfig() {
     if (setpoint > 0.0f) phSetpoint = setpoint;
     autoPHEnabled = autoEnabled;
     if (intervalSeconds > 0) autoPHIntervalSeconds = (int)intervalSeconds;
+
+    float maxStepPh = 0.5f;
+    if (PreferencesManager::loadConfigFloat("ph_maxStep", maxStepPh)) {
+        if (maxStepPh < 0.05f) maxStepPh = 0.05f;
+        if (maxStepPh > 1.0f) maxStepPh = 1.0f;
+        phAggressiveness = maxStepPh;
+        Serial.printf("   • maxStep:          %.2f\n", phAggressiveness);
+    }
+    int32_t consPh = 0;
+    if (PreferencesManager::loadConfigInt("ph_cons24", consPh)) {
+        consumoPh24hEnabled = consPh != 0;
+        Serial.printf("   • consumo_24h:      %s\n", consumoPh24hEnabled ? "true" : "false");
+    }
 
     Serial.println("✅ PH_CONFIG carregado e aplicado com sucesso");
     Serial.println("╚════════════════════════════════════════════════════╝\n");
@@ -2203,7 +2274,12 @@ static float clampEcAggressiveness(float fraction) {
 }
 
 void HydroControl::setMaxStepEcFraction(float fraction) {
-    ecAggressiveness = clampEcAggressiveness(fraction);
+    const float next = clampEcAggressiveness(fraction);
+    if (fabsf(next - ecAggressiveness) < 0.0001f) {
+        return;
+    }
+    ecAggressiveness = next;
+    PreferencesManager::saveConfigFloat("ec_maxStep", ecAggressiveness);
 }
 
 void HydroControl::setEcPulseDosing(float pulseMl, float pulseGapSec) {
@@ -2226,6 +2302,9 @@ void HydroControl::setPhPulseDosing(float pulseMl, float pulseGapSec) {
 }
 
 void HydroControl::setConsumoEc24hEnabled(bool enabled) {
+    if (consumoEc24hEnabled == enabled) {
+        return;
+    }
     if (enabled && !consumoEc24hEnabled) {
         consumoEc24hT0 = ec;
         consumoEc24hStartMs = millis();
@@ -2241,9 +2320,13 @@ void HydroControl::setConsumoEc24hEnabled(bool enabled) {
         Serial.println("📅 [CONSUMO EC 24h] OFF");
     }
     consumoEc24hEnabled = enabled;
+    PreferencesManager::saveConfigInt("ec_cons24", enabled ? 1 : 0);
 }
 
 void HydroControl::setConsumoPh24hEnabled(bool enabled) {
+    if (consumoPh24hEnabled == enabled) {
+        return;
+    }
     if (enabled && !consumoPh24hEnabled) {
         consumoPh24hT0 = pH;
         consumoPh24hStartMs = millis();
@@ -2257,6 +2340,7 @@ void HydroControl::setConsumoPh24hEnabled(bool enabled) {
         Serial.println("📅 [CONSUMO pH 24h] OFF");
     }
     consumoPh24hEnabled = enabled;
+    PreferencesManager::saveConfigInt("ph_cons24", enabled ? 1 : 0);
 }
 
 void HydroControl::tickConsumoEcWindow() {
@@ -2787,8 +2871,12 @@ void HydroControl::setPhPumpConfig(int relayUp, int relayDown, float flowUp, flo
 }
 
 void HydroControl::setPhAdaptiveConfig(float aggressiveness, float gainAlpha) {
-    phAggressiveness = aggressiveness >= 0.05f ? aggressiveness : 0.5f;
-    if (phAggressiveness > 1.0f) phAggressiveness = 1.0f;
+    float next = aggressiveness >= 0.05f ? aggressiveness : 0.5f;
+    if (next > 1.0f) next = 1.0f;
+    if (fabsf(next - phAggressiveness) >= 0.0001f) {
+        phAggressiveness = next;
+        PreferencesManager::saveConfigFloat("ph_maxStep", phAggressiveness);
+    }
     phGainAlpha = gainAlpha >= 0.05f ? gainAlpha : 0.2f;
     if (phGainAlpha > 0.5f) phGainAlpha = 0.5f;
 }
@@ -3005,6 +3093,9 @@ void HydroControl::processPhAutoState() {
 
 void HydroControl::checkAutoPH() {
     if (!autoPHEnabled) {
+        return;
+    }
+    if (!dosingArmed_) {
         return;
     }
     if (phAutoState != PH_IDLE) return;

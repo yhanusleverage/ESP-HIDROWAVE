@@ -4757,14 +4757,15 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
         Serial.printf("ℹ️ [EC CONFIG] inalterada via=%s — NVS não reescrito\n", via ? via : "?");
         return true;
     }
-    Serial.printf("[EC CONFIG] apply via=%s auto=%s sp=%.0f iv=%d pulse=%.1f/%.1fs maxStep=%.2f\n",
+    Serial.printf("[EC CONFIG] apply via=%s auto=%s sp=%.0f iv=%d pulse=%.1f/%.1fs A=%.2f cons=%d\n",
                   via ? via : "?",
                   config.auto_enabled ? "SIM" : "NAO",
                   config.ec_setpoint,
                   config.intervalo_auto_ec,
                   (float)config.pulse_ml,
                   (float)config.pulse_gap_sec,
-                  (float)config.aggressiveness);
+                  (float)config.aggressiveness,
+                  config.consumo_24h ? 1 : 0);
     hydroControl.getECController().setBaseDose(config.base_dose);
     hydroControl.getECController().setVolume(config.volume);
     hydroControl.getECController().setTotalMl(config.total_ml);
@@ -4870,6 +4871,7 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
 #if ENABLE_HMI_UART
     if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
         bridge->publishPlantCfg();
+        bridge->publishLoopCfg();
     }
 #endif
     return true;
@@ -4879,8 +4881,12 @@ bool HydroSystemCore::applyPHConfig(const PHConfig& config, const char* via) {
     if (!config.isValid) {
         return false;
     }
-    Serial.printf("[PH CONFIG] apply via=%s auto=%s sp=%.2f\n",
-                  via ? via : "?", config.auto_enabled ? "SIM" : "NAO", config.ph_setpoint);
+    Serial.printf("[PH CONFIG] apply via=%s auto=%s sp=%.2f A=%.2f cons=%d\n",
+                  via ? via : "?",
+                  config.auto_enabled ? "SIM" : "NAO",
+                  config.ph_setpoint,
+                  (float)config.aggressiveness,
+                  config.consumo_24h ? 1 : 0);
     hydroControl.setPHSetpoint((float)config.ph_setpoint, false);
     hydroControl.setPHTolerance((float)config.ph_tolerance);
     hydroControl.setPhPumpConfig(
@@ -4902,6 +4908,7 @@ bool HydroSystemCore::applyPHConfig(const PHConfig& config, const char* via) {
 #if ENABLE_HMI_UART
     if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
         bridge->publishPlantCfg();
+        bridge->publishLoopCfg();
     }
 #endif
     return true;

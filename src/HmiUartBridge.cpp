@@ -506,9 +506,21 @@ void HmiUartBridge::publishTelemetryNow() {
     doc["ilock"] = hydro.getLevelInterlockModeName();
     const char* ecOp = hydro.getEcOperationStateName();
     const char* phOp = hydro.getPhOperationStateName();
-    const bool dosingNow =
-        (ecOp && strcmp(ecOp, "dosing") == 0) || (phOp && strcmp(phOp, "dosing") == 0);
-    doc["dosing"] = dosingNow ? 1 : 0;
+    const bool ecDosing = ecOp && strcmp(ecOp, "dosing") == 0;
+    const bool phDosing = phOp && strcmp(phOp, "dosing") == 0;
+    const bool ecHomo = ecOp && strcmp(ecOp, "recirculating") == 0;
+    const bool phHomo = phOp && strcmp(phOp, "recirculating") == 0;
+    doc["dosing"] = (ecDosing || phDosing) ? 1 : 0;
+    doc["dosing_ec"] = ecDosing ? 1 : 0;
+    doc["dosing_ph"] = phDosing ? 1 : 0;
+    doc["homo_ec"] = ecHomo ? 1 : 0;
+    doc["homo_ph"] = phHomo ? 1 : 0;
+    if (ecDosing && hydro.activeEcDoseMl() > 0.05f) {
+        doc["dose_ml_ec"] = hydro.activeEcDoseMl();
+    }
+    if (phDosing && hydro.activePhDoseMl() > 0.05f) {
+        doc["dose_ml_ph"] = hydro.activePhDoseMl();
+    }
     doc["autoEc"] = hydro.isAutoECEnabled();
     doc["autoPh"] = hydro.isAutoPHEnabled();
     doc["wifi_off"] = stateManager.wifiUserOffline() ? 1 : 0;
@@ -574,6 +586,45 @@ void HmiUartBridge::publishPlantCfg() {
     }
     emitJson(doc);
     Serial.printf("[HMI PLANT] pumps=%d\n", n);
+}
+
+void HmiUartBridge::publishLoopCfg() {
+    if (!ready_ || !ctx_.hydro) {
+        return;
+    }
+    HydroControl& hydro = *ctx_.hydro;
+    StaticJsonDocument<768> doc;
+    doc["t"] = "loop_cfg";
+    doc["maxStepEc"] = hydro.getMaxStepEcFraction();
+    doc["maxStepPh"] = hydro.getPhAggressiveness();
+    doc["consumoDiario"] = hydro.isConsumoEc24hEnabled();
+    doc["consumoPh24h"] = hydro.isConsumoPh24hEnabled();
+    doc["autoEcIntervalSec"] = hydro.getAutoECInterval();
+    doc["autoPhIntervalSec"] = hydro.getAutoPHInterval();
+    doc["volumeL"] = hydro.getECController().getVolume();
+    doc["homoSec"] = (uint32_t)hydro.getTempoRecirculacaoSeconds();
+    doc["pulseMl"] = hydro.getEcPulseMl();
+    doc["pulseGapSec"] = hydro.getEcPulseGapSec();
+    doc["autoEc"] = hydro.isAutoECEnabled();
+    doc["autoPh"] = hydro.isAutoPHEnabled();
+    const float ecSp = hydro.getECSetpoint();
+    const float ecTol = hydro.getECTolerance();
+    if (ecSp > 0.0f && ecTol > 0.0f) {
+        doc["ecLo"] = ecSp - ecTol;
+        doc["ecHi"] = ecSp + ecTol;
+    }
+    const float phSp = hydro.getPHSetpoint();
+    const float phTol = hydro.getPHTolerance();
+    if (phSp > 0.0f && phTol > 0.0f) {
+        doc["phLo"] = phSp - phTol;
+        doc["phHi"] = phSp + phTol;
+    }
+    Serial.printf("[HMI UART] loop_cfg Aec=%.2f Aph=%.2f cons=%d/%d\n",
+                  hydro.getMaxStepEcFraction(),
+                  hydro.getPhAggressiveness(),
+                  hydro.isConsumoEc24hEnabled() ? 1 : 0,
+                  hydro.isConsumoPh24hEnabled() ? 1 : 0);
+    emitJson(doc);
 }
 
 void HmiUartBridge::publishConfigHeartbeat() {
@@ -665,11 +716,14 @@ bool HmiUartBridge::applyDeadbandFromLimits(HydroControl& hydro, float lo, float
                       isEc ? "EC" : "pH", lo, hi);
         return false;
     }
+    const float mid = (lo + hi) * 0.5f;
     if (isEc) {
         const float tol = max(1.0f, (hi - lo) / 2.0f);
+        hydro.setECSetpoint(mid, false);
         hydro.setECTolerance(tol, false);
     } else {
         const float tol = max(0.01f, (hi - lo) / 2.0f);
+        hydro.setPHSetpoint(mid, true);
         hydro.setPHTolerance(tol);
     }
     return true;
@@ -848,7 +902,7 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
         }
     };
     if (doc.containsKey("dosingArmed")) {
-        appendIgnored(" armed=ignorado");
+        hydro.setDosingArmed(doc["dosingArmed"] | false);
     }
     if (doc.containsKey("dosingDelaySec") || doc.containsKey("dosingMode")) {
         appendIgnored(" delay/mode=ignorado");
@@ -871,8 +925,9 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
     }
 
     Serial.printf(
-        "[HMI LOOP] autoEc=%d iv=%d autoPh=%d iv=%d vol=%.0f pulse=%.1f/%.1fs "
+        "[HMI LOOP] armed=%d autoEc=%d iv=%d autoPh=%d iv=%d vol=%.0f pulse=%.1f/%.1fs "
         "maxStepEc=%.2f maxStepPh=%.2f ecBand=%s phBand=%s%s\n",
+        hydro.isDosingArmed() ? 1 : 0,
         hydro.isAutoECEnabled() ? 1 : 0,
         hydro.getAutoECInterval(),
         hydro.isAutoPHEnabled() ? 1 : 0,
@@ -885,6 +940,31 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
         ecBand,
         phBand,
         ignored);
+
+    if (ctx_.mqtt) {
+        MqttHmiLoopReading loop = {};
+        loop.volume = hydro.getECController().getVolume();
+        loop.tempoRecirculacaoSec = hydro.getTempoRecirculacaoSeconds();
+        loop.pulseMl = hydro.getEcPulseMl();
+        loop.pulseGapSec = hydro.getEcPulseGapSec();
+        loop.intervaloAutoEc = hydro.getAutoECInterval();
+        loop.intervaloAutoPh = hydro.getAutoPHInterval();
+        loop.aggressivenessEc = hydro.getMaxStepEcFraction();
+        loop.aggressivenessPh = hydro.getPhAggressiveness();
+        loop.consumoEc24h = hydro.isConsumoEc24hEnabled();
+        loop.consumoPh24h = hydro.isConsumoPh24hEnabled();
+        loop.ecSetpoint = hydro.getECSetpoint();
+        loop.ecTolerance = hydro.getECTolerance();
+        loop.phSetpoint = hydro.getPHSetpoint();
+        loop.phTolerance = hydro.getPHTolerance();
+        loop.relayPhUp = hydro.getRelayPhUp();
+        loop.relayPhDown = hydro.getRelayPhDown();
+        loop.hasAutoEc = pushedEc;
+        loop.autoEc = hydro.isAutoECEnabled();
+        loop.hasAutoPh = pushedPh;
+        loop.autoPh = hydro.isAutoPHEnabled();
+        ctx_.mqtt->publishHmiLoop(loop);
+    }
     return true;
 }
 
@@ -1675,6 +1755,14 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
             ok = true;
         }
         if (ok) {
+            publishTelemetryNow();
+        }
+    } else if (strcmp(action, "mesh_stop") == 0) {
+        if (!ctx_.hydro) {
+            ok = false;
+        } else {
+            ctx_.hydro->emergencyStopMesh();
+            ok = true;
             publishTelemetryNow();
         }
     } else if (strcmp(action, "level_interlock") == 0) {

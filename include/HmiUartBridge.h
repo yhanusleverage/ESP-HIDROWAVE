@@ -52,6 +52,8 @@ public:
     static HmiUartBridge* activeInstance();
     /** ml/L y ml/min de cada bomba, los mismos que sube a la web. */
     void publishPlantCfg();
+    /** Config de malla aplicada desde la web. La HMI la pinta y no la reenvía. */
+    void publishLoopCfg();
     /** Un bit confirmado por RELAY-ACK. No reconstruye t:slaves. */
     void notifyRelayState(const uint8_t mac[6], int relay, bool on);
     /** Empuja el catálogo de nombres de relé al HMI. */
