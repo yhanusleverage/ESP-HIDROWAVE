@@ -14,7 +14,7 @@ struct MqttTelemetryReading {
     bool level3Wet;
     bool level4Wet;
     const char* waterLevel;  // vazio|baixo|medio|medio_alto|alto
-    const char* interlockMode;  // normal|carrera (nullable ok)
+    const char* interlockMode;  // normal|carrera|indep (nullable ok)
     float airTemperature;  // ambiente (environment_data)
     float humidity;
     bool phValid;      // lectura fresca y plausible (no caché stale)
@@ -85,7 +85,7 @@ struct MqttLevelsReading {
     const char* waterLevel;
     bool levelsSimulated;
     bool levelsOnline;  // PCF I2C OK (false = offline, no inventar)
-    const char* interlockMode;  // normal|carrera
+    const char* interlockMode;  // normal|carrera|indep
     bool circulationTyped;
     bool circulationMixOk;
 };

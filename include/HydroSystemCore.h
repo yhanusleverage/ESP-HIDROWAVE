@@ -264,6 +264,8 @@ private:
     void markRecentlyClosedCloudAck(int supabaseCommandId);
 #if ENABLE_MQTT
     unsigned long mqttConnectedSinceMs;
+    unsigned long mqttRetainFloodLastMs;
+    bool mqttRetainFloodClosed;
     unsigned long lastRuleExecutedMirrorMs;
     bool mqttEcConfigReceived;
     bool mqttPhConfigReceived;
@@ -311,6 +313,9 @@ private:
     void rememberPublishedRelayState(const uint8_t* mac, const bool states[8], const bool timers[8],
                                      const int remaining[8], uint8_t numRelays, bool linkOnline);
 #endif
+    /** Rafaga tras conectar: se alarga con config/reglas, cierra tras 1,5 s de silencio, tope 30 s. */
+    bool mqttRetainReplay() const;
+    void noteMqttRetainMessage();
 
 #if ESPNOW_RELAY_BATCH_ENABLED
     struct EspNowRelayBatchItem {

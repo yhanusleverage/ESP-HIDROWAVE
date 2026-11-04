@@ -160,6 +160,8 @@ private:
     bool circulationConfigured;
     uint8_t circulationMac[6];
     int circulationRelay;
+    mutable bool circulationLatchedOn_;
+    void publishCirculationRescueTarget();
     RelayOwner circulationOwner;
     uint8_t circulationRefCount;
 

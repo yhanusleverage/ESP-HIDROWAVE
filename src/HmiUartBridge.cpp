@@ -1773,6 +1773,8 @@ bool HmiUartBridge::handleCommand(JsonDocument& doc) {
             ok = ctx_.hydro->setLevelInterlockMode(HydroControl::LEVEL_INTERLOCK_NORMAL);
         } else if (strcmp(mode, "carrera") == 0) {
             ok = ctx_.hydro->setLevelInterlockMode(HydroControl::LEVEL_INTERLOCK_CARRERA);
+        } else if (strcmp(mode, "indep") == 0) {
+            ok = ctx_.hydro->setLevelInterlockMode(HydroControl::LEVEL_INTERLOCK_INDEP);
         } else {
             ok = false;
         }

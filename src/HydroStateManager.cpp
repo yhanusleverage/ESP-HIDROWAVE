@@ -1,5 +1,6 @@
 #include "HybridStateManager.h"
 #include "Config.h"
+#include "EspNowChannelPolicy.h"
 #include <SPIFFS.h>
 #include <esp_task_wdt.h>  // ✅ CRÍTICO: Para esp_task_wdt_reset()
 #include "DeviceRegistration.h" // ✅ NOVO: Sistema de registro por email
@@ -623,6 +624,11 @@ void HydroStateManager::setWifiUserOffline(bool offline) {
 }
 
 void HydroStateManager::handleWifiReconnectRuntime(unsigned long now) {
+    // El rescate ESP-NOW deja el WiFi caído a propósito (canal 11). Un begin
+    // aquí devuelve la radio al canal del router y el broadcast falla con 0x3066.
+    if (EspNowChannelPolicy::isProvisioningStaSuspendActive()) {
+        return;
+    }
     if (wifiUserOffline_) {
         if (WiFi.isConnected()) {
             WiFi.setAutoReconnect(false);

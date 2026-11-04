@@ -89,7 +89,7 @@ const WATER_LEVEL_VALUES = new Set([
   'alto',
   'medio_baixo', // aceptado → normaliza a medio
 ]);
-const INTERLOCK_MODE_VALUES = new Set(['normal', 'carrera']);
+const INTERLOCK_MODE_VALUES = new Set(['normal', 'carrera', 'indep']);
 
 /** Canonical: 2/4=medio, 3/4=medio_alto. medio_baixo → medio. */
 function normalizeWaterLevel(raw) {

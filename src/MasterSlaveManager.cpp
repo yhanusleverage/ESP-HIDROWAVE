@@ -567,16 +567,7 @@ void MasterSlaveManager::runProvisioningIfNeeded() {
             (now - lastRescueMs) < ESPNOW_LOST_SLAVE_RESCUE_COOLDOWN_MS) {
             return;
         }
-        bool needRescue = false;
-        forEachTrustedSlave([&](const TrustedSlave& slave) {
-            if (needRescue) return;
-            if (!isSlaveReachable(slave) ||
-                slave.lastSeen == 0 ||
-                (now - slave.lastSeen) >= ESPNOW_LOST_SLAVE_RESCUE_AFTER_MS) {
-                needRescue = true;
-            }
-        });
-        if (!needRescue) {
+        if (!circulationSlaveNeedsRescue(now)) {
             return;
         }
         // Só 1 burst; limpar latch para permitir este rescue
@@ -1190,6 +1181,33 @@ void MasterSlaveManager::logSlaveLink(const char* event, const uint8_t* mac, lon
         Serial.printf(" last_seen_delta_ms=%ld", lastSeenDeltaMs);
     }
     Serial.println();
+}
+
+void MasterSlaveManager::setCirculationRescueTarget(const uint8_t* mac, bool configured) {
+    circulationRescueConfigured_ = configured && mac != nullptr;
+    if (circulationRescueConfigured_) {
+        memcpy(circulationRescueMac_, mac, 6);
+    } else {
+        memset(circulationRescueMac_, 0, sizeof(circulationRescueMac_));
+    }
+}
+
+bool MasterSlaveManager::circulationSlaveNeedsRescue(unsigned long now) {
+    if (!circulationRescueConfigured_) {
+        return false;
+    }
+    bool found = false;
+    bool lost = true;
+    forEachTrustedSlave([&](const TrustedSlave& slave) {
+        if (memcmp(slave.macAddress, circulationRescueMac_, 6) != 0) {
+            return;
+        }
+        found = true;
+        const bool stale = slave.lastSeen == 0 ||
+            (now - slave.lastSeen) >= ESPNOW_LOST_SLAVE_RESCUE_AFTER_MS;
+        lost = !isSlaveReachable(slave) || stale;
+    });
+    return !found || lost;
 }
 
 bool MasterSlaveManager::isSlaveReachable(const TrustedSlave& slave) const {

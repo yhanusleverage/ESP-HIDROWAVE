@@ -268,6 +268,9 @@ public:
      */
     bool isSlaveReachable(const TrustedSlave& slave) const;
 
+    /** El salto al canal 11 solo persigue este esclavo (la bomba de circulación). */
+    void setCirculationRescueTarget(const uint8_t* mac, bool configured);
+
     /**
      * @brief Copia snapshot de relés sob mutex (seguro para MQTT publish)
      */
@@ -651,6 +654,9 @@ private:
     };
     std::vector<PendingRelayCommand> pendingRelayCommands;
     mutable SemaphoreHandle_t pendingRelayCommandsMutex = nullptr;
+    bool circulationRescueConfigured_ = false;
+    uint8_t circulationRescueMac_[6] = {};
+    bool circulationSlaveNeedsRescue(unsigned long now);
     
     bool lockPendingQueue(TickType_t timeout = portMAX_DELAY) const;
     void unlockPendingQueue() const;

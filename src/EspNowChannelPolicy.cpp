@@ -65,11 +65,13 @@ namespace {
                       static_cast<unsigned>(opChannel),
                       static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL));
 
+        WiFi.setAutoReconnect(false);
         WiFi.disconnect(false);
         delay(50);
 
         if (!EspNowChannelPolicy::hopToConfigChannel(controller)) {
             Serial.println("[PROV] STA suspend hop config fail");
+            WiFi.setAutoReconnect(true);
             WiFi.begin(ssid.c_str(), password.c_str());
             provisioningStaSuspendActive = false;
             return false;
@@ -78,6 +80,10 @@ namespace {
         Serial.printf("[CHANNEL] hop config=%u ok (STA down)\n",
                       static_cast<unsigned>(ESPNOW_CONFIG_CHANNEL));
         delay(80);
+        if (controller->getCurrentRadioChannel() != ESPNOW_CONFIG_CHANNEL) {
+            EspNowChannelPolicy::hopToConfigChannel(controller);
+            delay(40);
+        }
         // Peers aún en ch STA → 0x3066. Re-add en CONFIG antes del burst (patch sobre REF).
         manager->refreshEspNowPeersOnCurrentChannel();
         delay(40);
@@ -120,6 +126,7 @@ namespace {
         }
         delay(50);
 
+        WiFi.setAutoReconnect(true);
         WiFi.begin(ssid.c_str(), password.c_str());
         const unsigned long reconnectStart = millis();
         while (WiFi.status() != WL_CONNECTED &&

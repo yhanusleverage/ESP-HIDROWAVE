@@ -560,6 +560,8 @@ HydroSystemCore::HydroSystemCore(WebServerTask* webTask, ESPNowController* espNo
     recentlyClosedCount(0),
 #if ENABLE_MQTT
     mqttConnectedSinceMs(0),
+    mqttRetainFloodLastMs(0),
+    mqttRetainFloodClosed(false),
     lastRuleExecutedMirrorMs(0),
     mqttEcConfigReceived(false),
     mqttPhConfigReceived(false),
@@ -1176,8 +1178,61 @@ void HydroSystemCore::expirePendingRuleAcks() {
     }
 }
 
+namespace {
+constexpr unsigned long kMqttRetainFloodSilenceMs = 1500UL;
+constexpr unsigned long kMqttRetainFloodCapMs = 30000UL;
+}
+
+bool HydroSystemCore::mqttRetainReplay() const {
+#if ENABLE_MQTT
+    if (mqttConnectedSinceMs == 0 || mqttRetainFloodClosed) {
+        return false;
+    }
+    const unsigned long now = millis();
+    if ((now - mqttConnectedSinceMs) >= kMqttRetainFloodCapMs) {
+        return false;
+    }
+    const unsigned long last =
+        mqttRetainFloodLastMs != 0 ? mqttRetainFloodLastMs : mqttConnectedSinceMs;
+    return (now - last) < kMqttRetainFloodSilenceMs;
+#else
+    return false;
+#endif
+}
+
+void HydroSystemCore::noteMqttRetainMessage() {
+#if ENABLE_MQTT
+    if (!mqttClient.isConnected()) {
+        return;
+    }
+    const unsigned long now = millis();
+    if (mqttConnectedSinceMs == 0) {
+        mqttConnectedSinceMs = now;
+        mqttRetainFloodLastMs = now;
+        mqttRetainFloodClosed = false;
+        return;
+    }
+    if (mqttRetainFloodClosed) {
+        return;
+    }
+    if ((now - mqttConnectedSinceMs) >= kMqttRetainFloodCapMs) {
+        mqttRetainFloodClosed = true;
+        return;
+    }
+    const unsigned long last =
+        mqttRetainFloodLastMs != 0 ? mqttRetainFloodLastMs : mqttConnectedSinceMs;
+    if ((now - last) >= kMqttRetainFloodSilenceMs) {
+        mqttRetainFloodClosed = true;
+        return;
+    }
+    mqttRetainFloodLastMs = now;
+#endif
+}
+
 void HydroSystemCore::loop() {
     if (!systemReady) return;
+
+    hydroControl.accountRadioHold();
     
     unsigned long now = millis();
 
@@ -1208,9 +1263,13 @@ void HydroSystemCore::loop() {
     if (mqttClient.isConnected()) {
         if (mqttConnectedSinceMs == 0) {
             mqttConnectedSinceMs = now;
+            mqttRetainFloodLastMs = now;
+            mqttRetainFloodClosed = false;
         }
     } else {
         mqttConnectedSinceMs = 0;
+        mqttRetainFloodLastMs = 0;
+        mqttRetainFloodClosed = false;
     }
     EspNowChannelPolicy::setMqttConnected(mqttClient.isConnected());
 #else
@@ -4767,13 +4826,18 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
                   (float)config.aggressiveness,
                   config.consumo_24h ? 1 : 0);
     hydroControl.getECController().setBaseDose(config.base_dose);
-    hydroControl.getECController().setVolume(config.volume);
     hydroControl.getECController().setTotalMl(config.total_ml);
     hydroControl.getECController().setKp(config.kp);
-    hydroControl.setECSetpoint(config.ec_setpoint, false);
     hydroControl.setECTolerance((float)config.tolerance, false);
-    hydroControl.setAutoECEnabled(config.auto_enabled, false);
-    hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);
+    const bool replayEc = mqttRetainReplay();
+    if (replayEc) {
+        Serial.println("[EC CONFIG] replay MQTT — auto, litros, setpoint e intervalo no se tocan");
+    } else {
+        hydroControl.getECController().setVolume(config.volume);
+        hydroControl.setECSetpoint(config.ec_setpoint, false);
+        hydroControl.setAutoECEnabled(config.auto_enabled, false);
+        hydroControl.setAutoECInterval(config.intervalo_auto_ec, false);
+    }
     hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
     hydroControl.setMaxStepEcFraction((float)config.aggressiveness);
     hydroControl.setEcPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
@@ -4863,7 +4927,14 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
         }
     }
     hydroControl.saveECControllerConfig();
-    rememberEcConfigSnapshot(config);
+    ECConfig rememberedEc = config;
+    if (replayEc) {
+        rememberedEc.volume = hydroControl.getECController().getVolume();
+        rememberedEc.ec_setpoint = hydroControl.getECSetpoint();
+        rememberedEc.intervalo_auto_ec = hydroControl.getAutoECInterval();
+        rememberedEc.auto_enabled = hydroControl.isAutoECEnabled();
+    }
+    rememberEcConfigSnapshot(rememberedEc);
     if (!config.auto_enabled) {
         syncEcOperationStateToSupabase();
     }
@@ -4887,8 +4958,15 @@ bool HydroSystemCore::applyPHConfig(const PHConfig& config, const char* via) {
                   config.ph_setpoint,
                   (float)config.aggressiveness,
                   config.consumo_24h ? 1 : 0);
-    hydroControl.setPHSetpoint((float)config.ph_setpoint, false);
     hydroControl.setPHTolerance((float)config.ph_tolerance);
+    const bool replayPh = mqttRetainReplay();
+    if (replayPh) {
+        Serial.println("[PH CONFIG] replay MQTT — auto, setpoint e intervalo no se tocan");
+    } else {
+        hydroControl.setPHSetpoint((float)config.ph_setpoint, false);
+        hydroControl.setAutoPHInterval(config.intervalo_auto_ph, false);
+        hydroControl.setAutoPHEnabled(config.auto_enabled, false);
+    }
     hydroControl.setPhPumpConfig(
         config.relay_ph_up,
         config.relay_ph_down,
@@ -4900,8 +4978,6 @@ bool HydroSystemCore::applyPHConfig(const PHConfig& config, const char* via) {
     if (config.reset_k_gains) {
         hydroControl.resetPhLearnedGains();
     }
-    hydroControl.setAutoPHInterval(config.intervalo_auto_ph, false);
-    hydroControl.setAutoPHEnabled(config.auto_enabled, false);
     hydroControl.setPhRecirculacaoSeconds(config.tempo_recirculacao);
     hydroControl.setPhPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
     hydroControl.setConsumoPh24hEnabled(config.consumo_24h);
@@ -4927,6 +5003,7 @@ void HydroSystemCore::handleMqttIncoming(const char* topic, const char* payload,
         return;
     }
     if (strstr(topic, "/ec/config") != nullptr) {
+        noteMqttRetainMessage();
         ECConfig config;
         if (!parseMqttEcConfigJson(payload, length, config) || !config.isValid) {
             Serial.println("[MQTT] ec/config JSON inválido");
@@ -4937,6 +5014,7 @@ void HydroSystemCore::handleMqttIncoming(const char* topic, const char* payload,
         return;
     }
     if (strstr(topic, "/ph/config") != nullptr) {
+        noteMqttRetainMessage();
         PHConfig config;
         if (!parseMqttPhConfigJson(payload, length, config) || !config.isValid) {
             Serial.println("[MQTT] ph/config JSON inválido");
@@ -4947,6 +5025,7 @@ void HydroSystemCore::handleMqttIncoming(const char* topic, const char* payload,
         return;
     }
     if (strstr(topic, "/circ/config") != nullptr) {
+        noteMqttRetainMessage();
         if (!applyCirculationConfigMqtt(payload, length)) {
             Serial.println("[MQTT] circ/config JSON inválido ou apply falhou");
         }
@@ -4957,16 +5036,19 @@ void HydroSystemCore::handleMqttIncoming(const char* topic, const char* payload,
         return;
     }
     if (strstr(topic, "/rules/manifest") != nullptr) {
+        noteMqttRetainMessage();
         applyRulesManifestMqtt(payload, length);
         return;
     }
     if (strstr(topic, "/rules/__relay_names") != nullptr) {
+        noteMqttRetainMessage();
         if (!applyRelayNamesMqtt(payload, length)) {
             Serial.println("[MQTT] relay_names JSON inválido");
         }
         return;
     }
     if (strstr(topic, "/rules/") != nullptr) {
+        noteMqttRetainMessage();
         applyRuleUpsertMqtt(payload, length);
         return;
     }
@@ -5050,6 +5132,10 @@ bool HydroSystemCore::applyCirculationConfigMqtt(const char* payload, size_t len
     int relayIndex = doc["relay_index"] | doc["relayIndex"] | -1;
 
     if (!enabled || !macStr || strlen(macStr) < 11 || relayIndex < 0 || relayIndex >= 8) {
+        if (mqttRetainReplay() && relayCoordinator.isCirculationConfigured()) {
+            Serial.println("[MQTT] circ/config replay — bomba se mantiene");
+            return true;
+        }
         relayCoordinator.clearCirculationTarget();
         Serial.println("[MQTT] circ/config → circulation cleared (NVS only)");
         return true;
@@ -5145,14 +5231,19 @@ bool HydroSystemCore::applyRuleUpsertMqtt(const char* payload, size_t length) {
             if (ruleIdStr.length() > 0) {
                 DecisionRule* existing = decisionEngine.getRule(ruleIdStr);
                 if (existing) {
-                    releaseDecisionRuleActuators(*existing);
+                    if (existing->enabled) {
+                        releaseDecisionRuleActuators(*existing);
+                        Serial.printf("[MQTT] rules disable (keep) → %s (+OFF actuators)\n",
+                                      ruleIdStr.c_str());
+                    } else {
+                        Serial.printf("[MQTT] rules disable (keep) → %s (ya off, sin OFF)\n",
+                                      ruleIdStr.c_str());
+                    }
                     existing->enabled = false;
                     ScriptRunnerManager::instance().removeByRuleId(ruleIdStr);
                     TankProcedureFsmManager::instance().removeByRuleId(ruleIdStr);
                     needSave = true;
                     ok = true;
-                    Serial.printf("[MQTT] rules disable (keep) → %s (+OFF actuators)\n",
-                                  ruleIdStr.c_str());
                 } else {
                     Serial.printf("[MQTT] rules disable — %s ausente (noop)\n",
                                   ruleIdStr.c_str());
@@ -5180,9 +5271,7 @@ bool HydroSystemCore::applyRuleUpsertMqtt(const char* payload, size_t length) {
             bool nowEnabled = after && after->enabled;
             // Solo en ventana post-reconnect (retained flood): no re-armar tras Complete.
             // Ativar con MQTT estable sigue funcionando (incluso <45s).
-            const bool retainFloodWindow =
-                mqttConnectedSinceMs > 0 &&
-                (millis() - mqttConnectedSinceMs) < 5000UL;
+            const bool retainFloodWindow = mqttRetainReplay();
             if (ok && after && nowEnabled && retainFloodWindow && ruleIdStr.length() > 0 &&
                 ruleIdStr == lastProcAutoDisabledRuleId_ &&
                 lastProcAutoDisabledAtMs_ != 0 &&
@@ -5366,10 +5455,12 @@ void HydroSystemCore::handleMqttCommandPayload(const char* payload, size_t lengt
 
     char interlockMode[16];
     if (parseMqttLevelInterlockCommand(payload, length, interlockMode, sizeof(interlockMode))) {
-        const HydroControl::LevelInterlockMode mode =
-            (strcmp(interlockMode, "carrera") == 0)
-                ? HydroControl::LEVEL_INTERLOCK_CARRERA
-                : HydroControl::LEVEL_INTERLOCK_NORMAL;
+        HydroControl::LevelInterlockMode mode = HydroControl::LEVEL_INTERLOCK_NORMAL;
+        if (strcmp(interlockMode, "carrera") == 0) {
+            mode = HydroControl::LEVEL_INTERLOCK_CARRERA;
+        } else if (strcmp(interlockMode, "indep") == 0) {
+            mode = HydroControl::LEVEL_INTERLOCK_INDEP;
+        }
         if (hydroControl.setLevelInterlockMode(mode)) {
             mqttLevelsFingerprintValid = false;
             publishMqttLevels();

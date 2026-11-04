@@ -18,6 +18,9 @@ public:
     void dumpRawPins(PCF8574& pcf) const;
 
     bool isAvailable() const { return available; }
+    bool hasSample() const { return hasStableSample; }
+    /** true tras LEVEL_BUS_MISS_LIMIT lecturas mudas seguidas. */
+    bool isBusLost() const { return busLost; }
     /** levelIndex: 1..4 */
     bool isWet(int levelIndex) const;
     const char* getWaterLevel() const;
@@ -29,6 +32,8 @@ private:
     bool stableWet[LEVEL_COUNT];
     bool rawWet[LEVEL_COUNT];
     bool hasStableSample;
+    uint8_t consecutiveBusMisses;
+    bool busLost;
     unsigned long lastChangeMs[LEVEL_COUNT];
     char waterLevelAggregate[16];  // "medio_alto" + NUL
 

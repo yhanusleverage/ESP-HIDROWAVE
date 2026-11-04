@@ -321,8 +321,9 @@ bool parseMqttLevelInterlockCommand(const char* payload, size_t length, char* ou
     }
 
     const char* mode = doc["mode"] | "";
-    if (strcmp(mode, "normal") != 0 && strcmp(mode, "carrera") != 0) {
-        Serial.println("[MQTT CMD] set_level_interlock mode inválido (normal|carrera)");
+    if (strcmp(mode, "normal") != 0 && strcmp(mode, "carrera") != 0 &&
+        strcmp(mode, "indep") != 0) {
+        Serial.println("[MQTT CMD] set_level_interlock mode inválido (normal|carrera|indep)");
         return false;
     }
 

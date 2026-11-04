@@ -174,8 +174,12 @@ public:
     bool* getRelayStates() { return relayStates; }
     bool areSensorsWorking() { return sensorsOk; }
     bool isWaterLevelOk() { return tankLevelOk; }
-    /** normal = ≠vazio; carrera = solo alto (4/4). Persistido NVS. */
-    enum LevelInterlockMode : uint8_t { LEVEL_INTERLOCK_NORMAL = 0, LEVEL_INTERLOCK_CARRERA = 1 };
+    /** normal = ≠vazio; carrera = solo alto (4/4); indep = sin nivel. Persistido NVS. */
+    enum LevelInterlockMode : uint8_t {
+        LEVEL_INTERLOCK_NORMAL = 0,
+        LEVEL_INTERLOCK_CARRERA = 1,
+        LEVEL_INTERLOCK_INDEP = 2
+    };
     bool setLevelInterlockMode(LevelInterlockMode mode);
     LevelInterlockMode getLevelInterlockMode() const { return levelInterlockMode; }
     const char* getLevelInterlockModeName() const;
@@ -223,6 +227,8 @@ public:
     bool isPhValidForTelemetry() const;
     bool isEcValidForTelemetry() const;
     bool isTempValidForTelemetry() const;
+    /** El rescate de radio no cuenta contra los 12 s de frescura. */
+    void accountRadioHold();
     /** Δ = lectura ahora − referencia al abrir la ventana de 24 h. */
     bool hasConsumoEc24hDelta() const { return consumoEc24hDeltaValid_; }
     float consumoEc24hDelta() const { return consumoEc24hDelta_; }
@@ -469,6 +475,8 @@ private:
     unsigned long lastPhValidMs;
     unsigned long lastEcValidMs;
     unsigned long lastTempValidMs;
+    bool radioHold_;
+    unsigned long radioHoldStartMs_;
     
     // Estado dos relés
     bool relayStates[NUM_RELAYS];

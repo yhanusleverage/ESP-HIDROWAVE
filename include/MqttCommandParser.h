@@ -16,7 +16,7 @@ bool parseMqttRelayCommand(
 /** action=ec_dilution_start, volume_l>0 */
 bool parseMqttEcDilutionCommand(const char* payload, size_t length, float& outVolumeL);
 
-/** action=set_level_interlock, mode=normal|carrera */
+/** action=set_level_interlock, mode=normal|carrera|indep */
 bool parseMqttLevelInterlockCommand(const char* payload, size_t length, char* outMode, size_t outModeLen);
 
 #endif

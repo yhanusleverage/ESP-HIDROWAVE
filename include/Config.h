@@ -342,6 +342,7 @@
 #define LEVEL_POLL_MS 200              // Paridad 4level_sensors
 #define LEVEL_LOG_MS 1000              // Línea LEVEL en serial
 #define LEVEL_PCF_RETRY_MS 5000        // Reintento I2C si PCF niveles offline
+#define LEVEL_BUS_MISS_LIMIT 10        // Fallos I2C seguidos antes de soltar el último nivel
 #define LEVEL_NPN_ACTIVE_LOW 1         // NPN ON → LOW no PCF (directo, sin PC817)
 // L1 base (P3) → L4 topo (P0). Ver LEVEL_LOGIC_VERSIONS.md
 #define LEVEL_SENSOR_PCF_PINS 3, 2, 1, 0
@@ -351,6 +352,9 @@
 #define I2C_SCL 22
 #ifndef I2C_CLOCK_HZ
 #define I2C_CLOCK_HZ 100000
+#endif
+#ifndef I2C_TIMEOUT_MS
+#define I2C_TIMEOUT_MS 50
 #endif
 
 // Status LED

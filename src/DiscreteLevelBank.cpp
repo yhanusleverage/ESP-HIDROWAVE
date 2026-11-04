@@ -19,7 +19,9 @@ static const char* levelLabel(int index0) {
 
 DiscreteLevelBank::DiscreteLevelBank()
     : available(false),
-      hasStableSample(false) {
+      hasStableSample(false),
+      consecutiveBusMisses(0),
+      busLost(false) {
     memset(wet, 0, sizeof(wet));
     memset(stableWet, 0, sizeof(stableWet));
     memset(rawWet, 0, sizeof(rawWet));
@@ -31,6 +33,8 @@ DiscreteLevelBank::DiscreteLevelBank()
 void DiscreteLevelBank::begin() {
     available = false;
     hasStableSample = false;
+    consecutiveBusMisses = 0;
+    busLost = false;
 }
 
 bool DiscreteLevelBank::readPinWithRetry(PCF8574& pcf, int pinIndex, bool& outWet) const {
@@ -38,17 +42,17 @@ bool DiscreteLevelBank::readPinWithRetry(PCF8574& pcf, int pinIndex, bool& outWe
         return false;
     }
     const uint8_t pin = LEVEL_PCF_PINS[pinIndex];
-    for (int attempt = 0; attempt < 3; attempt++) {
-        const uint8_t raw = pcf.read(pin);
-        if (raw == LOW || raw == HIGH) {
+    const uint8_t raw = pcf.read(pin);
+    if (pcf.lastError() == PCF8574_I2C_ERROR) {
+        return false;
+    }
+    if (raw == LOW || raw == HIGH) {
 #if defined(LEVEL_NPN_ACTIVE_LOW) && (LEVEL_NPN_ACTIVE_LOW)
             outWet = (raw == LOW);
 #else
             outWet = (raw == HIGH);
 #endif
-            return true;
-        }
-        delay(1);
+        return true;
     }
     return false;
 }
@@ -72,19 +76,23 @@ void DiscreteLevelBank::dumpRawPins(PCF8574& pcf) const {
 
 bool DiscreteLevelBank::poll(PCF8574& pcf, bool pcfOk) {
     if (!pcfOk) {
-        available = false;
-        return false;
+        if (!hasStableSample) {
+            available = false;
+            return false;
+        }
+        return true;
     }
 
-    available = true;
     const unsigned long now = millis();
+    bool readAny = false;
 
     for (int i = 0; i < LEVEL_COUNT; i++) {
         bool reading = false;
         if (!readPinWithRetry(pcf, i, reading)) {
-            // Paridad 4level: I2C fail → no actualizar pin (evita falso MOJADO)
-            continue;
+            // Bus mudo: no se tocan el resto de pines.
+            break;
         }
+        readAny = true;
 
         if (reading != rawWet[i]) {
             rawWet[i] = reading;
@@ -105,6 +113,26 @@ bool DiscreteLevelBank::poll(PCF8574& pcf, bool pcfOk) {
         wet[i] = stableWet[i];
     }
 
+    if (!readAny) {
+        if (consecutiveBusMisses < 255) {
+            consecutiveBusMisses++;
+        }
+        if (consecutiveBusMisses >= LEVEL_BUS_MISS_LIMIT) {
+            if (!busLost) {
+                Serial.printf("[LEVEL] bus mudo x%u — nivel anterior suelto\n",
+                              static_cast<unsigned>(LEVEL_BUS_MISS_LIMIT));
+            }
+            busLost = true;
+            available = false;
+            hasStableSample = false;
+            return false;
+        }
+        // Menos de 10 fallos: el último nivel sigue vigente.
+        return hasStableSample;
+    }
+    consecutiveBusMisses = 0;
+    busLost = false;
+    available = true;
     hasStableSample = true;
     deriveWaterLevel();
     return true;

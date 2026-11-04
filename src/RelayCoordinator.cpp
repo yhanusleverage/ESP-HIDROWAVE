@@ -88,6 +88,7 @@ RelayCoordinator::RelayCoordinator()
       masterManager(nullptr),
       circulationConfigured(false),
       circulationRelay(CIRCULATION_RELAY_DEFAULT),
+      circulationLatchedOn_(false),
       circulationOwner(RelayOwner::None),
       circulationRefCount(0),
       lastDenyReason_(RelayDenyReason::Ok),
@@ -197,6 +198,7 @@ void RelayCoordinator::loadConfigFromNVS() {
     } else {
         Serial.println("[COORD] Circulation target not configured (NVS circ_slave_mac)");
     }
+    publishCirculationRescueTarget();
 }
 
 void RelayCoordinator::setCirculationTarget(const uint8_t mac[6], int relayNumber) {
@@ -211,6 +213,7 @@ void RelayCoordinator::setCirculationTarget(const uint8_t mac[6], int relayNumbe
     Serial.printf("[COORD] Circulation target set: %s relay %d\n",
         ESPNowController::macToString(circulationMac).c_str(),
         circulationRelay + 1);
+    publishCirculationRescueTarget();
 }
 
 void RelayCoordinator::clearCirculationTarget() {
@@ -219,7 +222,18 @@ void RelayCoordinator::clearCirculationTarget() {
     circulationRelay = CIRCULATION_RELAY_DEFAULT;
     PreferencesManager::removeConfig(KEY_CIRC_MAC);
     PreferencesManager::removeConfig(KEY_CIRC_RELAY);
+    circulationLatchedOn_ = false;
     Serial.println("[COORD] Circulation target cleared");
+    publishCirculationRescueTarget();
+}
+
+void RelayCoordinator::publishCirculationRescueTarget() {
+    if (!masterManager) {
+        return;
+    }
+    masterManager->setCirculationRescueTarget(
+        circulationConfigured ? circulationMac : nullptr,
+        circulationConfigured);
 }
 
 CirculationMixGate RelayCoordinator::getCirculationMixGate() const {
@@ -227,10 +241,21 @@ CirculationMixGate RelayCoordinator::getCirculationMixGate() const {
         return CirculationMixGate::NotTyped;
     }
     const ObservedRelayState observed = getObservedState(getCirculationTarget());
-    if (!observed.valid || !observed.state) {
+    if (observed.valid && observed.state) {
+        circulationLatchedOn_ = true;
+        return CirculationMixGate::Ok;
+    }
+    const bool freshOff = observed.valid && !observed.state &&
+                          observed.lastUpdateMs != 0 &&
+                          (millis() - observed.lastUpdateMs) < 20000UL;
+    if (freshOff) {
+        circulationLatchedOn_ = false;
         return CirculationMixGate::Inactive;
     }
-    return CirculationMixGate::Ok;
+    if (circulationLatchedOn_ && observed.online) {
+        return CirculationMixGate::Ok;
+    }
+    return CirculationMixGate::Inactive;
 }
 
 bool RelayCoordinator::isCirculationMixActiveForDosing() const {

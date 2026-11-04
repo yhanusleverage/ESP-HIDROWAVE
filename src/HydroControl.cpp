@@ -1,4 +1,5 @@
 #include "HydroControl.h"
+#include "EspNowChannelPolicy.h"
 #include "PreferencesManager.h"  // ✅ Para persistência em NVS
 #include "StatePersistenceManager.h"
 #include "SensorSanitize.h"
@@ -140,6 +141,8 @@ HydroControl::HydroControl()
     lastPhValidMs = 0;
     lastEcValidMs = 0;
     lastTempValidMs = 0;
+    radioHold_ = false;
+    radioHoldStartMs_ = 0;
     
     // ✅ Inicializar sistema sequencial de dosagem
     currentState = IDLE;
@@ -228,6 +231,7 @@ bool HydroControl::begin() {
     if (!i2cInitialized) {
         Wire.begin(I2C_SDA, I2C_SCL);
         Wire.setClock(I2C_CLOCK_HZ);
+        Wire.setTimeOut(I2C_TIMEOUT_MS);
         i2cInitialized = true;
         Serial.printf("🔌 I2C inicializado SDA=%d SCL=%d @ %u Hz\n",
                       I2C_SDA, I2C_SCL, static_cast<unsigned>(I2C_CLOCK_HZ));
@@ -235,6 +239,7 @@ bool HydroControl::begin() {
     } else {
         Serial.println("ℹ️ I2C já estava inicializado (reutilizando)");
         Wire.setClock(I2C_CLOCK_HZ);
+        Wire.setTimeOut(I2C_TIMEOUT_MS);
     }
     
     Serial.println("🔍 Escaneando dispositivos I2C...");
@@ -384,6 +389,7 @@ void HydroControl::loop() {
 }
 
 void HydroControl::update() {
+    accountRadioHold();
     pollDiscreteLevels();
     updateSensors();
     flowSensorBank.tickAll();
@@ -455,8 +461,13 @@ void HydroControl::pollDiscreteLevels() {
                 getLevelInterlockModeName(),
                 tankLevelOk ? 1 : 0);
         }
-    } else {
-        tankLevelOk = false;
+    } else if (!levelBank.hasSample()) {
+        if (levelBank.isBusLost()) {
+            pcf1_ok = false;
+        }
+        if (levelInterlockMode != LEVEL_INTERLOCK_INDEP) {
+            tankLevelOk = false;
+        }
         static unsigned long lastOfflineBeatMs = 0;
         const bool justOffline = !levelOfflineLatched;
         if (justOffline || (now - lastOfflineBeatMs >= 30000UL)) {
@@ -478,7 +489,13 @@ bool HydroControl::tryBindLevelPcf(uint8_t address) {
         return false;  // 0x24 = relés — nunca niveles
     }
     Wire.beginTransmission(address);
-    if (Wire.endTransmission() != 0) {
+    const uint8_t bus = Wire.endTransmission();
+    if (address == PCF8574_ADDR_1 && bus != 0) {
+        Serial.printf("[LEVEL] 0x%02X endTransmission=%u\n",
+                      static_cast<unsigned>(address),
+                      static_cast<unsigned>(bus));
+    }
+    if (bus != 0) {
         return false;
     }
     if (!pcf1.setAddress(address)) {
@@ -523,7 +540,9 @@ bool HydroControl::discoverAndBindLevelPcf() {
         }
     }
     pcf1_ok = false;
-    levelBank.begin();  // available=false
+    if (!levelBank.hasSample()) {
+        levelBank.begin();
+    }
     if (announce) {
         Serial.println("✗ [LEVEL] ningún PCF niveles en bus (solo relés 0x24 u offline)");
     }
@@ -544,6 +563,7 @@ void HydroControl::maybeRetryLevelPcf() {
     }
     lastLevelPcfRetryMs = now;
     Wire.setClock(I2C_CLOCK_HZ);
+    Wire.setTimeOut(I2C_TIMEOUT_MS);
     if (discoverAndBindLevelPcf()) {
         Serial.println("[LEVEL] PCF niveles recuperado — L1-L4 activos");
     }
@@ -555,6 +575,10 @@ void HydroControl::refreshTankLevelOkFromAggregate() {
     tankLevelOk = true;
     return;
 #endif
+    if (levelInterlockMode == LEVEL_INTERLOCK_INDEP) {
+        tankLevelOk = true;
+        return;
+    }
     const char* wl = getWaterLevelAggregate();
     if (!wl || !wl[0]) {
         tankLevelOk = false;
@@ -568,11 +592,18 @@ void HydroControl::refreshTankLevelOkFromAggregate() {
 }
 
 const char* HydroControl::getLevelInterlockModeName() const {
-    return levelInterlockMode == LEVEL_INTERLOCK_CARRERA ? "carrera" : "normal";
+    if (levelInterlockMode == LEVEL_INTERLOCK_CARRERA) {
+        return "carrera";
+    }
+    if (levelInterlockMode == LEVEL_INTERLOCK_INDEP) {
+        return "indep";
+    }
+    return "normal";
 }
 
 bool HydroControl::setLevelInterlockMode(LevelInterlockMode mode) {
-    if (mode != LEVEL_INTERLOCK_NORMAL && mode != LEVEL_INTERLOCK_CARRERA) {
+    if (mode != LEVEL_INTERLOCK_NORMAL && mode != LEVEL_INTERLOCK_CARRERA &&
+        mode != LEVEL_INTERLOCK_INDEP) {
         return false;
     }
     levelInterlockMode = mode;
@@ -589,6 +620,8 @@ void HydroControl::loadLevelInterlockModeFromNVS() {
         mode.toLowerCase();
         if (mode == "carrera") {
             levelInterlockMode = LEVEL_INTERLOCK_CARRERA;
+        } else if (mode == "indep") {
+            levelInterlockMode = LEVEL_INTERLOCK_INDEP;
         } else {
             levelInterlockMode = LEVEL_INTERLOCK_NORMAL;
         }
@@ -598,9 +631,38 @@ void HydroControl::loadLevelInterlockModeFromNVS() {
     Serial.printf("[LEVEL] interlock_mode loaded=%s\n", getLevelInterlockModeName());
 }
 
+void HydroControl::accountRadioHold() {
+    const bool held = EspNowChannelPolicy::isProvisioningStaSuspendActive();
+    const unsigned long now = millis();
+    if (held) {
+        if (!radioHold_) {
+            radioHold_ = true;
+            radioHoldStartMs_ = now;
+        }
+        return;
+    }
+    if (!radioHold_) {
+        return;
+    }
+    const unsigned long heldMs = now - radioHoldStartMs_;
+    radioHold_ = false;
+    if (lastPhValidMs != 0) {
+        lastPhValidMs += heldMs;
+    }
+    if (lastEcValidMs != 0) {
+        lastEcValidMs += heldMs;
+    }
+    if (lastTempValidMs != 0) {
+        lastTempValidMs += heldMs;
+    }
+}
+
 bool HydroControl::isPhValidForTelemetry() const {
     if (!phValid || !isfinite(pH)) {
         return false;
+    }
+    if (radioHold_) {
+        return true;
     }
     return (millis() - lastPhValidMs) <= SENSOR_READING_STALE_MS;
 }
@@ -609,12 +671,18 @@ bool HydroControl::isEcValidForTelemetry() const {
     if (!ecValid || !isfinite(ec)) {
         return false;
     }
+    if (radioHold_) {
+        return true;
+    }
     return (millis() - lastEcValidMs) <= SENSOR_READING_STALE_MS;
 }
 
 bool HydroControl::isTempValidForTelemetry() const {
     if (!tempValid || !isfinite(temperature) || temperature <= 0.0f) {
         return false;
+    }
+    if (radioHold_) {
+        return true;
     }
     return (millis() - lastTempValidMs) <= SENSOR_READING_STALE_MS;
 }
@@ -797,7 +865,9 @@ void HydroControl::updateSensors() {
 #if HIDRO_SIMULATE_WATER_LEVELS
     tankLevelOk = true;
 #else
-    if (levelBank.isAvailable()) {
+    if (levelInterlockMode == LEVEL_INTERLOCK_INDEP) {
+        tankLevelOk = true;
+    } else if (levelBank.isAvailable()) {
         refreshTankLevelOkFromAggregate();
     } else {
         tankLevelOk = false;
@@ -812,8 +882,11 @@ bool HydroControl::isLevelWet(int levelIndex) const {
     }
     return false;
 #else
-    if (!levelBank.isAvailable() || levelIndex < 1 || levelIndex > 4) {
-        return false;  // offline: no inventar mojado
+    if (levelIndex < 1 || levelIndex > 4) {
+        return false;
+    }
+    if (!levelBank.isAvailable() && !levelBank.hasSample()) {
+        return false;
     }
     return levelBank.isWet(levelIndex);
 #endif
@@ -823,10 +896,10 @@ const char* HydroControl::getWaterLevelAggregate() const {
 #if HIDRO_SIMULATE_WATER_LEVELS
     return "alto";
 #else
-    if (levelBank.isAvailable()) {
+    if (levelBank.isAvailable() || levelBank.hasSample()) {
         return levelBank.getWaterLevel();
     }
-    return "vazio";  // offline honesto
+    return "vazio";
 #endif
 }
 
