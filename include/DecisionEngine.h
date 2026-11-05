@@ -282,6 +282,9 @@ public:
     void setTankProcedureGateCallback(TankProcedureGateCallback callback) {
         tank_procedure_gate_callback = callback;
     }
+    void setChemicalBusyCallback(std::function<bool()> callback) {
+        chemical_busy_callback = callback;
+    }
     
     // ✅ INTEGRAÇÃO ESP-NOW - Normalizado: usar MasterSlaveManager
     void setMasterManager(MasterSlaveManager* mgr) { masterManager = mgr; }
@@ -310,6 +313,7 @@ private:
     AlertCallback alert_callback;
     LogCallback log_callback;
     TankProcedureGateCallback tank_procedure_gate_callback;
+    std::function<bool()> chemical_busy_callback;
     
     // ✅ INTEGRAÇÃO ESP-NOW - Normalizado: usar MasterSlaveManager
     MasterSlaveManager* masterManager;

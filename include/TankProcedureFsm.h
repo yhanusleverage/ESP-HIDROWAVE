@@ -76,6 +76,7 @@ public:
     void tickAll(const SystemState& state, RelayFn relayFn);
 
     void setTankProcedureGateCallback(TankGateFn cb) { tankGateCb_ = cb; }
+    void setChemicalBusyCallback(std::function<bool()> cb) { chemicalBusyCb_ = cb; }
     void setProcedureFinishedCallback(ProcedureFinishedFn cb) { procedureFinishedCb_ = cb; }
 
     bool hasRule(const String& ruleId) const;
@@ -92,6 +93,7 @@ private:
     /** Guard Drain/Fill: true mientras debe seguir ON (wl != until). */
     bool guardActive(const SystemState& state, const TankActuatorSpec& spec) const;
 
+    bool chemicalBusy() const;
     void setPhase(TankProcedureInstance& p, TankProcPhase next, const char* why);
     void engageGate(TankProcedureInstance& p);
     void releaseGate(TankProcedureInstance& p);
@@ -105,6 +107,7 @@ private:
 
     std::vector<TankProcedureInstance> procs_;
     TankGateFn tankGateCb_;
+    std::function<bool()> chemicalBusyCb_;
     ProcedureFinishedFn procedureFinishedCb_;
     RelayFn lastRelayFn_;
 };

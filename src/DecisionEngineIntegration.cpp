@@ -1,8 +1,10 @@
 #include "DecisionEngineIntegration.h"
 #include "RelayCoordinator.h"
 #include "ScriptRunner.h"
+#include "TankProcedureFsm.h"
 #include "Config.h"
 #include <ArduinoJson.h>
+#include <cstring>
 #include <math.h>
 
 // ===== CONSTRUTOR E DESTRUTOR =====
@@ -56,6 +58,22 @@ bool DecisionEngineIntegration::begin() {
             hydroControl->setTankProcedureActive(active);
         }
     });
+    auto chemicalBusy = [this]() {
+        if (!hydroControl) {
+            return false;
+        }
+        auto busy = [](const char* name) {
+            if (!name || !name[0]) {
+                return false;
+            }
+            return strcmp(name, "dosing") == 0 || strcmp(name, "recirculating") == 0 ||
+                   strncmp(name, "dilut", 5) == 0;
+        };
+        return busy(hydroControl->getEcOperationStateName()) ||
+               busy(hydroControl->getPhOperationStateName());
+    };
+    engine->setChemicalBusyCallback(chemicalBusy);
+    TankProcedureFsmManager::instance().setChemicalBusyCallback(chemicalBusy);
 
     // ScriptRunner: YFB5 + recirc + roles drain/fill (sin EventBus).
     ScriptRunnerManager::instance().setFlowSessionCallbacks(

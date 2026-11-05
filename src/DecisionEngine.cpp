@@ -509,6 +509,18 @@ void DecisionEngine::evaluateAllRules() {
     for (auto& rule : rules) {
         if (!rule.enabled) continue;
 
+        const bool levelRule = rule.condition.sensor_name == "water_level" ||
+                               rule.condition.sensor_name.startsWith("level_");
+        if (!rule.has_script && levelRule && chemical_busy_callback && chemical_busy_callback()) {
+            static unsigned long lastLevelWaitLogMs = 0;
+            const unsigned long nowMs = millis();
+            if (nowMs - lastLevelWaitLogMs >= 5000UL) {
+                lastLevelWaitLogMs = nowMs;
+                Serial.printf("[DE] regla nivel espera quimica id=%s\n", rule.id.c_str());
+            }
+            continue;
+        }
+
         // Mutex Auto pH: não executar ph_low_control quando Auto pH está ativo
         if (rule.id == "ph_low_control" && current_state.auto_ph_active) {
             continue;

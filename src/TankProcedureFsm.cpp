@@ -350,6 +350,8 @@ bool TankProcedureFsmManager::inferFromScript(const JsonObject& ruleJson, TankPr
         Serial.println("[PROC] infer fail: 0 pasos water_level");
         return false;
     }
+    // Nivel y dosis no corren juntos, haya o no block_auto en el guion.
+    out.holdChemical = true;
 
     auto isDrainUntil = [](const String& u) {
         return u == "vazio" || u == "seco" || u == "baixo" || u == "empty";
@@ -561,6 +563,10 @@ const char* TankProcedureFsmManager::kindName(TankProcKind k) const {
     }
 }
 
+bool TankProcedureFsmManager::chemicalBusy() const {
+    return chemicalBusyCb_ && chemicalBusyCb_();
+}
+
 void TankProcedureFsmManager::setPhase(TankProcedureInstance& p, TankProcPhase next, const char* why) {
     Serial.printf("[PROC] %s %s → %s (%s) wl-pending\n",
                   p.ruleId.c_str(), phaseName(p.phase), phaseName(next),
@@ -695,6 +701,15 @@ void TankProcedureFsmManager::startRunning(TankProcedureInstance& p, const Syste
 void TankProcedureFsmManager::tickOne(TankProcedureInstance& p, const SystemState& state,
                                      RelayFn relayFn) {
     if (p.phase == TankProcPhase::Armed && p.pendingStart) {
+        if (chemicalBusy()) {
+            static unsigned long lastWaitLogMs = 0;
+            const unsigned long nowMs = millis();
+            if (nowMs - lastWaitLogMs >= 5000UL) {
+                lastWaitLogMs = nowMs;
+                Serial.printf("[PROC] start espera quimica rule=%s\n", p.ruleId.c_str());
+            }
+            return;
+        }
         p.pendingStart = false;
         startRunning(p, state, relayFn);
         return;
@@ -703,6 +718,15 @@ void TankProcedureFsmManager::tickOne(TankProcedureInstance& p, const SystemStat
     // Schedule rising edge → start
     const bool inWin = inTimeWindow(p.timeWindow);
     if (p.phase == TankProcPhase::Armed && p.timeWindow.active && inWin && !p.wasInWindow) {
+        if (chemicalBusy()) {
+            static unsigned long lastSchedWaitLogMs = 0;
+            const unsigned long nowMs = millis();
+            if (nowMs - lastSchedWaitLogMs >= 5000UL) {
+                lastSchedWaitLogMs = nowMs;
+                Serial.printf("[PROC] schedule espera quimica rule=%s\n", p.ruleId.c_str());
+            }
+            return;
+        }
         Serial.printf("[PROC] schedule start rule=%s\n", p.ruleId.c_str());
         startRunning(p, state, relayFn);
         p.wasInWindow = inWin;
