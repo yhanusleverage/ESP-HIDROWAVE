@@ -104,23 +104,25 @@ export function publishMqttJson(bridgeClient, topic, body, opts = {}) {
 }
 
 /**
- * Upsert retained — same shape Core expects from UI sync.
- * @param {import('mqtt').MqttClient | null} bridgeClient
+ * Misma forma que la web. disable lleva el cuerpo y enabled=false,
+ * para que el Master guarde la regla apagada y el HMI siga mostrándola.
+ * @param {'upsert' | 'disable' | 'delete'} op
  */
-export async function publishRuleUpsertMqtt(bridgeClient, deviceId, ruleRow) {
-  if (!DEVICE_ID_RE.test(deviceId)) {
-    return { ok: false, error: 'invalid device_id' };
+export function buildRuleMqttEnvelope(deviceId, ruleRow, op = 'upsert') {
+  if (!DEVICE_ID_RE.test(deviceId) || !ruleRow?.rule_id) {
+    return null;
   }
   const ruleId = ruleRow.rule_id;
   const ruleJson =
     ruleRow.rule_json && typeof ruleRow.rule_json === 'object'
       ? ruleRow.rule_json
       : {};
+  const enabled = op === 'disable' || op === 'delete' ? false : ruleRow.enabled !== false;
   const ruleBody = {
     rule_id: ruleId,
     rule_name: ruleRow.rule_name ?? ruleId,
     rule_description: ruleRow.rule_description ?? '',
-    enabled: ruleRow.enabled !== false,
+    enabled,
     priority: ruleRow.priority ?? 50,
     rule_json: ruleJson,
   };
@@ -137,22 +139,32 @@ export async function publishRuleUpsertMqtt(bridgeClient, deviceId, ruleRow) {
   if (ruleJson.procedure_kind != null) {
     ruleBody.procedure_kind = ruleJson.procedure_kind;
   }
-
-  const topic = `hidrowave/${deviceId}/rules/${safeMqttRuleId(ruleId)}`;
-  const body = {
+  return {
     v: 1,
-    op: 'upsert',
+    op,
     device_id: deviceId,
     rule_id: ruleId,
     hash: hashRuleBody(ruleBody),
     rule: ruleBody,
   };
+}
+
+/**
+ * Upsert retained — same shape Core expects from UI sync.
+ * @param {import('mqtt').MqttClient | null} bridgeClient
+ */
+export async function publishRuleUpsertMqtt(bridgeClient, deviceId, ruleRow) {
+  const body = buildRuleMqttEnvelope(deviceId, ruleRow, 'upsert');
+  if (!body) {
+    return { ok: false, error: 'invalid device_id' };
+  }
+  const topic = `hidrowave/${deviceId}/rules/${safeMqttRuleId(ruleRow.rule_id)}`;
 
   const r = await publishMqttJson(bridgeClient, topic, body, { retain: true });
   if (r.ok) {
     console.log(`[scheduler-mqtt] upsert retained → ${topic}`);
   } else {
-    console.error(`[scheduler-mqtt] upsert failed rule=${ruleId}:`, r.error || r.skipped);
+    console.error(`[scheduler-mqtt] upsert failed rule=${ruleRow.rule_id}:`, r.error || r.skipped);
   }
   return r;
 }

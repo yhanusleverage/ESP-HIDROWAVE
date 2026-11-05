@@ -25,6 +25,8 @@ MqttClientWrapper::MqttClientWrapper()
     : mqtt(wifiClient),
       lastReconnectAttempt(0),
       reconnectIntervalMs(30000),
+      webWaitAnchorMs(0),
+      webWaitAnchorIntervalMs(0),
       lastFailLogMs(0),
       consecutiveFailCount(0),
       incomingHandler(nullptr),
@@ -212,6 +214,38 @@ bool MqttClientWrapper::publishOnlineStatus() {
     }
 
     return mqtt.publish(statusTopic.c_str(), payload, true);
+}
+
+uint16_t MqttClientWrapper::webLoadWaitSec() const {
+    if (mqtt.connected()) {
+        webWaitAnchorMs = 0;
+        return 0;
+    }
+    const unsigned long now = millis();
+    unsigned long interval = reconnectIntervalMs;
+    unsigned long started = 0;
+    if (WiFi.status() == WL_CONNECTED && lastReconnectAttempt != 0) {
+        started = lastReconnectAttempt;
+        webWaitAnchorMs = 0;
+    } else {
+        if (webWaitAnchorMs == 0 || webWaitAnchorIntervalMs != interval) {
+            webWaitAnchorMs = now;
+            webWaitAnchorIntervalMs = interval;
+        }
+        started = webWaitAnchorMs;
+    }
+    const unsigned long elapsed = now - started;
+    if (elapsed >= interval) {
+        return 1;
+    }
+    unsigned long sec = (interval - elapsed + 999UL) / 1000UL;
+    if (sec < 1UL) {
+        sec = 1UL;
+    }
+    if (sec > 600UL) {
+        sec = 600UL;
+    }
+    return static_cast<uint16_t>(sec);
 }
 
 bool MqttClientWrapper::ensureConnected() {

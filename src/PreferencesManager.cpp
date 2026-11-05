@@ -435,6 +435,41 @@ bool PreferencesManager::saveConfigFloat(const String& key, float value) {
     }
 }
 
+bool PreferencesManager::saveConfigBlob(const String& key, const void* data, size_t len) {
+    if (!ensureInitialized()) return false;
+    if (!validateKey(key) || data == nullptr || len == 0 || len > 4000) return false;
+
+    if (useNVS) {
+        nvs_handle_t nvs_handle;
+        esp_err_t err = nvs_open(PREFERENCES_NAMESPACE, NVS_READWRITE, &nvs_handle);
+        if (err != ESP_OK) return false;
+        err = nvs_set_blob(nvs_handle, key.c_str(), data, len);
+        esp_err_t commit_err = nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        return err == ESP_OK && commit_err == ESP_OK;
+    }
+
+    return preferences.putBytes(key.c_str(), data, len) == len;
+}
+
+bool PreferencesManager::loadConfigBlob(const String& key, void* data, size_t len) {
+    if (!ensureInitialized()) return false;
+    if (!validateKey(key) || data == nullptr || len == 0) return false;
+
+    if (useNVS) {
+        nvs_handle_t nvs_handle;
+        esp_err_t err = nvs_open(PREFERENCES_NAMESPACE, NVS_READONLY, &nvs_handle);
+        if (err != ESP_OK) return false;
+        size_t blob_len = len;
+        esp_err_t get_err = nvs_get_blob(nvs_handle, key.c_str(), data, &blob_len);
+        nvs_close(nvs_handle);
+        return get_err == ESP_OK && blob_len == len;
+    }
+
+    if (!preferences.isKey(key.c_str())) return false;
+    return preferences.getBytes(key.c_str(), data, len) == len;
+}
+
 bool PreferencesManager::loadConfigFloat(const String& key, float& value) {
     if (!ensureInitialized()) return false;
     if (!validateKey(key)) return false;

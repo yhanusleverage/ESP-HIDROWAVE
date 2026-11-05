@@ -256,6 +256,10 @@ public:
      * @return true se carregamento foi bem-sucedido
      */
     static bool loadConfigFloat(const String& key, float& value);
+
+    /** Un blob, un commit. El libro de dosis lo usa una vez por pulso cerrado. */
+    static bool saveConfigBlob(const String& key, const void* data, size_t len);
+    static bool loadConfigBlob(const String& key, void* data, size_t len);
     
     // ===== UTILITÁRIOS =====
     

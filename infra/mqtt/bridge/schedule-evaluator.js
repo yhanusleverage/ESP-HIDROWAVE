@@ -40,6 +40,15 @@ function nowInTimezone(tz) {
   };
 }
 
+function todayYmd(tz) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
 function parseTime(timeStr) {
   if (!timeStr) return null;
   const parts = String(timeStr).split(':');
@@ -117,7 +126,13 @@ function extractActions(ruleJson) {
       }
 
       const durationMs = Number(a.duration_ms || 0);
-      const durationS = durationMs > 0 ? Math.floor(durationMs / 1000) : 0;
+      const durationSec = Number(a.duration || a.duration_seconds || 0);
+      const durationS =
+        durationMs > 0
+          ? Math.floor(durationMs / 1000)
+          : durationSec > 0
+            ? Math.floor(durationSec)
+            : 0;
 
       return {
         relay_index: Number(relayIndex),
@@ -182,6 +197,11 @@ async function matchSchedule(supabase, sched) {
   const target = parseTime(sched.time_start);
   if (!target) return null;
   if (hour !== target.hour || minute !== target.minute) return null;
+
+  if (sched.schedule_type === 'once') {
+    const on = String(sched.on_date || '').slice(0, 10);
+    if (!on || on !== todayYmd(tz)) return null;
+  }
 
   if (sched.schedule_type === 'weekly') {
     if (Array.isArray(sched.days_of_week) && sched.days_of_week.length > 0) {
@@ -257,7 +277,9 @@ async function fireMatch(supabase, mqttClient, { sched, rule, now }) {
     return;
   }
 
-  // Simple: exigir enabled (comportamiento previo)
+  // Decisión: solo un procedimiento apagado se enciende a la hora.
+  // Una regla simple apagada no se habilita sola: encenderla y además
+  // publicar el comando de relé la dispararía dos veces.
   if (rule.enabled === false) {
     console.warn(
       `[scheduler] simple rule ${ruleId} disabled — skip (habilite o use procedure)`
@@ -283,7 +305,7 @@ async function fireMatch(supabase, mqttClient, { sched, rule, now }) {
     });
   }
 
-  await markTriggered(supabase, sched.id, now);
+  await markTriggered(supabase, sched.id, now, sched.schedule_type === 'once');
   console.log(
     `[scheduler] simple rule=${ruleId} device=${deviceId} actions=${actions.length}`
   );
@@ -340,16 +362,18 @@ async function fireProcedureAtivar(supabase, mqttClient, ctx) {
     return;
   }
 
-  await markTriggered(supabase, sched.id, now);
+  await markTriggered(supabase, sched.id, now, sched.schedule_type === 'once');
   console.log(
     `[scheduler] procedure start rule=${ruleId} device=${deviceId} type=${sched.schedule_type}`
   );
 }
 
-async function markTriggered(supabase, scheduleId, now) {
+async function markTriggered(supabase, scheduleId, now, disableAfter) {
+  const patch = { last_triggered_at: now.toISOString() };
+  if (disableAfter) patch.enabled = false;
   const { error: updErr } = await supabase
     .from('rule_schedules')
-    .update({ last_triggered_at: now.toISOString() })
+    .update(patch)
     .eq('id', scheduleId);
   if (updErr) {
     console.error(

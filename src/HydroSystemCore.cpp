@@ -378,7 +378,7 @@ bool HydroSystemCore::applyHmiRuleCreate(const char* name, const char* mac, int 
         kind = "full_recharge";
     }
 
-    static StaticJsonDocument<2048> doc;
+    static StaticJsonDocument<2560> doc;
     doc.clear();
     doc["v"] = 1;
     doc["op"] = "create";
@@ -418,6 +418,15 @@ bool HydroSystemCore::applyHmiRuleCreate(const char* name, const char* mac, int 
         if (relayLabel && relayLabel[0]) {
             step["label"] = relayLabel;
         }
+        JsonObject off = instr.createNestedObject();
+        off["type"] = "relay_action";
+        off["action"] = "off";
+        off["relay_number"] = r;
+        off["target"] = "slave";
+        off["slave_mac"] = mac;
+        if (relayLabel && relayLabel[0]) {
+            off["label"] = relayLabel;
+        }
         JsonObject action = actions.createNestedObject();
         action["type"] = "relay_on";
         action["target_relay"] = r;
@@ -434,7 +443,7 @@ bool HydroSystemCore::applyHmiRuleCreate(const char* name, const char* mac, int 
         return false;
     }
 #if ENABLE_MQTT
-    char payload[1800];
+    char payload[2400];
     const size_t len = serializeJson(doc, payload, sizeof(payload));
     if (len == 0 || len >= sizeof(payload)) {
         Serial.printf("[REGLA] create local ok, MQTT overflow %s\n", id);
@@ -4828,8 +4837,8 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
     hydroControl.getECController().setBaseDose(config.base_dose);
     hydroControl.getECController().setTotalMl(config.total_ml);
     hydroControl.getECController().setKp(config.kp);
-    hydroControl.setECTolerance((float)config.tolerance, false);
     const bool replayEc = mqttRetainReplay();
+    hydroControl.setECTolerance((float)config.tolerance, !replayEc);
     if (replayEc) {
         Serial.println("[EC CONFIG] replay MQTT — auto, litros, setpoint e intervalo no se tocan");
     } else {
@@ -4840,10 +4849,10 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
     }
     hydroControl.setTempoRecirculacaoSeconds(config.tempo_recirculacao);
     hydroControl.setMaxStepEcFraction((float)config.aggressiveness);
-    hydroControl.setEcPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
+    hydroControl.setEcPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec, !replayEc);
     hydroControl.setConsumoEc24hEnabled(config.consumo_24h);
     hydroControl.setDilutionAutoEnabled(
-        config.dilution_auto_enabled || config.auto_enabled, false);
+        config.dilution_auto_enabled || config.auto_enabled, !replayEc);
     hydroControl.setDilutionSlaveRelays(
         config.dilution_drain_slave_mac,
         config.dilution_drain_relay,
@@ -4958,14 +4967,14 @@ bool HydroSystemCore::applyPHConfig(const PHConfig& config, const char* via) {
                   config.ph_setpoint,
                   (float)config.aggressiveness,
                   config.consumo_24h ? 1 : 0);
-    hydroControl.setPHTolerance((float)config.ph_tolerance);
     const bool replayPh = mqttRetainReplay();
+    hydroControl.setPHTolerance((float)config.ph_tolerance, !replayPh);
     if (replayPh) {
         Serial.println("[PH CONFIG] replay MQTT — auto, setpoint e intervalo no se tocan");
     } else {
-        hydroControl.setPHSetpoint((float)config.ph_setpoint, false);
-        hydroControl.setAutoPHInterval(config.intervalo_auto_ph, false);
-        hydroControl.setAutoPHEnabled(config.auto_enabled, false);
+        hydroControl.setPHSetpoint((float)config.ph_setpoint, true);
+        hydroControl.setAutoPHInterval(config.intervalo_auto_ph, true);
+        hydroControl.setAutoPHEnabled(config.auto_enabled, true);
     }
     hydroControl.setPhPumpConfig(
         config.relay_ph_up,
@@ -4973,13 +4982,14 @@ bool HydroSystemCore::applyPHConfig(const PHConfig& config, const char* via) {
         (float)config.flow_rate_ph_up,
         (float)config.flow_rate_ph_down,
         (float)config.ml_per_ph_unit_acid,
-        (float)config.ml_per_ph_unit_base);
+        (float)config.ml_per_ph_unit_base,
+        !replayPh);
     hydroControl.setPhAdaptiveConfig((float)config.aggressiveness, (float)config.gain_alpha);
     if (config.reset_k_gains) {
         hydroControl.resetPhLearnedGains();
     }
-    hydroControl.setPhRecirculacaoSeconds(config.tempo_recirculacao);
-    hydroControl.setPhPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec);
+    hydroControl.setPhRecirculacaoSeconds(config.tempo_recirculacao, !replayPh);
+    hydroControl.setPhPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec, !replayPh);
     hydroControl.setConsumoPh24hEnabled(config.consumo_24h);
 #if ENABLE_HMI_UART
     if (HmiUartBridge* bridge = HmiUartBridge::activeInstance()) {
@@ -5389,6 +5399,27 @@ bool HydroSystemCore::applyProcedureCmdMqtt(const char* payload, size_t length) 
             lastProcAutoDisabledRuleId_ = "";
             lastProcAutoDisabledAtMs_ = 0;
         }
+    }
+    // El reloj manda start con la regla apagada: el archivo está, el motor no.
+    // Mismo paso que el HMI: cargar del archivo y recién entonces arrancar.
+    if (strcasecmp(op, "start") == 0 &&
+        !TankProcedureFsmManager::instance().hasRule(String(ruleId))) {
+        DecisionRule* stored = decisionEngine.getRule(String(ruleId));
+        if (!stored) {
+            Serial.printf("[PROC] cmd rule not found %s (ni en archivo)\n", ruleId);
+            Serial.printf("[MQTT] procedure/cmd rule=%s op=%s → ignored\n", ruleId, op);
+            return false;
+        }
+        stored->enabled = true;
+        const bool started = armHmiRuleRuntime(*stored);
+        if (!started) {
+            stored->enabled = false;
+            TankProcedureFsmManager::instance().removeByRuleId(stored->id);
+        }
+        decisionEngine.saveRulesToFile();
+        Serial.printf("[MQTT] procedure/cmd rule=%s op=start → %s\n",
+                      ruleId, started ? "ok" : "ignored");
+        return started;
     }
     const bool ok = TankProcedureFsmManager::instance().handleCmd(String(ruleId), String(op));
     Serial.printf("[MQTT] procedure/cmd rule=%s op=%s → %s\n", ruleId, op, ok ? "ok" : "ignored");

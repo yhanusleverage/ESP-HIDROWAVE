@@ -3082,7 +3082,16 @@ async function autoDisableRuleAfterProcedure(row) {
     );
   }
 
-  await publishRuleDisableMqtt(row.deviceId, existing);
+  // Regla entera y apagada. El aviso corto de op=disable pisa el texto retenido
+  // y, si el chip no la tiene, no la vuelve a crear.
+  existing.enabled = false;
+  const published = await publishRuleUpsertMqtt(client, row.deviceId, existing);
+  if (!published?.ok) {
+    console.error(
+      `[bridge] auto-disable full upsert failed rule=${ruleId}:`,
+      published?.error || published?.skipped || 'fail'
+    );
+  }
 }
 
 async function handleProcedureFinished(topic, message) {

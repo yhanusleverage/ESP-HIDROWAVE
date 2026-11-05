@@ -54,6 +54,8 @@ HydroControl::HydroControl()
     pulseChunkMl = 0.0f;
     pulseOnDurationMs = 0;
     pulseIndex = 0;
+    memset(&ecDoseLedger_, 0, sizeof(ecDoseLedger_));
+    ecDoseLedgerOpen_ = false;
     consumoEc24hEnabled = false;
     consumoEc24hWindowOpen = false;
     consumoEc24hT0 = 0.0f;
@@ -93,6 +95,9 @@ HydroControl::HydroControl()
     phPulseGapSec = 2.0f;
     phPulseRemainingMl = 0.0f;
     phPulseChunkMl = 0.0f;
+    memset(&phDoseLedger_, 0, sizeof(phDoseLedger_));
+    phDoseLedgerOpen_ = false;
+    phDoseSkipLearn_ = false;
     phPulseOnDurationMs = 0;
     phPulseIndex = 0;
     phGainAlpha = 0.2f;
@@ -1272,6 +1277,173 @@ void HydroControl::completeAutoEcGracefulStopIfNeeded() {
 }
 
 // ✅ Máquina de estados para dosagem sequencial
+static const char* kEcDoseLedgerKey = "ec_dose_open";
+static const uint8_t kEcDoseLedgerMagic = 0xD1;
+static const uint8_t kEcDoseLedgerVersion = 1;
+
+String HydroControl::nutrientNameForRelay(int relay) const {
+    for (int i = 0; i < activeNutrientsCount; i++) {
+        if (dynamicProportions[i].active && dynamicProportions[i].relay == relay &&
+            dynamicProportions[i].name.length() > 0) {
+            return dynamicProportions[i].name;
+        }
+    }
+    if (relay >= 0 && relay < 6 && pumpNameGhost_[relay][0] != '\0') {
+        return String(pumpNameGhost_[relay]);
+    }
+    return String("R") + String(relay + 1);
+}
+
+void HydroControl::persistEcDoseLedger() {
+    if (!ecDoseLedgerOpen_) {
+        return;
+    }
+    if (!PreferencesManager::saveConfigBlob(kEcDoseLedgerKey, &ecDoseLedger_, sizeof(ecDoseLedger_))) {
+        Serial.println("[DOSE] no se pudo guardar el plan");
+    }
+}
+
+void HydroControl::openEcDoseLedger() {
+    memset(&ecDoseLedger_, 0, sizeof(ecDoseLedger_));
+    ecDoseLedger_.magic = kEcDoseLedgerMagic;
+    ecDoseLedger_.version = kEcDoseLedgerVersion;
+    ecDoseLedger_.open = 1;
+    ecDoseLedger_.phase = 0;
+    ecDoseLedger_.count = (uint8_t)totalNutrients;
+    for (int i = 0; i < totalNutrients && i < 8; i++) {
+        ecDoseLedger_.relay[i] = (uint8_t)nutrients[i].relay;
+        ecDoseLedger_.plannedMl[i] = nutrients[i].dosageML;
+        ecDoseLedger_.deliveredMl[i] = 0.0f;
+        Serial.printf("[DOSE] plan %s relé %d %.3fml\n",
+                      nutrients[i].name.c_str(), nutrients[i].relay + 1, nutrients[i].dosageML);
+    }
+    ecDoseLedgerOpen_ = true;
+    persistEcDoseLedger();
+}
+
+void HydroControl::clearEcDoseLedger() {
+    ecDoseLedgerOpen_ = false;
+    memset(&ecDoseLedger_, 0, sizeof(ecDoseLedger_));
+    PreferencesManager::removeConfig(kEcDoseLedgerKey);
+}
+
+void HydroControl::noteEcPulseDelivered(float chunkMl) {
+    if (!ecDoseLedgerOpen_ || chunkMl <= 0.0f) {
+        return;
+    }
+    if (currentNutrientIndex < 0 || currentNutrientIndex >= ecDoseLedger_.count ||
+        currentNutrientIndex >= 8) {
+        return;
+    }
+    float& delivered = ecDoseLedger_.deliveredMl[currentNutrientIndex];
+    delivered += chunkMl;
+    const float planned = ecDoseLedger_.plannedMl[currentNutrientIndex];
+    if (delivered > planned) {
+        delivered = planned;
+    }
+    persistEcDoseLedger();
+    Serial.printf("[DOSE] pulso cerrado %s %.3f/%.3fml\n",
+                  nutrients[currentNutrientIndex].name.c_str(), delivered, planned);
+}
+
+void HydroControl::markEcDoseRecircPhase() {
+    if (!ecDoseLedgerOpen_) {
+        return;
+    }
+    ecDoseLedger_.phase = 1;
+    persistEcDoseLedger();
+}
+
+bool HydroControl::resumeInterruptedEcDose() {
+    if (currentState != IDLE) {
+        return false;
+    }
+    EcDoseLedger loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    if (!PreferencesManager::loadConfigBlob(kEcDoseLedgerKey, &loaded, sizeof(loaded))) {
+        return false;
+    }
+    if (loaded.magic != kEcDoseLedgerMagic || loaded.version != kEcDoseLedgerVersion ||
+        loaded.open != 1 || loaded.count == 0 || loaded.count > 8) {
+        clearEcDoseLedger();
+        return false;
+    }
+
+    ecGainLearnPending = false;
+    ecDoseLedger_ = loaded;
+    ecDoseLedgerOpen_ = true;
+
+    if (loaded.phase == 1) {
+        currentState = RECIRCULATING;
+        stateStartTime = millis();
+        totalNutrients = loaded.count;
+        currentNutrientIndex = loaded.count;
+        Serial.println("[DOSE] retoma solo la recirculacion");
+        showMessage("Recirculando...");
+        notifyPhysicalRecirc(true, "ec");
+        notifyEcOperationChanged();
+        return true;
+    }
+
+    totalNutrients = 0;
+    currentNutrientIndex = 0;
+    for (int i = 0; i < loaded.count; i++) {
+        const float remaining = loaded.plannedMl[i] - loaded.deliveredMl[i];
+        if (remaining <= 0.001f) {
+            continue;
+        }
+        const int relay = loaded.relay[i];
+        const float q = getFlowRateMlPerSecForRelay(relay);
+        if (q < 0.01f) {
+            Serial.printf("[DOSE] relé %d sin caudal — quedan %.3fml sin retomar\n",
+                          relay + 1, remaining);
+            continue;
+        }
+        nutrients[totalNutrients].name = nutrientNameForRelay(relay);
+        nutrients[totalNutrients].relay = relay;
+        nutrients[totalNutrients].dosageML = remaining;
+        nutrients[totalNutrients].flowRateMlPerS = q;
+        nutrients[totalNutrients].durationMs = (int)((remaining / q) * 1000.0f);
+        if (nutrients[totalNutrients].durationMs < 100) {
+            nutrients[totalNutrients].durationMs = 100;
+        }
+        Serial.printf("[DOSE] retoma %s relé %d falta=%.3fml\n",
+                      nutrients[totalNutrients].name.c_str(), relay + 1, remaining);
+        totalNutrients++;
+    }
+
+    if (totalNutrients == 0) {
+        bool anyPlanned = false;
+        for (int i = 0; i < loaded.count; i++) {
+            if (loaded.plannedMl[i] - loaded.deliveredMl[i] > 0.001f) {
+                anyPlanned = true;
+                break;
+            }
+        }
+        if (anyPlanned) {
+            Serial.println("[DOSE] plan abierto sin caudal — se conserva");
+            return false;
+        }
+        if (tempoRecirculacaoSeconds > 0) {
+            markEcDoseRecircPhase();
+            currentState = RECIRCULATING;
+            stateStartTime = millis();
+            currentNutrientIndex = loaded.count;
+            Serial.println("[DOSE] nutrientes cerrados — retoma recirculacion");
+            showMessage("Recirculando...");
+            notifyPhysicalRecirc(true, "ec");
+            notifyEcOperationChanged();
+            return true;
+        }
+        clearEcDoseLedger();
+        return false;
+    }
+
+    openEcDoseLedger();
+    beginEcNutrientPulses();
+    return currentState != IDLE;
+}
+
 void HydroControl::beginEcNutrientPulses() {
     if (currentNutrientIndex < 0 || currentNutrientIndex >= totalNutrients) {
         return;
@@ -1327,6 +1499,7 @@ void HydroControl::advanceAfterEcNutrientComplete(unsigned long now) {
     if (currentNutrientIndex >= totalNutrients) {
         Serial.println("✅ SEQUÊNCIA COMPLETA - TODOS OS NUTRIENTES DOSADOS!");
         if (tempoRecirculacaoSeconds > 0) {
+            markEcDoseRecircPhase();
             currentState = RECIRCULATING;
             stateStartTime = now;
             Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n",
@@ -1335,6 +1508,7 @@ void HydroControl::advanceAfterEcNutrientComplete(unsigned long now) {
             notifyPhysicalRecirc(true, "ec");
             notifyEcOperationChanged();
         } else {
+            clearEcDoseLedger();
             currentState = IDLE;
             totalNutrients = 0;
             currentNutrientIndex = 0;
@@ -1381,6 +1555,7 @@ void HydroControl::processSimpleSequential() {
         if (elapsedSec >= tempoRecirculacaoSeconds) {
             notifyPhysicalRecirc(false, "ec");
             Serial.println("✅ [RECIRC] Tempo de recirculação concluído");
+            clearEcDoseLedger();
             currentState = IDLE;
             totalNutrients = 0;
             currentNutrientIndex = 0;
@@ -1406,11 +1581,12 @@ void HydroControl::processSimpleSequential() {
             if (pulseRemainingMl < 0.0f) {
                 pulseRemainingMl = 0.0f;
             }
+            noteEcPulseDelivered(pulseChunkMl);
 
             if (pulseRemainingMl > 0.001f) {
                 if (ecPulseGapSec > 0.0f) {
                     currentState = PULSE_GAP;
-                    stateStartTime = currentTime;
+                    stateStartTime = millis();
                     Serial.printf("⏳ [GAP EC] %.2fs até próximo pulso (restante=%.3fml)\n",
                         ecPulseGapSec, pulseRemainingMl);
                     notifyEcOperationChanged();
@@ -1436,7 +1612,7 @@ void HydroControl::processSimpleSequential() {
 // ✅ Iniciar dosagem sequencial automática
 void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, float ecActual) {
     // Se já há uma dosagem ativa, não iniciar nova
-    if (currentState != IDLE) {
+    if (currentState != IDLE || ecDoseLedgerOpen_) {
         Serial.println("⚠️  Sistema já ativo - ignorando nova dosagem");
         return;
     }
@@ -1540,6 +1716,7 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
         currentNutrientIndex = 0;
         Serial.printf("✅ [DOSAGEM] SISTEMA SEQUENCIAL INICIADO: %d nutrientes, intervalo %ds, pulse_ml=%.2f gap=%.2fs\n",
             totalNutrients, intervalSeconds, ecPulseMl, ecPulseGapSec);
+        openEcDoseLedger();
         beginEcNutrientPulses();
     } else {
         Serial.println("❌ Nenhuma dosagem significativa para executar");
@@ -1550,7 +1727,7 @@ void HydroControl::startSimpleSequentialDosage(float totalML, float ecSetpoint, 
 // ✅ Executar dosagem recebida do frontend
 void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
     // Se já há uma dosagem ativa, não iniciar nova
-    if (currentState != IDLE) {
+    if (currentState != IDLE || ecDoseLedgerOpen_) {
         Serial.println("⚠️  Sistema já ativo - ignorando nova dosagem web");
         return;
     }
@@ -1603,6 +1780,7 @@ void HydroControl::executeWebDosage(JsonArray distribution, int intervalo) {
         currentNutrientIndex = 0;
         Serial.printf("✅ [DOSAGEM] SISTEMA WEB INICIADO: %d nutrientes, intervalo %ds, pulse_ml=%.2f gap=%.2fs\n",
             totalNutrients, intervalSeconds, ecPulseMl, ecPulseGapSec);
+        openEcDoseLedger();
         beginEcNutrientPulses();
     } else {
         Serial.println("❌ Nenhum nutriente válido recebido da web");
@@ -1639,6 +1817,7 @@ void HydroControl::cancelCurrentDosage() {
         currentNutrientIndex = 0;
         stateStartTime = 0;
         ecGainLearnPending = false;
+        clearEcDoseLedger();
         
         Serial.println("✅ DOSAGEM CANCELADA - Sistema resetado para IDLE");
         autoECGracefulStopPending = false;
@@ -1662,6 +1841,7 @@ void HydroControl::emergencyStopMesh() {
         phActiveRelay = -1;
         phActivePath = PH_PATH_NONE;
         phPulseRemainingMl = 0.0f;
+        clearPhDoseLedger();
         notifyPhOperationChanged();
         Serial.println("[URG] pH cortado — sin guardar K");
     }
@@ -1688,7 +1868,9 @@ bool HydroControl::abortAutoOperationsOnBoot() {
     }
 
     StatePersistenceManager::saveEcPhBootSnapshot("idle", "idle", wasActive);
-    if (wasActive) {
+    if (resumeInterruptedEcDose() || resumeInterruptedPhDose()) {
+        wasActive = true;
+    } else if (wasActive) {
         Serial.println("⚠️ BOOT: ciclo Auto EC/pH interrompido — fail-safe idle");
     }
     return wasActive;
@@ -1863,7 +2045,9 @@ void HydroControl::loadECControllerConfig() {
     float kp = 1.0;
     float setpoint = 0.0;
     float tolerance = 50.0f;
+    int32_t autoEnabledRaw = 0;
     bool autoEnabled = false;
+    int32_t intervalRaw = 30;
     int intervalSeconds = 30;
     int32_t tempoRecircSec = 60;
     
@@ -1874,8 +2058,12 @@ void HydroControl::loadECControllerConfig() {
     PreferencesManager::loadConfigFloat("ec_kp", kp);
     PreferencesManager::loadConfigFloat("ec_setpoint", setpoint);
     PreferencesManager::loadConfigFloat("ec_tolerance", tolerance);
-    PreferencesManager::loadConfigInt("ec_autoEnabled", (int32_t&)autoEnabled);
-    PreferencesManager::loadConfigInt("ec_interval", (int32_t&)intervalSeconds);
+    if (PreferencesManager::loadConfigInt("ec_autoEnabled", autoEnabledRaw)) {
+        autoEnabled = autoEnabledRaw != 0;
+    }
+    if (PreferencesManager::loadConfigInt("ec_interval", intervalRaw) && intervalRaw > 0) {
+        intervalSeconds = (int)intervalRaw;
+    }
     PreferencesManager::loadConfigInt("ec_tempoRecirc", tempoRecircSec);
     
     // Mostrar valores carregados
@@ -1908,6 +2096,18 @@ void HydroControl::loadECControllerConfig() {
     if (intervalSeconds > 0) autoECIntervalSeconds = intervalSeconds;
     if (tempoRecircSec > 0) tempoRecirculacaoSeconds = (unsigned long)tempoRecircSec;
 
+    float pulseMl = 0.0f;
+    float pulseGap = 0.0f;
+    if (PreferencesManager::loadConfigFloat("ec_pulseMl", pulseMl) && pulseMl >= 0.05f) {
+        if (pulseMl > 50.0f) pulseMl = 50.0f;
+        ecPulseMl = pulseMl;
+    }
+    if (PreferencesManager::loadConfigFloat("ec_pulseGap", pulseGap) && pulseGap >= 0.0f) {
+        if (pulseGap > 120.0f) pulseGap = 120.0f;
+        ecPulseGapSec = pulseGap;
+    }
+    Serial.printf("   • pulse:            %.2f ml / %.2fs\n", ecPulseMl, ecPulseGapSec);
+
     float maxStep = 0.5f;
     if (PreferencesManager::loadConfigFloat("ec_maxStep", maxStep)) {
         if (maxStep < 0.05f) maxStep = 0.05f;
@@ -1939,6 +2139,15 @@ void HydroControl::loadECControllerConfig() {
     if (maxVol > 0.0f) dilutionMaxVolumeL = maxVol;
     if (fillLps > 0.0f) dilutionFillFlowLps = fillLps;
     if (ppl > 0.0f) applyFlowCalibrationFromPpl(ppl);
+    String drainMac;
+    String fillMac;
+    if (PreferencesManager::loadConfig("dil_drainMac", drainMac) && drainMac.length() > 0) {
+        dilutionDrainSlaveMac = drainMac;
+    }
+    if (PreferencesManager::loadConfig("dil_fillMac", fillMac) && fillMac.length() > 0) {
+        dilutionFillSlaveMac = fillMac;
+    }
+    dilutionAutoEnabled = dilutionAutoEnabled || autoECEnabled;
     Serial.printf("   • dilution_auto:    %s\n", dilutionAutoEnabled ? "true" : "false");
     Serial.printf("   • dil_drain_relay:  %d\n", dilutionDrainRelay);
     Serial.printf("   • dil_fill_relay:   %d\n", dilutionFillRelay);
@@ -1953,11 +2162,14 @@ void HydroControl::loadPHControllerConfig() {
     Serial.println("╚════════════════════════════════════════════════════╝");
 
     float setpoint = 0.0f;
+    int32_t autoEnabledRaw = 0;
     bool autoEnabled = false;
     int32_t intervalSeconds = 300;
 
     PreferencesManager::loadConfigFloat("ph_setpoint", setpoint);
-    PreferencesManager::loadConfigInt("ph_autoEnabled", (int32_t&)autoEnabled);
+    if (PreferencesManager::loadConfigInt("ph_autoEnabled", autoEnabledRaw)) {
+        autoEnabled = autoEnabledRaw != 0;
+    }
     PreferencesManager::loadConfigInt("ph_interval", intervalSeconds);
     float mlAcid = 0.0f;
     float mlBase = 0.0f;
@@ -1976,6 +2188,42 @@ void HydroControl::loadPHControllerConfig() {
     if (setpoint > 0.0f) phSetpoint = setpoint;
     autoPHEnabled = autoEnabled;
     if (intervalSeconds > 0) autoPHIntervalSeconds = (int)intervalSeconds;
+
+    float phTol = 0.0f;
+    if (PreferencesManager::loadConfigFloat("ph_tol", phTol) && phTol > 0.0f) {
+        phTolerance = phTol;
+        Serial.printf("   • tolerancia:       %.2f\n", phTolerance);
+    }
+    float phPulse = 0.0f;
+    float phGap = 0.0f;
+    if (PreferencesManager::loadConfigFloat("ph_pulseMl", phPulse) && phPulse >= 0.05f) {
+        if (phPulse > 50.0f) phPulse = 50.0f;
+        phPulseMl = phPulse;
+    }
+    if (PreferencesManager::loadConfigFloat("ph_pulseGap", phGap) && phGap >= 0.0f) {
+        if (phGap > 120.0f) phGap = 120.0f;
+        phPulseGapSec = phGap;
+    }
+    Serial.printf("   • pulse:            %.2f ml / %.2fs\n", phPulseMl, phPulseGapSec);
+    int32_t phRecirc = 0;
+    if (PreferencesManager::loadConfigInt("ph_recirc", phRecirc) && phRecirc > 0) {
+        phRecircSeconds = (unsigned long)phRecirc;
+        Serial.printf("   • recirculacion:    %lds\n", (long)phRecirc);
+    }
+    int32_t relayUp = -2;
+    int32_t relayDn = -2;
+    if (PreferencesManager::loadConfigInt("ph_relayUp", relayUp) && relayUp >= -1 && relayUp < 8) {
+        relayPhUp = (int)relayUp;
+    }
+    if (PreferencesManager::loadConfigInt("ph_relayDn", relayDn) && relayDn >= -1 && relayDn < 8) {
+        relayPhDown = (int)relayDn;
+    }
+    Serial.printf("   • reles up/down:    %d / %d\n", relayPhUp, relayPhDown);
+    float gainA = 0.0f;
+    if (PreferencesManager::loadConfigFloat("ph_gainA", gainA) && gainA >= 0.05f) {
+        if (gainA > 0.5f) gainA = 0.5f;
+        phGainAlpha = gainA;
+    }
 
     float maxStepPh = 0.5f;
     if (PreferencesManager::loadConfigFloat("ph_maxStep", maxStepPh)) {
@@ -2355,23 +2603,44 @@ void HydroControl::setMaxStepEcFraction(float fraction) {
     PreferencesManager::saveConfigFloat("ec_maxStep", ecAggressiveness);
 }
 
-void HydroControl::setEcPulseDosing(float pulseMl, float pulseGapSec) {
-    ecPulseMl = pulseMl;
-    if (ecPulseMl < 0.05f) ecPulseMl = 0.05f;
-    if (ecPulseMl > 50.0f) ecPulseMl = 50.0f;
-    ecPulseGapSec = pulseGapSec;
-    if (ecPulseGapSec < 0.0f) ecPulseGapSec = 0.0f;
-    if (ecPulseGapSec > 120.0f) ecPulseGapSec = 120.0f;
+void HydroControl::setEcPulseDosing(float pulseMl, float pulseGapSec, bool saveToNVS) {
+    float ml = pulseMl;
+    if (ml < 0.05f) ml = 0.05f;
+    if (ml > 50.0f) ml = 50.0f;
+    float gap = pulseGapSec;
+    if (gap < 0.0f) gap = 0.0f;
+    if (gap > 120.0f) gap = 120.0f;
+    if (fabsf(ecPulseMl - ml) < 0.0001f && fabsf(ecPulseGapSec - gap) < 0.0001f) {
+        return;
+    }
+    ecPulseMl = ml;
+    ecPulseGapSec = gap;
+    if (!saveToNVS) {
+        return;
+    }
+    PreferencesManager::saveConfigFloat("ec_pulseMl", ecPulseMl);
+    PreferencesManager::saveConfigFloat("ec_pulseGap", ecPulseGapSec);
+    Serial.printf("[EC CONFIG] pulso %.2f ml / %.2fs guardado en NVS\n", ecPulseMl, ecPulseGapSec);
 }
 
-void HydroControl::setPhPulseDosing(float pulseMl, float pulseGapSec) {
-    phPulseMl = pulseMl;
-    if (phPulseMl < 0.05f) phPulseMl = 0.05f;
-    if (phPulseMl > 50.0f) phPulseMl = 50.0f;
-    phPulseGapSec = pulseGapSec;
-    if (phPulseGapSec < 0.0f) phPulseGapSec = 0.0f;
-    if (phPulseGapSec > 120.0f) phPulseGapSec = 120.0f;
-    Serial.printf("📐 [AUTO PH] pulse_ml=%.2f gap=%.2fs\n", phPulseMl, phPulseGapSec);
+void HydroControl::setPhPulseDosing(float pulseMl, float pulseGapSec, bool saveToNVS) {
+    float ml = pulseMl;
+    if (ml < 0.05f) ml = 0.05f;
+    if (ml > 50.0f) ml = 50.0f;
+    float gap = pulseGapSec;
+    if (gap < 0.0f) gap = 0.0f;
+    if (gap > 120.0f) gap = 120.0f;
+    if (fabsf(phPulseMl - ml) < 0.0001f && fabsf(phPulseGapSec - gap) < 0.0001f) {
+        return;
+    }
+    phPulseMl = ml;
+    phPulseGapSec = gap;
+    if (!saveToNVS) {
+        return;
+    }
+    PreferencesManager::saveConfigFloat("ph_pulseMl", phPulseMl);
+    PreferencesManager::saveConfigFloat("ph_pulseGap", phPulseGapSec);
+    Serial.printf("[PH CONFIG] pulso %.2f ml / %.2fs guardado en NVS\n", phPulseMl, phPulseGapSec);
 }
 
 void HydroControl::setConsumoEc24hEnabled(bool enabled) {
@@ -2880,6 +3149,45 @@ void HydroControl::saveNutrientProportions() {
 
 // ===== Auto pH =====
 
+void HydroControl::setPHTolerance(float tolerance, bool saveToNVS) {
+    if (!(tolerance > 0.0f) || !isfinite(tolerance)) {
+        return;
+    }
+    if (fabsf(tolerance - phTolerance) < 0.0001f) {
+        return;
+    }
+    phTolerance = tolerance;
+    if (!saveToNVS) {
+        return;
+    }
+    PreferencesManager::saveConfigFloat("ph_tol", phTolerance);
+    Serial.printf("[PH CONFIG] tolerancia %.2f guardada en NVS\n", phTolerance);
+}
+
+void HydroControl::setPhRecirculacaoSeconds(unsigned long seconds, bool saveToNVS) {
+    const unsigned long next = seconds > 0 ? seconds : 60;
+    if (next == phRecircSeconds) {
+        return;
+    }
+    phRecircSeconds = next;
+    if (!saveToNVS) {
+        return;
+    }
+    PreferencesManager::saveConfigInt("ph_recirc", (int32_t)phRecircSeconds);
+    Serial.printf("[PH CONFIG] recirculacion %lus guardada en NVS\n", phRecircSeconds);
+}
+
+void HydroControl::setPhPumpRelays(int relayUp, int relayDown) {
+    if (relayPhUp == relayUp && relayPhDown == relayDown) {
+        return;
+    }
+    relayPhUp = relayUp;
+    relayPhDown = relayDown;
+    PreferencesManager::saveConfigInt("ph_relayUp", relayPhUp);
+    PreferencesManager::saveConfigInt("ph_relayDn", relayPhDown);
+    Serial.printf("[PH CONFIG] reles up=%d down=%d guardados en NVS\n", relayPhUp, relayPhDown);
+}
+
 void HydroControl::setPHSetpoint(float setpoint, bool saveToNVS) {
     phSetpoint = setpoint;
     if (saveToNVS) {
@@ -2902,6 +3210,7 @@ void HydroControl::setAutoPHEnabled(bool enabled, bool saveToNVS) {
     }
     if (saveToNVS) {
         PreferencesManager::saveConfigInt("ph_autoEnabled", enabled ? 1 : 0);
+        Serial.printf("[PH CONFIG] auto %s guardado en NVS\n", enabled ? "ON" : "OFF");
     }
 }
 
@@ -2931,15 +3240,39 @@ bool HydroControl::applyPhMlPerUnit(bool acid, float mlPerPh) {
 }
 
 void HydroControl::setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
-                                     float mlPerUnitAcid, float mlPerUnitBase) {
+                                     float mlPerUnitAcid, float mlPerUnitBase, bool saveToNVS) {
+    const bool relaysMoved = relayPhUp != relayUp || relayPhDown != relayDown;
+    const float nextUp = flowUp > 0 ? flowUp : 1.0f;
+    const float nextDown = flowDown > 0 ? flowDown : 1.0f;
+    const float nextAcid = mlPerUnitAcid > 0 ? mlPerUnitAcid : 2.0f;
+    const float nextBase = mlPerUnitBase > 0 ? mlPerUnitBase : 2.0f;
+    const bool flowMoved = fabsf(nextUp - flowRatePhUp) >= 0.0001f
+        || fabsf(nextDown - flowRatePhDown) >= 0.0001f;
+    const bool mlMoved = fabsf(nextAcid - mlPerPhUnitAcid) >= 0.0001f
+        || fabsf(nextBase - mlPerPhUnitBase) >= 0.0001f;
     relayPhUp = relayUp;
     relayPhDown = relayDown;
-    flowRatePhUp = flowUp > 0 ? flowUp : 1.0f;
-    flowRatePhDown = flowDown > 0 ? flowDown : 1.0f;
-    mlPerPhUnitAcid = mlPerUnitAcid > 0 ? mlPerUnitAcid : 2.0f;
-    mlPerPhUnitBase = mlPerUnitBase > 0 ? mlPerUnitBase : 2.0f;
+    flowRatePhUp = nextUp;
+    flowRatePhDown = nextDown;
+    mlPerPhUnitAcid = nextAcid;
+    mlPerPhUnitBase = nextBase;
     if (adaptivePhController.getValidLearningCycles() == 0) {
         adaptivePhController.setSeedFromMlPerPhUnit(phSetpoint, mlPerPhUnitAcid, mlPerPhUnitBase);
+    }
+    if (!saveToNVS) {
+        return;
+    }
+    if (relaysMoved) {
+        PreferencesManager::saveConfigInt("ph_relayUp", relayPhUp);
+        PreferencesManager::saveConfigInt("ph_relayDn", relayPhDown);
+        Serial.printf("[PH CONFIG] reles up=%d down=%d guardados en NVS\n", relayPhUp, relayPhDown);
+    }
+    if (flowMoved) {
+        savePhFlowRatesToNVS();
+    }
+    if (mlMoved) {
+        PreferencesManager::saveConfigFloat("ph_ml_acid", mlPerPhUnitAcid);
+        PreferencesManager::saveConfigFloat("ph_ml_base", mlPerPhUnitBase);
     }
 }
 
@@ -2950,8 +3283,12 @@ void HydroControl::setPhAdaptiveConfig(float aggressiveness, float gainAlpha) {
         phAggressiveness = next;
         PreferencesManager::saveConfigFloat("ph_maxStep", phAggressiveness);
     }
-    phGainAlpha = gainAlpha >= 0.05f ? gainAlpha : 0.2f;
-    if (phGainAlpha > 0.5f) phGainAlpha = 0.5f;
+    float nextAlpha = gainAlpha >= 0.05f ? gainAlpha : 0.2f;
+    if (nextAlpha > 0.5f) nextAlpha = 0.5f;
+    if (fabsf(nextAlpha - phGainAlpha) >= 0.0001f) {
+        phGainAlpha = nextAlpha;
+        PreferencesManager::saveConfigFloat("ph_gainA", phGainAlpha);
+    }
 }
 
 void HydroControl::resetPhLearnedGains() {
@@ -2990,6 +3327,128 @@ void HydroControl::notifyPhOperationChanged() {
     if (phOperationSyncCallback) {
         phOperationSyncCallback(phOperationSyncCallbackUserData);
     }
+}
+
+static const char* kPhDoseLedgerKey = "ph_dose_open";
+static const uint8_t kPhDoseLedgerMagic = 0xD2;
+static const uint8_t kPhDoseLedgerVersion = 1;
+
+void HydroControl::persistPhDoseLedger() {
+    if (!phDoseLedgerOpen_) {
+        return;
+    }
+    if (!PreferencesManager::saveConfigBlob(kPhDoseLedgerKey, &phDoseLedger_, sizeof(phDoseLedger_))) {
+        Serial.println("[DOSE] no se pudo guardar el plan pH");
+    }
+}
+
+void HydroControl::openPhDoseLedger() {
+    memset(&phDoseLedger_, 0, sizeof(phDoseLedger_));
+    phDoseLedger_.magic = kPhDoseLedgerMagic;
+    phDoseLedger_.version = kPhDoseLedgerVersion;
+    phDoseLedger_.open = 1;
+    phDoseLedger_.phase = 0;
+    phDoseLedger_.relay = (int8_t)phActiveRelay;
+    phDoseLedger_.path = (int8_t)phActivePath;
+    phDoseLedger_.plannedMl = phCycleMlApplied;
+    phDoseLedger_.deliveredMl = 0.0f;
+    phDoseLedgerOpen_ = true;
+    const char* pathLabel = (phActivePath == PH_PATH_BASE) ? "pH+" : "pH-";
+    Serial.printf("[DOSE] plan %s relé %d %.3fml\n", pathLabel, phActiveRelay + 1, phCycleMlApplied);
+    persistPhDoseLedger();
+}
+
+void HydroControl::clearPhDoseLedger() {
+    phDoseLedgerOpen_ = false;
+    memset(&phDoseLedger_, 0, sizeof(phDoseLedger_));
+    PreferencesManager::removeConfig(kPhDoseLedgerKey);
+}
+
+void HydroControl::notePhPulseDelivered(float chunkMl) {
+    if (!phDoseLedgerOpen_ || chunkMl <= 0.0f) {
+        return;
+    }
+    phDoseLedger_.deliveredMl += chunkMl;
+    if (phDoseLedger_.deliveredMl > phDoseLedger_.plannedMl) {
+        phDoseLedger_.deliveredMl = phDoseLedger_.plannedMl;
+    }
+    persistPhDoseLedger();
+    const char* pathLabel = (phDoseLedger_.path == (int8_t)PH_PATH_BASE) ? "pH+" : "pH-";
+    Serial.printf("[DOSE] pulso cerrado %s %.3f/%.3fml\n",
+                  pathLabel, phDoseLedger_.deliveredMl, phDoseLedger_.plannedMl);
+}
+
+void HydroControl::markPhDoseRecircPhase() {
+    if (!phDoseLedgerOpen_) {
+        return;
+    }
+    phDoseLedger_.phase = 1;
+    persistPhDoseLedger();
+}
+
+bool HydroControl::resumeInterruptedPhDose() {
+    if (phAutoState != PH_IDLE || currentState != IDLE) {
+        return false;
+    }
+    PhDoseLedger loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    if (!PreferencesManager::loadConfigBlob(kPhDoseLedgerKey, &loaded, sizeof(loaded))) {
+        return false;
+    }
+    if (loaded.magic != kPhDoseLedgerMagic || loaded.version != kPhDoseLedgerVersion ||
+        loaded.open != 1 || loaded.plannedMl <= 0.001f) {
+        clearPhDoseLedger();
+        return false;
+    }
+    if (loaded.path != (int8_t)PH_PATH_BASE && loaded.path != (int8_t)PH_PATH_ACID) {
+        clearPhDoseLedger();
+        return false;
+    }
+    if (loaded.relay < 0 || loaded.relay >= 8) {
+        clearPhDoseLedger();
+        return false;
+    }
+
+    phDoseSkipLearn_ = true;
+    phDoseLedger_ = loaded;
+    phDoseLedgerOpen_ = true;
+    phActiveRelay = loaded.relay;
+    phActivePath = (PhCorrectionPath)loaded.path;
+    phCycleMlApplied = loaded.plannedMl;
+    const char* pathLabel = (phActivePath == PH_PATH_BASE) ? "pH+" : "pH-";
+    const float flow = (phActivePath == PH_PATH_BASE) ? flowRatePhUp : flowRatePhDown;
+
+    if (loaded.phase == 1) {
+        phAutoState = PH_RECIRCULATING;
+        phStateStartMs = millis();
+        Serial.println("[DOSE] retoma solo la recirculacion pH");
+        notifyPhysicalRecirc(true, "ph");
+        notifyPhOperationChanged();
+        return true;
+    }
+
+    const float remaining = loaded.plannedMl - loaded.deliveredMl;
+    if (remaining <= 0.001f) {
+        markPhDoseRecircPhase();
+        phAutoState = PH_RECIRCULATING;
+        phStateStartMs = millis();
+        Serial.println("[DOSE] pH cerrado — retoma recirculacion");
+        notifyPhysicalRecirc(true, "ph");
+        notifyPhOperationChanged();
+        return true;
+    }
+    if (flow < 0.01f) {
+        Serial.printf("[DOSE] %s relé %d sin caudal — quedan %.3fml\n",
+                      pathLabel, phActiveRelay + 1, remaining);
+        return false;
+    }
+
+    phCycleMlApplied = remaining;
+    Serial.printf("[DOSE] retoma %s relé %d falta=%.3fml\n",
+                  pathLabel, phActiveRelay + 1, remaining);
+    openPhDoseLedger();
+    beginPhDosePulses(flow);
+    return phAutoState != PH_IDLE;
 }
 
 void HydroControl::beginPhDosePulses(float flowMlPerS) {
@@ -3033,6 +3492,10 @@ void HydroControl::startPhAutoDosage(int relay, float durationSec, PhCorrectionP
         return;
     }
 #endif
+    if (phDoseLedgerOpen_) {
+        Serial.println("[DOSE] plan pH abierto — no se calcula otra dosis");
+        return;
+    }
     const char* pathLabel = (path == PH_PATH_BASE) ? "pH+" : (path == PH_PATH_ACID) ? "pH-" : "pH";
 
     phActiveRelay = relay;
@@ -3053,19 +3516,23 @@ void HydroControl::startPhAutoDosage(int relay, float durationSec, PhCorrectionP
     Serial.printf("🚀 [DOSAGEM pH] Iniciando: %s - %.3fml (pulsos %.2fml / gap %.2fs) - Relé %d\n",
         pathLabel, mlApplied, phPulseMl, phPulseGapSec, relay + 1);
 
+    openPhDoseLedger();
     beginPhDosePulses(flow);
     Serial.printf("✅ [DOSAGEM pH] Ciclo iniciado: %.3f ml, relé %d\n", mlApplied, relay + 1);
 }
 
 void HydroControl::finishPhRecirculation() {
     notifyPhysicalRecirc(false, "ph");
-    const float hAfter = AdaptivePHController::toH(pH);
-    const bool kLearned = adaptivePhController.updateGainAfterDose(
-        phActivePath, phCycleHBefore, hAfter, phCycleMlApplied, phGainAlpha);
+    if (!phDoseSkipLearn_) {
+        const float hAfter = AdaptivePHController::toH(pH);
+        const bool kLearned = adaptivePhController.updateGainAfterDose(
+            phActivePath, phCycleHBefore, hAfter, phCycleMlApplied, phGainAlpha);
 
-    if (kLearned && phGainLearnedCallback) {
-        phGainLearnedCallback(phGainLearnedCallbackUserData);
+        if (kLearned && phGainLearnedCallback) {
+            phGainLearnedCallback(phGainLearnedCallbackUserData);
+        }
     }
+    phDoseSkipLearn_ = false;
 
     if (adaptivePhController.needsAdjustment(phSetpoint, pH, phTolerance)) {
         // ainda fora da banda — mantém contador consecutivo
@@ -3077,6 +3544,7 @@ void HydroControl::finishPhRecirculation() {
     phActiveRelay = -1;
     phActivePath = PH_PATH_NONE;
     phCycleDurationMs = 0;
+    clearPhDoseLedger();
     lastPHCheck = millis();
     lastPHCheckAtMs = millis();
     Serial.println("✅ SEQUÊNCIA pH COMPLETA");
@@ -3125,11 +3593,12 @@ void HydroControl::processPhAutoState() {
             if (phPulseRemainingMl < 0.0f) {
                 phPulseRemainingMl = 0.0f;
             }
+            notePhPulseDelivered(phPulseChunkMl);
 
             if (phPulseRemainingMl > 0.001f) {
                 if (phPulseGapSec > 0.0f) {
                     phAutoState = PH_PULSE_GAP;
-                    phStateStartMs = now;
+                    phStateStartMs = millis();
                     Serial.printf("⏳ [GAP pH] %.2fs até próximo pulso (restante=%.3fml)\n",
                         phPulseGapSec, phPulseRemainingMl);
                     notifyPhOperationChanged();
@@ -3138,6 +3607,7 @@ void HydroControl::processPhAutoState() {
                 }
             } else {
                 emitPhDoseEvent();
+                markPhDoseRecircPhase();
                 phAutoState = PH_RECIRCULATING;
                 phStateStartMs = now;
                 Serial.printf("⏳ [RECIRC] Aguardando %lu s (tempo_recirculacao)...\n", phRecircSeconds);

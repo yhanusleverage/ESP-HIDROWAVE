@@ -227,6 +227,8 @@ public:
     void loop();
 
     bool isConnected() const { return mqtt.connected(); }
+    /** Segundos hasta el próximo intento MQTT. 0 = ya conectado a la web. */
+    uint16_t webLoadWaitSec() const;
     bool publishTelemetry(const MqttTelemetryReading& reading);
     bool publishLevels(const MqttLevelsReading& reading);
     bool publishHeartbeat(const MqttHeartbeatReading& reading);
@@ -305,6 +307,9 @@ private:
     char lwtPayload[128];
     unsigned long lastReconnectAttempt;
     unsigned long reconnectIntervalMs;
+    /** Cuenta atrás antes del primer intento, para no repetir 30 s en cada telemetría. */
+    mutable unsigned long webWaitAnchorMs;
+    mutable unsigned long webWaitAnchorIntervalMs;
     unsigned long lastFailLogMs;
     uint8_t consecutiveFailCount;
     MqttIncomingHandler incomingHandler;
@@ -329,6 +334,7 @@ public:
     bool begin(const String&) { return false; }
     void loop() {}
     bool isConnected() const { return false; }
+    uint16_t webLoadWaitSec() const { return 0; }
     bool publishTelemetry(const MqttTelemetryReading&) { return false; }
     bool publishLevels(const MqttLevelsReading&) { return false; }
     bool publishHeartbeat(const MqttHeartbeatReading&) { return false; }

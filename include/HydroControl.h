@@ -280,10 +280,10 @@ public:
     bool isConsumoPh24hEnabled() const { return consumoPh24hEnabled; }
     void setTempoRecirculacaoSeconds(unsigned long seconds);
     unsigned long getTempoRecirculacaoSeconds() const { return tempoRecirculacaoSeconds; }
-    void setEcPulseDosing(float pulseMl, float pulseGapSec);
+    void setEcPulseDosing(float pulseMl, float pulseGapSec, bool saveToNVS = true);
     float getEcPulseMl() const { return ecPulseMl; }
     float getEcPulseGapSec() const { return ecPulseGapSec; }
-    void setPhPulseDosing(float pulseMl, float pulseGapSec);
+    void setPhPulseDosing(float pulseMl, float pulseGapSec, bool saveToNVS = true);
     float getPhPulseMl() const { return phPulseMl; }
     float getPhPulseGapSec() const { return phPulseGapSec; }
     void setNutrientDoseCallback(NutrientDoseCallback cb, void* userData);
@@ -357,14 +357,14 @@ public:
     const AdaptivePHController& getAdaptivePHController() const { return adaptivePhController; }
     void setPHSetpoint(float setpoint, bool saveToNVS = true);
     float getPHSetpoint() const { return phSetpoint; }
-    void setPHTolerance(float tolerance) { phTolerance = tolerance; }
+    void setPHTolerance(float tolerance, bool saveToNVS = true);
     float getPHTolerance() const { return phTolerance; }
     void setAutoPHEnabled(bool enabled, bool saveToNVS = true);
     bool isAutoPHEnabled() const { return autoPHEnabled; }
     void setAutoPHInterval(int intervalSeconds, bool saveToNVS = true);
     int getAutoPHInterval() const { return autoPHIntervalSeconds; }
     void setPhPumpConfig(int relayUp, int relayDown, float flowUp, float flowDown,
-                         float mlPerUnitAcid, float mlPerUnitBase);
+                         float mlPerUnitAcid, float mlPerUnitBase, bool saveToNVS = true);
     /** ml por punto de pH del vaso. acid=true es pH−. No usa litros del sistema. */
     bool applyPhMlPerUnit(bool acid, float mlPerPh);
     void setPhAdaptiveConfig(float aggressiveness, float gainAlpha);
@@ -374,7 +374,7 @@ public:
     void setPhGainLearnedCallback(PhGainLearnedCallback cb, void* userData);
     void setEcGainLearnedCallback(EcGainLearnedCallback cb, void* userData);
     float getPhErrorH() const;
-    void setPhRecirculacaoSeconds(unsigned long seconds) { phRecircSeconds = seconds > 0 ? seconds : 60; }
+    void setPhRecirculacaoSeconds(unsigned long seconds, bool saveToNVS = true);
     void setPhOperationSyncCallback(PhOperationSyncCallback cb, void* userData);
     const char* getPhOperationStateName() const;
     int getPhOperationRemainingSec() const;
@@ -423,10 +423,7 @@ public:
     float getFlowRatePhUp() const { return flowRatePhUp; }
     float getFlowRatePhDown() const { return flowRatePhDown; }
     /** Solo el rol. -1 = sin bomba. No toca el caudal calibrado. */
-    void setPhPumpRelays(int relayUp, int relayDown) {
-        relayPhUp = relayUp;
-        relayPhDown = relayDown;
-    }
+    void setPhPumpRelays(int relayUp, int relayDown);
 
 private:
     // Hardware
@@ -672,6 +669,46 @@ private:
     void beginEcNutrientPulses();
     bool startEcPulseOn();
     void advanceAfterEcNutrientComplete(unsigned long now);
+    /** Plan congelado de la dosis en curso. Se borra al volver a IDLE. */
+    struct EcDoseLedger {
+        uint8_t magic;
+        uint8_t version;
+        uint8_t open;
+        uint8_t count;
+        uint8_t phase;
+        uint8_t relay[8];
+        float plannedMl[8];
+        float deliveredMl[8];
+    };
+    EcDoseLedger ecDoseLedger_;
+    bool ecDoseLedgerOpen_;
+    void openEcDoseLedger();
+    void persistEcDoseLedger();
+    void clearEcDoseLedger();
+    void noteEcPulseDelivered(float chunkMl);
+    void markEcDoseRecircPhase();
+    bool resumeInterruptedEcDose();
+    String nutrientNameForRelay(int relay) const;
+    /** Una bomba. Se borra al cerrar la recirculación de pH. */
+    struct PhDoseLedger {
+        uint8_t magic;
+        uint8_t version;
+        uint8_t open;
+        uint8_t phase;
+        int8_t relay;
+        int8_t path;
+        float plannedMl;
+        float deliveredMl;
+    };
+    PhDoseLedger phDoseLedger_;
+    bool phDoseLedgerOpen_;
+    bool phDoseSkipLearn_;
+    void openPhDoseLedger();
+    void persistPhDoseLedger();
+    void clearPhDoseLedger();
+    void notePhPulseDelivered(float chunkMl);
+    void markPhDoseRecircPhase();
+    bool resumeInterruptedPhDose();
     bool isAutoEcCycleActive() const;
     void completeAutoEcGracefulStopIfNeeded();
     void beginPhDosePulses(float flowMlPerS);

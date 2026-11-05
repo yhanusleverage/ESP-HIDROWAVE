@@ -524,6 +524,10 @@ void HmiUartBridge::publishTelemetryNow() {
     doc["autoEc"] = hydro.isAutoECEnabled();
     doc["autoPh"] = hydro.isAutoPHEnabled();
     doc["wifi_off"] = stateManager.wifiUserOffline() ? 1 : 0;
+    doc["up"] = millis() / 1000UL;
+    if (!stateManager.wifiUserOffline() && ctx_.mqtt) {
+        doc["web_s"] = ctx_.mqtt->webLoadWaitSec();
+    }
     const size_t n = serializeJson(doc, lastTelemetryJson_, sizeof(lastTelemetryJson_));
     lastTelemetryValid_ = (n > 0 && n < sizeof(lastTelemetryJson_));
     if (!lastTelemetryValid_) {
@@ -1516,6 +1520,11 @@ void stepsFromScript(const String &json, RuleSnap &snap) {
             }
             continue;
         }
+        String actName = ij["action"] | "";
+        actName.toLowerCase();
+        if (actName == "off") {
+            continue;
+        }
         JsonObject act = ij["actuator"].as<JsonObject>();
         JsonObject target = act.isNull() ? ij : act;
         const int relay = readRelayNumber(target);
@@ -1868,6 +1877,7 @@ void HmiUartBridge::loop() {
                     if (!plantCfgPushed_ && ctx_.hydro) {
                         plantCfgPushed_ = true;
                         publishPlantCfg();
+                        publishLoopCfg();
                     }
                 } else if (err == DeserializationError::NoMemory) {
                     Serial.printf("[HMI UART] BUFFER LLENO (cap=%u, linea=%u B) — mensaje descartado\n",
