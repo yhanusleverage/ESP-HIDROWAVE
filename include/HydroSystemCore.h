@@ -277,6 +277,10 @@ private:
     static const unsigned long PROC_AUTO_DISABLE_COOLDOWN_MS = 45000;
     String lastProcAutoDisabledRuleId_;
     unsigned long lastProcAutoDisabledAtMs_ = 0;
+    /** Un start repetido del mismo mensaje no debe abrir las bombas otra vez. */
+    static const unsigned long PROCEDURE_START_DUP_MS = 20000;
+    String lastProcedureStartRuleId_;
+    unsigned long lastProcedureStartAtMs_ = 0;
     bool tryPublishCloudAckViaMqtt(int supabaseCommandId, uint32_t espNowCommandId,
                                    const uint8_t* slaveMac, int relayNumber, bool currentState,
                                    const char* status = "completed");

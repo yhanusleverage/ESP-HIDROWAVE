@@ -5400,11 +5400,25 @@ bool HydroSystemCore::applyProcedureCmdMqtt(const char* payload, size_t length) 
             lastProcAutoDisabledAtMs_ = 0;
         }
     }
-    // El reloj manda start con la regla apagada: el archivo está, el motor no.
-    // Mismo paso que el HMI: cargar del archivo y recién entonces arrancar.
-    if (strcasecmp(op, "start") == 0 &&
-        !TankProcedureFsmManager::instance().hasRule(String(ruleId))) {
-        DecisionRule* stored = decisionEngine.getRule(String(ruleId));
+    // El reloj manda start. La primera vez la regla no está en el motor.
+    // Después de Complete sigue cargada y apagada: el mismo start la rearma.
+    // Drain/Fill no se toca. Un duplicado del mismo mensaje (menos de 20 s) tampoco.
+    if (strcasecmp(op, "start") == 0) {
+        auto& fsm = TankProcedureFsmManager::instance();
+        const String id(ruleId);
+        if (fsm.isRunning(id)) {
+            const bool ok = fsm.handleCmd(id, "start");
+            Serial.printf("[MQTT] procedure/cmd rule=%s op=start → %s\n",
+                          ruleId, ok ? "ok" : "ignored");
+            return ok;
+        }
+        if (lastProcedureStartRuleId_ == ruleId && lastProcedureStartAtMs_ != 0 &&
+            (millis() - lastProcedureStartAtMs_) < PROCEDURE_START_DUP_MS) {
+            Serial.printf("[PROC] cmd start ignored rule=%s duplicate\n", ruleId);
+            Serial.printf("[MQTT] procedure/cmd rule=%s op=start → ignored\n", ruleId);
+            return false;
+        }
+        DecisionRule* stored = decisionEngine.getRule(id);
         if (!stored) {
             Serial.printf("[PROC] cmd rule not found %s (ni en archivo)\n", ruleId);
             Serial.printf("[MQTT] procedure/cmd rule=%s op=%s → ignored\n", ruleId, op);
@@ -5414,7 +5428,10 @@ bool HydroSystemCore::applyProcedureCmdMqtt(const char* payload, size_t length) 
         const bool started = armHmiRuleRuntime(*stored);
         if (!started) {
             stored->enabled = false;
-            TankProcedureFsmManager::instance().removeByRuleId(stored->id);
+            fsm.removeByRuleId(stored->id);
+        } else {
+            lastProcedureStartRuleId_ = ruleId;
+            lastProcedureStartAtMs_ = millis();
         }
         decisionEngine.saveRulesToFile();
         Serial.printf("[MQTT] procedure/cmd rule=%s op=start → %s\n",

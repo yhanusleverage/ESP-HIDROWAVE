@@ -45,6 +45,16 @@ bool TankProcedureFsmManager::hasRule(const String& ruleId) const {
     return false;
 }
 
+bool TankProcedureFsmManager::isRunning(const String& ruleId) const {
+    for (const auto& p : procs_) {
+        if (p.ruleId != ruleId) {
+            continue;
+        }
+        return p.phase == TankProcPhase::Drain || p.phase == TankProcPhase::Fill;
+    }
+    return false;
+}
+
 bool TankProcedureFsmManager::parseHHMM(const String& hhmm, int& outMin) {
     int h = 0, m = 0;
     if (sscanf(hhmm.c_str(), "%d:%d", &h, &m) != 2) {

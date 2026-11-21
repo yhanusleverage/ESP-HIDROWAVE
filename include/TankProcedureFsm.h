@@ -80,6 +80,8 @@ public:
     void setProcedureFinishedCallback(ProcedureFinishedFn cb) { procedureFinishedCb_ = cb; }
 
     bool hasRule(const String& ruleId) const;
+    /** Drain o Fill: un start nuevo no debe cortar la corrida. */
+    bool isRunning(const String& ruleId) const;
 
 private:
     TankProcedureFsmManager() = default;
