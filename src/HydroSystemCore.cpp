@@ -4851,8 +4851,7 @@ bool HydroSystemCore::applyECConfig(const ECConfig& config, const char* via) {
     hydroControl.setMaxStepEcFraction((float)config.aggressiveness);
     hydroControl.setEcPulseDosing((float)config.pulse_ml, (float)config.pulse_gap_sec, !replayEc);
     hydroControl.setConsumoEc24hEnabled(config.consumo_24h);
-    hydroControl.setDilutionAutoEnabled(
-        config.dilution_auto_enabled || config.auto_enabled, !replayEc);
+    hydroControl.setDilutionAutoEnabled(config.dilution_auto_enabled, !replayEc);
     hydroControl.setDilutionSlaveRelays(
         config.dilution_drain_slave_mac,
         config.dilution_drain_relay,

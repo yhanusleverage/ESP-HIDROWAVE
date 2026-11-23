@@ -193,6 +193,12 @@ struct MqttHmiLoopReading {
     bool autoEc;
     bool hasAutoPh;
     bool autoPh;
+    bool hasDilution;
+    bool dilutionAuto;
+    int dilutionDrainRelay;
+    int dilutionFillRelay;
+    char dilutionDrainMac[18];
+    char dilutionFillMac[18];
 };
 
 /** hidrowave/{id}/relay/state — doc mqtt/04 §3.4 */

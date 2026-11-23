@@ -597,7 +597,7 @@ void HmiUartBridge::publishLoopCfg() {
         return;
     }
     HydroControl& hydro = *ctx_.hydro;
-    StaticJsonDocument<768> doc;
+    StaticJsonDocument<1024> doc;
     doc["t"] = "loop_cfg";
     doc["maxStepEc"] = hydro.getMaxStepEcFraction();
     doc["maxStepPh"] = hydro.getPhAggressiveness();
@@ -623,6 +623,11 @@ void HmiUartBridge::publishLoopCfg() {
         doc["phLo"] = phSp - phTol;
         doc["phHi"] = phSp + phTol;
     }
+    doc["dilAuto"] = hydro.isDilutionAutoEnabled();
+    doc["dilDrainMac"] = hydro.getDilutionDrainSlaveMac();
+    doc["dilDrainR"] = hydro.getDilutionDrainRelay();
+    doc["dilFillMac"] = hydro.getDilutionFillSlaveMac();
+    doc["dilFillR"] = hydro.getDilutionFillRelay();
     Serial.printf("[HMI UART] loop_cfg Aec=%.2f Aph=%.2f cons=%d/%d\n",
                   hydro.getMaxStepEcFraction(),
                   hydro.getPhAggressiveness(),
@@ -842,6 +847,30 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
     if (doc.containsKey("consumoPh24h")) {
         hydro.setConsumoPh24hEnabled(doc["consumoPh24h"] | false);
     }
+    const bool pushedDilution = doc.containsKey("dilAuto") || doc.containsKey("dilDrainR") ||
+                                doc.containsKey("dilFillR");
+    if (pushedDilution) {
+        if (doc.containsKey("dilAuto")) {
+            hydro.setDilutionAutoEnabled(doc["dilAuto"] | false, true);
+        }
+        String drainMac = hydro.getDilutionDrainSlaveMac();
+        String fillMac = hydro.getDilutionFillSlaveMac();
+        int drainR = hydro.getDilutionDrainRelay();
+        int fillR = hydro.getDilutionFillRelay();
+        if (doc.containsKey("dilDrainMac")) {
+            drainMac = doc["dilDrainMac"].as<const char *>();
+        }
+        if (doc.containsKey("dilFillMac")) {
+            fillMac = doc["dilFillMac"].as<const char *>();
+        }
+        if (doc.containsKey("dilDrainR")) {
+            drainR = doc["dilDrainR"] | -1;
+        }
+        if (doc.containsKey("dilFillR")) {
+            fillR = doc["dilFillR"] | -1;
+        }
+        hydro.setDilutionSlaveRelays(drainMac, drainR, fillMac, fillR);
+    }
     bool ecBandOk = false;
     bool phBandOk = false;
     if (doc.containsKey("ecLo") && doc.containsKey("ecHi")) {
@@ -967,6 +996,14 @@ bool HmiUartBridge::handleLoopControl(JsonDocument& doc) {
         loop.autoEc = hydro.isAutoECEnabled();
         loop.hasAutoPh = pushedPh;
         loop.autoPh = hydro.isAutoPHEnabled();
+        loop.hasDilution = true;
+        loop.dilutionAuto = hydro.isDilutionAutoEnabled();
+        loop.dilutionDrainRelay = hydro.getDilutionDrainRelay();
+        loop.dilutionFillRelay = hydro.getDilutionFillRelay();
+        strncpy(loop.dilutionDrainMac, hydro.getDilutionDrainSlaveMac().c_str(),
+                sizeof(loop.dilutionDrainMac) - 1);
+        strncpy(loop.dilutionFillMac, hydro.getDilutionFillSlaveMac().c_str(),
+                sizeof(loop.dilutionFillMac) - 1);
         ctx_.mqtt->publishHmiLoop(loop);
     }
     return true;

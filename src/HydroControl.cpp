@@ -3939,7 +3939,7 @@ float HydroControl::getTDSVRef() const {
 // ===== Diluição EC modo A =====
 
 void HydroControl::setDilutionAutoEnabled(bool enabled, bool saveToNVS) {
-    dilutionAutoEnabled = enabled || autoECEnabled;
+    dilutionAutoEnabled = enabled;
     if (!enabled && dilutionState != DILUTION_IDLE) {
         finishDilutionSequence(false);
     }

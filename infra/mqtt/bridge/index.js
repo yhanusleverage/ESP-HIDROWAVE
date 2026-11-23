@@ -2024,6 +2024,15 @@ function boolOrUndef(value) {
 }
 
 /** Relé 0..7, null si el HMI no tiene bomba, undefined si el campo no vino. */
+function macOrSkip(payload, key) {
+  if (!Object.prototype.hasOwnProperty.call(payload, key)) return undefined;
+  const value = payload[key];
+  if (typeof value !== 'string') return undefined;
+  const mac = value.trim().toUpperCase();
+  if (!/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(mac)) return undefined;
+  return mac;
+}
+
 function hmiRelayOrSkip(payload, key) {
   if (!Object.prototype.hasOwnProperty.call(payload, key)) return undefined;
   const value = payload[key];
@@ -2086,6 +2095,16 @@ function validateHmiLoop(deviceId, payload) {
   if (autoEc !== undefined) ec.auto_enabled = autoEc;
   const autoPh = boolOrUndef(payload.auto_ph);
   if (autoPh !== undefined) ph.auto_enabled = autoPh;
+  const dilAuto = boolOrUndef(payload.dilution_auto_enabled);
+  if (dilAuto !== undefined) ec.dilution_auto_enabled = dilAuto;
+  const dilDrain = hmiRelayOrSkip(payload, 'dilution_drain_relay');
+  if (dilDrain !== undefined) ec.dilution_drain_relay = dilDrain;
+  const dilFill = hmiRelayOrSkip(payload, 'dilution_fill_relay');
+  if (dilFill !== undefined) ec.dilution_fill_relay = dilFill;
+  const dilDrainMac = macOrSkip(payload, 'dilution_drain_slave_mac');
+  if (dilDrainMac !== undefined) ec.dilution_drain_slave_mac = dilDrainMac;
+  const dilFillMac = macOrSkip(payload, 'dilution_fill_slave_mac');
+  if (dilFillMac !== undefined) ec.dilution_fill_slave_mac = dilFillMac;
 
   const relayUp = hmiRelayOrSkip(payload, 'relay_ph_up');
   const relayDown = hmiRelayOrSkip(payload, 'relay_ph_down');

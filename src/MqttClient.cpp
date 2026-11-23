@@ -799,7 +799,7 @@ bool MqttClientWrapper::publishHmiLoop(const MqttHmiLoopReading& reading) {
         return false;
     }
 
-    StaticJsonDocument<768> doc;
+    StaticJsonDocument<1024> doc;
     doc["v"] = 1;
     doc["device_id"] = deviceId;
     doc["volume"] = reading.volume;
@@ -828,8 +828,23 @@ bool MqttClientWrapper::publishHmiLoop(const MqttHmiLoopReading& reading) {
     if (reading.hasAutoPh) {
         doc["auto_ph"] = reading.autoPh;
     }
+    if (reading.hasDilution) {
+        doc["dilution_auto_enabled"] = reading.dilutionAuto;
+        if (reading.dilutionDrainRelay >= 0 && reading.dilutionDrainRelay <= 7) {
+            doc["dilution_drain_relay"] = reading.dilutionDrainRelay;
+        }
+        if (reading.dilutionFillRelay >= 0 && reading.dilutionFillRelay <= 7) {
+            doc["dilution_fill_relay"] = reading.dilutionFillRelay;
+        }
+        if (reading.dilutionDrainMac[0]) {
+            doc["dilution_drain_slave_mac"] = reading.dilutionDrainMac;
+        }
+        if (reading.dilutionFillMac[0]) {
+            doc["dilution_fill_slave_mac"] = reading.dilutionFillMac;
+        }
+    }
 
-    char payload[768];
+    char payload[1024];
     const size_t len = serializeJson(doc, payload, sizeof(payload));
     if (len == 0 || len >= sizeof(payload)) {
         Serial.println("[MQTT] hmi_loop publish failed");
